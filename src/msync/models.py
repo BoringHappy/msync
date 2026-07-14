@@ -49,7 +49,9 @@ class Conversation:
     provider: Provider
     transcript: bytes
     sha256: str
+    chat_sha256: str | None
     external_id: str
+    logical_session_id: str
     events: tuple[Event, ...]
     metadata: dict[str, Any] = field(default_factory=dict)
     kind: str = "main"

@@ -109,6 +109,65 @@ def test_new_provider_can_be_added_through_the_shared_contract(tmp_path: Path) -
     assert conversation.title == "hello extension"
 
 
+@pytest.mark.parametrize(
+    ("provider_name", "relative_path", "records"),
+    [
+        (
+            "claude",
+            "projects/-work/legacy.jsonl",
+            [
+                {
+                    "type": "user",
+                    "uuid": "message-1",
+                    "sessionId": "converted-session",
+                    "message": {"role": "user", "content": "legacy copy"},
+                    "msync": {
+                        "sourceProvider": "codex",
+                        "sourceConversationId": "019f61a0-0000-7000-8000-000000000055",
+                        "sourceKey": "legacy-source",
+                    },
+                }
+            ],
+        ),
+        (
+            "codex",
+            "sessions/2026/07/14/legacy.jsonl",
+            [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "converted-session",
+                        "msync": {
+                            "source_provider": "claude",
+                            "source_conversation_id": "019f61a0-0000-7000-8000-000000000055",
+                            "source_key": "legacy-source",
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "legacy copy"},
+                },
+            ],
+        ),
+    ],
+)
+def test_legacy_generated_provenance_recovers_the_source_session_identity(
+    tmp_path: Path,
+    provider_name: str,
+    relative_path: str,
+    records: list[dict[str, Any]],
+) -> None:
+    root = tmp_path / provider_name
+    path = root / relative_path
+    path.parent.mkdir(parents=True)
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    conversation = get_provider(provider_name).read(path, root)
+
+    assert conversation.logical_session_id == "019f61a0-0000-7000-8000-000000000055"
+
+
 def test_registry_rejects_duplicates_and_unknown_names() -> None:
     registry = ProviderRegistry((ExampleProvider(),))
 

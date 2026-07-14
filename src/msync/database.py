@@ -10,12 +10,13 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from sqlalchemy import URL, create_engine, delete, event, func, inspect, select
+from sqlalchemy import URL, create_engine, delete, event, func, inspect, select, update
 from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from msync.models import Conversation
-from msync.providers import HistoryProvider
+from msync.providers import HistoryProvider, get_provider
 from msync.tables import (
     Base,
     ConversationRow,
@@ -25,7 +26,7 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SQLITE_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
@@ -65,6 +66,7 @@ class UploadResult:
     imported: int = 0
     updated: int = 0
     unchanged: int = 0
+    duplicates: int = 0
     events: int = 0
     message_parts: int = 0
 
@@ -80,6 +82,16 @@ class SearchResult:
     role: str | None
     occurred_at: str | None
     text: str
+
+
+@dataclass(slots=True, frozen=True)
+class ArchivedConversation:
+    """One stored transcript together with its source-location identity."""
+
+    location_id: int
+    source_root: str
+    source_mtime_ns: int
+    conversation: Conversation
 
 
 class Archive:
@@ -137,7 +149,17 @@ class Archive:
             location = self._upsert_location(session, root, provider.name)
             result = UploadResult(location_id=location.id, scanned=len(transcripts))
             for path in transcripts:
-                self._upload_file(session, result, root, provider, path)
+                for attempt in range(2):
+                    file_result = UploadResult(location_id=location.id)
+                    try:
+                        with session.begin_nested():
+                            self._upload_file(session, file_result, root, provider, path)
+                    except IntegrityError:
+                        if attempt:
+                            raise
+                        continue
+                    _accumulate_upload_result(result, file_result)
+                    break
             location.last_scanned_at = datetime.now(UTC)
         return result
 
@@ -187,25 +209,88 @@ class Archive:
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
 
+    def conversations(self) -> list[ArchivedConversation]:
+        """Reconstruct every stored conversation from its lossless transcript blob."""
+
+        statement = (
+            select(
+                LocationRow.id,
+                LocationRow.root_path,
+                LocationRow.provider,
+                ConversationRow.relative_path,
+                ConversationRow.source_mtime_ns,
+                ConversationRow.content_sha256,
+                ConversationRow.transcript_codec,
+                ConversationRow.transcript,
+            )
+            .join(ConversationRow, ConversationRow.location_id == LocationRow.id)
+            .order_by(LocationRow.id, ConversationRow.relative_path)
+        )
+        with Session(self.engine) as session:
+            rows = list(session.execute(statement))
+
+        conversations: list[ArchivedConversation] = []
+        for row in rows:
+            if row.transcript_codec != "zlib":
+                raise RuntimeError(
+                    f"Unsupported transcript codec {row.transcript_codec!r} in archive."
+                )
+            try:
+                transcript = zlib.decompress(row.transcript)
+            except zlib.error as error:
+                raise RuntimeError(
+                    "A stored transcript is corrupt and cannot be decompressed."
+                ) from error
+            if hashlib.sha256(transcript).hexdigest() != row.content_sha256:
+                raise RuntimeError("A stored transcript failed its SHA-256 integrity check.")
+
+            root = Path(row.root_path)
+            path = root / Path(row.relative_path)
+            provider = get_provider(row.provider)
+            conversation = provider.read(path, root, transcript=transcript)
+            conversations.append(
+                ArchivedConversation(
+                    location_id=row.id,
+                    source_root=row.root_path,
+                    source_mtime_ns=row.source_mtime_ns,
+                    conversation=conversation,
+                )
+            )
+        return conversations
+
     def _initialize(self) -> None:
         with self.engine.begin() as connection:
             expected_tables = set(Base.metadata.tables)
             existing_tables = set(inspect(connection).get_table_names())
             self.initialized_new_database = not expected_tables.intersection(existing_tables)
+            stored_version = None
+            if "schema_info" in existing_tables:
+                stored_version = connection.execute(
+                    select(SchemaInfoRow.value).where(SchemaInfoRow.key == "schema_version")
+                ).scalar_one_or_none()
+                if stored_version is not None:
+                    stored_version = int(stored_version)
+
             sqlite_version = 0
             if self.engine.dialect.name == "sqlite":
                 sqlite_version = int(connection.exec_driver_sql("PRAGMA user_version").scalar_one())
-                if sqlite_version not in {0, SCHEMA_VERSION}:
+                if sqlite_version not in {0, 3, SCHEMA_VERSION}:
                     _raise_incompatible_schema(sqlite_version)
+
+            if stored_version == 3 and {"conversations", "locations"} <= existing_tables:
+                _migrate_v3_to_v4(connection)
+                stored_version = SCHEMA_VERSION
+            elif stored_version is not None and stored_version != SCHEMA_VERSION:
+                _raise_incompatible_schema(stored_version)
 
             Base.metadata.create_all(connection)
             self._validate_schema(connection)
-            stored_version = connection.execute(
+            current_version = connection.execute(
                 select(SchemaInfoRow.value).where(SchemaInfoRow.key == "schema_version")
             ).scalar_one_or_none()
-            if stored_version is not None and int(stored_version) != SCHEMA_VERSION:
-                _raise_incompatible_schema(int(stored_version))
-            if stored_version is None:
+            if current_version is not None and int(current_version) != SCHEMA_VERSION:
+                _raise_incompatible_schema(int(current_version))
+            if current_version is None:
                 connection.execute(
                     SchemaInfoRow.__table__.insert().values(
                         key="schema_version", value=str(SCHEMA_VERSION)
@@ -352,10 +437,47 @@ class Archive:
         if existing is not None and existing.relative_path != relative_path:
             raise RuntimeError("A SHA-256 collision occurred while identifying a transcript.")
         if existing is not None and existing.content_sha256 == content_sha256:
+            identity = (
+                (existing.logical_session_id, existing.chat_sha256)
+                if existing.logical_session_id is not None
+                else None
+            )
+            conversation = None
+            if identity is None:
+                conversation = provider.read(path, root, transcript=transcript)
+                identity = _conversation_identity(conversation)
+            duplicate = _find_duplicate_identity(
+                session,
+                identity,
+                exclude_id=existing.id,
+            )
+            if duplicate is not None:
+                if duplicate < existing.id:
+                    session.delete(existing)
+                    result.duplicates += 1
+                    return
+                session.execute(delete(ConversationRow).where(ConversationRow.id == duplicate))
+                result.duplicates += 1
+            if conversation is not None:
+                existing.logical_session_id = conversation.logical_session_id
+                existing.chat_sha256 = conversation.chat_sha256
+                existing.metadata_json = _metadata_with_identity(
+                    existing.metadata_json, conversation
+                )
             result.unchanged += 1
             return
 
         conversation = provider.read(path, root, transcript=transcript)
+        duplicate = _find_duplicate_conversation(
+            session,
+            conversation,
+            exclude_id=existing.id if existing is not None else None,
+        )
+        if duplicate is not None:
+            if existing is not None:
+                session.delete(existing)
+            result.duplicates += 1
+            return
         stat = path.stat()
         if existing is None:
             existing = ConversationRow(
@@ -416,6 +538,93 @@ class Archive:
         result.message_parts += len(parts)
 
 
+def _accumulate_upload_result(result: UploadResult, file_result: UploadResult) -> None:
+    for field_name in (
+        "imported",
+        "updated",
+        "unchanged",
+        "duplicates",
+        "events",
+        "message_parts",
+    ):
+        setattr(result, field_name, getattr(result, field_name) + getattr(file_result, field_name))
+
+
+def _migrate_v3_to_v4(connection: Connection) -> None:
+    """Add indexed logical revision identity and collapse existing duplicate rows."""
+
+    columns = {column["name"] for column in inspect(connection).get_columns("conversations")}
+    if "logical_session_id" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE conversations ADD COLUMN logical_session_id VARCHAR(36)"
+        )
+    if "chat_sha256" not in columns:
+        connection.exec_driver_sql("ALTER TABLE conversations ADD COLUMN chat_sha256 VARCHAR(64)")
+
+    rows = list(
+        connection.execute(
+            select(
+                ConversationRow.id,
+                ConversationRow.relative_path,
+                ConversationRow.content_sha256,
+                ConversationRow.transcript_codec,
+                ConversationRow.transcript,
+                ConversationRow.metadata_json,
+                LocationRow.root_path,
+                LocationRow.provider,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .order_by(ConversationRow.id)
+        )
+    )
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        if row.transcript_codec != "zlib":
+            raise RuntimeError(f"Unsupported transcript codec {row.transcript_codec!r} in archive.")
+        try:
+            transcript = zlib.decompress(row.transcript)
+        except zlib.error as error:
+            raise RuntimeError(
+                "A stored transcript is corrupt and cannot be decompressed."
+            ) from error
+        if hashlib.sha256(transcript).hexdigest() != row.content_sha256:
+            raise RuntimeError("A stored transcript failed its SHA-256 integrity check.")
+
+        root = Path(row.root_path)
+        conversation = get_provider(row.provider).read(
+            root / Path(row.relative_path),
+            root,
+            transcript=transcript,
+        )
+        identity = _conversation_identity(conversation)
+        if identity[1] is not None and (identity[0], identity[1]) in seen:
+            connection.execute(delete(ConversationRow).where(ConversationRow.id == row.id))
+            continue
+        if identity[1] is not None:
+            seen.add((identity[0], identity[1]))
+        connection.execute(
+            update(ConversationRow)
+            .where(ConversationRow.id == row.id)
+            .values(
+                logical_session_id=identity[0],
+                chat_sha256=identity[1],
+                metadata_json=_metadata_with_identity(row.metadata_json, conversation),
+            )
+        )
+
+    revision_index = next(
+        index
+        for index in ConversationRow.__table__.indexes
+        if index.name == "conversations_logical_revision_uq"
+    )
+    revision_index.create(connection, checkfirst=True)
+    connection.execute(
+        update(SchemaInfoRow)
+        .where(SchemaInfoRow.key == "schema_version")
+        .values(value=str(SCHEMA_VERSION))
+    )
+
+
 def _update_conversation(
     row: ConversationRow, conversation: Conversation, source_mtime_ns: int
 ) -> None:
@@ -431,10 +640,55 @@ def _update_conversation(
     row.source_mtime_ns = source_mtime_ns
     row.source_size = len(conversation.transcript)
     row.content_sha256 = conversation.sha256
+    row.logical_session_id = conversation.logical_session_id
+    row.chat_sha256 = conversation.chat_sha256
     row.transcript_codec = "zlib"
     row.transcript = zlib.compress(conversation.transcript)
-    row.metadata_json = conversation.metadata
+    row.metadata_json = _metadata_with_identity(conversation.metadata, conversation)
     row.imported_at = datetime.now(UTC)
+
+
+def _find_duplicate_conversation(
+    session: Session,
+    conversation: Conversation,
+    *,
+    exclude_id: int | None,
+) -> int | None:
+    return _find_duplicate_identity(
+        session,
+        _conversation_identity(conversation),
+        exclude_id=exclude_id,
+    )
+
+
+def _find_duplicate_identity(
+    session: Session,
+    identity: tuple[str, str | None],
+    *,
+    exclude_id: int | None,
+) -> int | None:
+    if identity[1] is None:
+        return None
+    statement = select(ConversationRow.id).where(
+        ConversationRow.logical_session_id == identity[0],
+        ConversationRow.chat_sha256 == identity[1],
+    )
+    if exclude_id is not None:
+        statement = statement.where(ConversationRow.id != exclude_id)
+    return session.scalar(statement.order_by(ConversationRow.id).limit(1))
+
+
+def _conversation_identity(conversation: Conversation) -> tuple[str, str | None]:
+    return conversation.logical_session_id, conversation.chat_sha256
+
+
+def _metadata_with_identity(metadata: dict[str, Any], conversation: Conversation) -> dict[str, Any]:
+    stored = dict(metadata)
+    stored["_msync"] = {
+        "chat_sha256": conversation.chat_sha256,
+        "logical_session_id": conversation.logical_session_id,
+    }
+    return stored
 
 
 def _normalize_database(database: str | Path) -> tuple[URL, Path | None]:

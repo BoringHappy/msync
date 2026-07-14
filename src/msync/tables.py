@@ -66,6 +66,12 @@ class ConversationRow(Base):
             "relative_path_hash",
             unique=True,
         ),
+        Index(
+            "conversations_logical_revision_uq",
+            "logical_session_id",
+            "chat_sha256",
+            unique=True,
+        ),
         Index("conversations_external_id_idx", "location_id", "external_id"),
         Index("conversations_time_idx", "started_at", "ended_at"),
     )
@@ -77,6 +83,8 @@ class ConversationRow(Base):
     external_id: Mapped[str] = mapped_column(String(255), nullable=False)
     relative_path: Mapped[str] = mapped_column(LONG_TEXT, nullable=False)
     relative_path_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    logical_session_id: Mapped[str | None] = mapped_column(String(36))
+    chat_sha256: Mapped[str | None] = mapped_column(String(64))
     conversation_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="main")
     parent_external_id: Mapped[str | None] = mapped_column(String(255))
     title: Mapped[str | None] = mapped_column(String(512))
