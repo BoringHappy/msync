@@ -10,12 +10,12 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from sqlalchemy import URL, create_engine, delete, event, inspect, select, text
+from sqlalchemy import URL, create_engine, delete, event, inspect, select
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.orm import Session
 
-from msync.models import Conversation, Provider
-from msync.readers import read_conversation
+from msync.models import Conversation
+from msync.providers import HistoryProvider
 from msync.tables import (
     Base,
     ConversationRow,
@@ -25,7 +25,7 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SQLITE_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
@@ -114,14 +114,14 @@ class Archive:
         self,
         *,
         root: Path,
-        provider: Provider,
+        provider: HistoryProvider,
         transcripts: list[Path],
     ) -> UploadResult:
         """Archive changed transcripts from a single source location."""
 
         root = root.resolve()
         with Session(self.engine) as session, session.begin():
-            location = self._upsert_location(session, root, provider)
+            location = self._upsert_location(session, root, provider.name)
             result = UploadResult(location_id=location.id, scanned=len(transcripts))
             for path in transcripts:
                 self._upload_file(session, result, root, provider, path)
@@ -136,29 +136,21 @@ class Archive:
             sqlite_version = 0
             if self.engine.dialect.name == "sqlite":
                 sqlite_version = int(connection.exec_driver_sql("PRAGMA user_version").scalar_one())
-                if sqlite_version > SCHEMA_VERSION:
-                    _raise_newer_schema(sqlite_version)
-                if sqlite_version == 1:
-                    self._migrate_sqlite_v1(connection)
+                if sqlite_version not in {0, SCHEMA_VERSION}:
+                    _raise_incompatible_schema(sqlite_version)
 
             Base.metadata.create_all(connection)
             self._validate_schema(connection)
             stored_version = connection.execute(
                 select(SchemaInfoRow.value).where(SchemaInfoRow.key == "schema_version")
             ).scalar_one_or_none()
-            if stored_version is not None and int(stored_version) > SCHEMA_VERSION:
-                _raise_newer_schema(int(stored_version))
+            if stored_version is not None and int(stored_version) != SCHEMA_VERSION:
+                _raise_incompatible_schema(int(stored_version))
             if stored_version is None:
                 connection.execute(
                     SchemaInfoRow.__table__.insert().values(
                         key="schema_version", value=str(SCHEMA_VERSION)
                     )
-                )
-            elif int(stored_version) < SCHEMA_VERSION:
-                connection.execute(
-                    SchemaInfoRow.__table__.update()
-                    .where(SchemaInfoRow.key == "schema_version")
-                    .values(value=str(SCHEMA_VERSION))
                 )
 
             if self.engine.dialect.name == "sqlite":
@@ -254,48 +246,7 @@ class Archive:
             raise RuntimeError(f"Database schema validation failed: missing SQLite FTS: {missing}")
 
     @staticmethod
-    def _migrate_sqlite_v1(connection: Connection) -> None:
-        """Add portable path hashes to databases created before SQLAlchemy."""
-
-        location_columns = {
-            row[1] for row in connection.exec_driver_sql("PRAGMA table_info(locations)")
-        }
-        if "root_path_hash" not in location_columns:
-            connection.exec_driver_sql("ALTER TABLE locations ADD COLUMN root_path_hash TEXT")
-            for location_id, root_path in connection.exec_driver_sql(
-                "SELECT id, root_path FROM locations"
-            ):
-                connection.execute(
-                    text("UPDATE locations SET root_path_hash = :hash WHERE id = :id"),
-                    {"hash": _text_hash(root_path), "id": location_id},
-                )
-
-        conversation_columns = {
-            row[1] for row in connection.exec_driver_sql("PRAGMA table_info(conversations)")
-        }
-        if "relative_path_hash" not in conversation_columns:
-            connection.exec_driver_sql(
-                "ALTER TABLE conversations ADD COLUMN relative_path_hash TEXT"
-            )
-            for conversation_id, relative_path in connection.exec_driver_sql(
-                "SELECT id, relative_path FROM conversations"
-            ):
-                connection.execute(
-                    text("UPDATE conversations SET relative_path_hash = :hash WHERE id = :id"),
-                    {"hash": _text_hash(relative_path), "id": conversation_id},
-                )
-
-        connection.exec_driver_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS locations_root_path_hash_uq "
-            "ON locations(root_path_hash)"
-        )
-        connection.exec_driver_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS conversations_location_path_hash_uq "
-            "ON conversations(location_id, relative_path_hash)"
-        )
-
-    @staticmethod
-    def _upsert_location(session: Session, root: Path, provider: Provider) -> LocationRow:
+    def _upsert_location(session: Session, root: Path, provider: str) -> LocationRow:
         root_path = str(root)
         root_path_hash = _text_hash(root_path)
         location = session.scalar(
@@ -326,7 +277,7 @@ class Archive:
         session: Session,
         result: UploadResult,
         root: Path,
-        provider: Provider,
+        provider: HistoryProvider,
         path: Path,
     ) -> None:
         transcript = path.read_bytes()
@@ -345,7 +296,7 @@ class Archive:
             result.unchanged += 1
             return
 
-        conversation = read_conversation(path, root, provider, transcript=transcript)
+        conversation = provider.read(path, root, transcript=transcript)
         stat = path.stat()
         if existing is None:
             existing = ConversationRow(
@@ -475,7 +426,8 @@ def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _raise_newer_schema(version: int) -> None:
+def _raise_incompatible_schema(version: int) -> None:
     raise RuntimeError(
-        f"Database schema version {version} is newer than this msync supports ({SCHEMA_VERSION})."
+        f"Database schema version {version} is incompatible with this msync schema "
+        f"({SCHEMA_VERSION}); create a new database."
     )

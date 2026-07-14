@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -12,14 +11,18 @@ from rich.table import Table
 from sqlalchemy.exc import SQLAlchemyError
 
 from msync.database import Archive
-from msync.models import Provider
-from msync.readers import HistoryFormatError, detect_provider, discover_transcripts
+from msync.providers import (
+    HistoryFormatError,
+    detect_provider,
+    get_provider,
+    provider_names,
+)
 
 DEFAULT_DATABASE = Path.home() / ".msync" / "msync.sqlite"
 
 app = typer.Typer(
     name="msync",
-    help="Archive local Claude Code and Codex chat histories.",
+    help="Archive local AI chat histories.",
     no_args_is_help=True,
     rich_markup_mode="rich",
     pretty_exceptions_enable=False,
@@ -28,17 +31,9 @@ console = Console()
 error_console = Console(stderr=True)
 
 
-class ProviderChoice(StrEnum):
-    """History formats accepted by the CLI."""
-
-    auto = "auto"
-    claude = "claude"
-    codex = "codex"
-
-
 @app.callback()
 def cli() -> None:
-    """Archive local Claude Code and Codex chat histories."""
+    """Archive local AI chat histories."""
 
 
 @app.command()
@@ -53,7 +48,7 @@ def upload(
             dir_okay=True,
             readable=True,
             resolve_path=True,
-            help="Claude or Codex data directory to archive.",
+            help="Provider data directory to archive.",
         ),
     ],
     database: Annotated[
@@ -66,18 +61,16 @@ def upload(
         ),
     ] = str(DEFAULT_DATABASE),
     provider: Annotated[
-        ProviderChoice,
-        typer.Option(help="History format; auto detects from the directory."),
-    ] = ProviderChoice.auto,
+        str,
+        typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
+    ] = "auto",
 ) -> None:
     """Read new and changed transcripts into the configured archive."""
 
     root = directory.expanduser().resolve()
     try:
-        selected_provider: Provider = (
-            detect_provider(root) if provider is ProviderChoice.auto else provider.value
-        )
-        transcripts = discover_transcripts(root, selected_provider)
+        selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
+        transcripts = selected_provider.discover(root)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
         with Archive(database) as archive:
@@ -94,7 +87,7 @@ def upload(
     table = Table(title="Upload complete", show_header=False, box=None, pad_edge=False)
     table.add_column(style="dim")
     table.add_column()
-    table.add_row("Provider", selected_provider)
+    table.add_row("Provider", selected_provider.name)
     table.add_row("Location", str(root))
     table.add_row("Database", database_display)
     table.add_row("Transcripts", str(result.scanned))

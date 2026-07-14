@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 from msync.database import Archive
-from msync.readers import detect_provider, discover_transcripts
+from msync.providers import detect_provider, get_provider
 
 
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> bytes:
@@ -59,12 +59,12 @@ def test_codex_upload_is_lossless_searchable_and_idempotent(tmp_path: Path) -> N
     database = tmp_path / "archive.sqlite"
 
     provider = detect_provider(root)
-    paths = discover_transcripts(root, provider)
+    paths = provider.discover(root)
     with Archive(database) as archive:
         first = archive.upload(root=root, provider=provider, transcripts=paths)
         second = archive.upload(root=root, provider=provider, transcripts=paths)
 
-    assert provider == "codex"
+    assert provider.name == "codex"
     assert first.imported == 1
     assert first.events == 4
     assert second.imported == 0
@@ -100,8 +100,9 @@ def test_changed_transcript_replaces_normalized_events(tmp_path: Path) -> None:
     path = root / "sessions/rollout.jsonl"
     _write_jsonl(path, _codex_records())
     database = tmp_path / "archive.sqlite"
+    provider = get_provider("codex")
     with Archive(database) as archive:
-        archive.upload(root=root, provider="codex", transcripts=[path])
+        archive.upload(root=root, provider=provider, transcripts=[path])
         records = _codex_records()
         records[-1]["payload"] = {
             "type": "message",
@@ -109,7 +110,7 @@ def test_changed_transcript_replaces_normalized_events(tmp_path: Path) -> None:
             "content": [{"type": "output_text", "text": "Updated answer"}],
         }
         _write_jsonl(path, records)
-        result = archive.upload(root=root, provider="codex", transcripts=[path])
+        result = archive.upload(root=root, provider=provider, transcripts=[path])
 
     assert result.updated == 1
     with closing(sqlite3.connect(database)) as connection:
@@ -128,9 +129,10 @@ def test_same_session_id_from_two_locations_stays_separate(tmp_path: Path) -> No
     _write_jsonl(first_path, _codex_records("shared-id"))
     _write_jsonl(second_path, _codex_records("shared-id"))
     database = tmp_path / "archive.sqlite"
+    provider = get_provider("codex")
     with Archive(database) as archive:
-        archive.upload(root=first_root, provider="codex", transcripts=[first_path])
-        archive.upload(root=second_root, provider="codex", transcripts=[second_path])
+        archive.upload(root=first_root, provider=provider, transcripts=[first_path])
+        archive.upload(root=second_root, provider=provider, transcripts=[second_path])
 
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("SELECT count(*) FROM locations").fetchone() == (2,)
@@ -172,12 +174,13 @@ def test_claude_transcript_and_subagent_metadata(tmp_path: Path) -> None:
         ],
     )
     database = tmp_path / "archive.sqlite"
+    provider = detect_provider(root)
 
     with Archive(database) as archive:
         result = archive.upload(
             root=root,
-            provider=detect_provider(root),
-            transcripts=discover_transcripts(root, "claude"),
+            provider=provider,
+            transcripts=provider.discover(root),
         )
 
     assert result.imported == 1

@@ -47,3 +47,40 @@ def test_upload_rejects_empty_directory(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "No conversation transcripts found" in result.output
+
+
+def test_upload_accepts_explicit_claude_provider(tmp_path: Path) -> None:
+    root = tmp_path / "custom-history"
+    transcript = root / "projects/-work/session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "message-1",
+                "sessionId": "claude-session",
+                "timestamp": "2026-07-14T12:00:00Z",
+                "message": {"role": "user", "content": "hello Claude"},
+            }
+        )
+        + "\n"
+    )
+    database = tmp_path / "claude.sqlite"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--provider",
+            "claude",
+            "--database",
+            str(database),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "claude" in result.output
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT provider FROM locations").fetchone() == ("claude",)

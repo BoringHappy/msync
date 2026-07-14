@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -38,7 +36,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("2",)
+        ).fetchone() == ("3",)
 
     with Archive(database) as archive:
         assert archive.initialized_new_database is False
@@ -48,7 +46,7 @@ def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "broken.sqlite"
     with closing(sqlite3.connect(database)) as connection:
         connection.execute("CREATE TABLE locations (id INTEGER PRIMARY KEY)")
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 3")
         connection.commit()
 
     with pytest.raises(RuntimeError, match="locations missing columns"):
@@ -79,47 +77,17 @@ def test_common_database_urls_select_supported_drivers() -> None:
     assert "secret" not in postgres_url.render_as_string(hide_password=True)
 
 
-def test_sqlite_v1_archive_is_migrated_without_data_loss(tmp_path: Path) -> None:
-    root = tmp_path / ".codex"
-    transcript = root / "sessions/rollout.jsonl"
-    transcript.parent.mkdir(parents=True)
-    transcript.write_text(
-        json.dumps(
-            {
-                "timestamp": "2026-07-14T12:00:00Z",
-                "type": "session_meta",
-                "payload": {"id": "migration-session", "cwd": "/tmp"},
-            }
-        )
-        + "\n"
-    )
+def test_old_schema_version_is_rejected_without_migration(tmp_path: Path) -> None:
     database = tmp_path / "archive.sqlite"
     with Archive(database) as archive:
-        archive.upload(root=root, provider="codex", transcripts=[transcript])
+        assert archive.initialized_new_database
 
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute("DROP INDEX conversations_location_path_hash_uq")
-        connection.execute("DROP INDEX locations_root_path_hash_uq")
-        connection.execute("ALTER TABLE conversations DROP COLUMN relative_path_hash")
-        connection.execute("ALTER TABLE locations DROP COLUMN root_path_hash")
-        connection.execute("DROP TABLE schema_info")
         connection.execute("PRAGMA user_version = 1")
         connection.commit()
 
-    with Archive(database) as archive:
-        result = archive.upload(root=root, provider="codex", transcripts=[transcript])
-
-    expected_root_hash = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
-    with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
-        assert connection.execute("SELECT root_path_hash FROM locations").fetchone() == (
-            expected_root_hash,
-        )
-        assert connection.execute(
-            "SELECT length(relative_path_hash) FROM conversations"
-        ).fetchone() == (64,)
-        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
-    assert result.unchanged == 1
+    with pytest.raises(RuntimeError, match="create a new database"):
+        Archive(database)
 
 
 def _compiled_schema(dialect: object) -> str:

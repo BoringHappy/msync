@@ -1,12 +1,12 @@
-"""Data passed between history readers and the SQLite archive."""
+"""Data passed between provider adapters and the portable archive."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-Provider = Literal["claude", "codex"]
+type Provider = str
 
 
 @dataclass(slots=True, frozen=True)
