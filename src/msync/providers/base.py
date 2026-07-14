@@ -7,10 +7,13 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID, uuid5
 
 from msync.models import Conversation, Event, MessagePart
+from msync.schemas.base import NativeRecord
 
 
 class HistoryFormatError(ValueError):
@@ -86,6 +89,31 @@ class HistoryProvider(ABC):
                     path.resolve() for path in search_root.rglob("*.jsonl") if path.is_file()
                 )
         return sorted(paths)
+
+    def encode_conversation(
+        self,
+        conversation: Conversation,
+        *,
+        session_id: str,
+        started_at: datetime,
+        source_key: str,
+    ) -> bytes:
+        """Convert a normalized conversation into this provider's native JSONL."""
+
+        del conversation, session_id, started_at, source_key
+        raise HistoryFormatError(f"Provider {self.name!r} does not support transcript export.")
+
+    def export_relative_path(
+        self,
+        conversation: Conversation,
+        *,
+        session_id: str,
+        started_at: datetime,
+    ) -> Path:
+        """Return the canonical native location for a converted conversation."""
+
+        del conversation, session_id, started_at
+        raise HistoryFormatError(f"Provider {self.name!r} does not support transcript export.")
 
     def read(
         self,
@@ -216,3 +244,50 @@ def first_user_title(events: tuple[Event, ...]) -> str | None:
 
 def as_string(value: Any) -> str | None:
     return cast(str, value) if isinstance(value, str) and value else None
+
+
+def display_events(conversation: Conversation) -> tuple[Event, ...]:
+    """Return human-visible user/assistant turns that can cross provider boundaries."""
+
+    return tuple(
+        event
+        for event in conversation.events
+        if event.visibility == "display"
+        and event.role in {"user", "assistant"}
+        and event.searchable_text.strip()
+    )
+
+
+def stable_event_id(session_id: str, event: Event) -> str:
+    """Derive an idempotent UUID for a converted native message."""
+
+    return str(uuid5(UUID(session_id), f"{event.sequence}:{event.role}:{event.searchable_text}"))
+
+
+def event_timestamp(event: Event, started_at: datetime, offset: int) -> str:
+    """Return an RFC 3339 timestamp, falling back to stable sequence ordering."""
+
+    if event.occurred_at:
+        try:
+            parsed = datetime.fromisoformat(event.occurred_at.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        else:
+            return _rfc3339(parsed)
+    return _rfc3339(started_at + timedelta(microseconds=offset))
+
+
+def encode_jsonl(records: Iterable[NativeRecord]) -> bytes:
+    """Serialize validated native records as newline-terminated UTF-8 JSONL."""
+
+    return (
+        "".join(
+            record.model_dump_json(by_alias=True, exclude_none=True) + "\n" for record in records
+        )
+    ).encode()
+
+
+def _rfc3339(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")

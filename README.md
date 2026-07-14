@@ -2,8 +2,8 @@
 
 Keep your AI conversations, context, and decisions in sync. `msync` archives local
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex JSONL transcripts in one
-database without changing the source directories. SQLAlchemy provides SQLite, PostgreSQL, and
-MySQL persistence through the same schema and upload flow.
+database, then can generate native histories that both clients recognize and resume. SQLAlchemy
+provides SQLite, PostgreSQL, and MySQL persistence through the same schema and sync flow.
 
 ## Install
 
@@ -79,6 +79,50 @@ Uploads are idempotent. Each file is addressed by its source location and relati
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
 and unchanged files are skipped.
 
+`upload` only reads the source directory. Use `sync` when native history files should also be
+written.
+
+## Sync Claude and Codex
+
+Merge both local histories through the archive and write each conversation back in the native
+format of both clients:
+
+```console
+$ msync sync --dir ~/.claude --dir ~/.codex
+```
+
+The command runs in two phases: it first archives new or changed native transcripts from every
+location, then writes all archived conversations into each location's provider format. Session
+boundaries remain intact, so each source conversation appears as a separate resumable conversation
+instead of one combined transcript. Repeating the command is idempotent.
+
+Provider names are normally detected from the directory name or content. Specify one provider per
+directory, in the same order, for neutral or newly created locations:
+
+```console
+$ msync sync --dir /mnt/merged-claude --provider claude
+$ msync sync --dir /mnt/a --dir /mnt/b --provider claude --provider codex
+```
+
+`sync` uses the same `--database` option as the other commands, including PostgreSQL and MySQL
+URLs. This also makes it possible to generate a new native history location from conversations
+that were uploaded earlier:
+
+```console
+$ msync sync --dir /mnt/merged-codex --provider codex --database ./history.sqlite
+```
+
+Native transcripts already belonging to the target provider are copied byte-for-byte when needed.
+Cross-provider conversion writes the visible user and assistant messages using typed native JSONL
+schemas. Provider-specific tool calls, reasoning, usage, and system metadata remain losslessly
+available in the archive but are not translated into the other provider's execution protocol.
+
+Every destination contains a `.msync-manifest.json` provenance file. It prevents exported copies
+from feeding back into the archive on the next sync, permits safe updates when the source changes,
+and ensures a session continued in Claude or Codex is never overwritten. Unknown path collisions
+are reported and left untouched. Generated transcript and manifest files use owner-only
+permissions.
+
 ## Search history
 
 Search the normalized message text in the default archive:
@@ -134,6 +178,10 @@ History sources are parallel adapters under `src/msync/providers/`:
 | `codex.py` | Codex session discovery, event parsing, and session metadata. |
 | `__init__.py` | Ordered provider registry, explicit lookup, and automatic format detection. |
 
+Native message and rollout contracts are Pydantic models under `src/msync/schemas/`. They validate
+the fields msync reads and writes while retaining unknown fields added by future client versions.
+The Claude and Codex adapters use these models for both import validation and native generation.
+
 The CLI and database use provider names from the registry rather than a hard-coded enum. Adding a
 future source requires a `HistoryProvider` subclass and one registry entry; upload orchestration,
 SQLAlchemy storage, location isolation, and CLI provider selection remain unchanged.
@@ -145,8 +193,9 @@ fixed internal candidates: Claude checks `history.jsonl` and `projects/**/*.json
 identified by fields such as `sessionId`/`uuid`, while Codex records use `session_id` or Codex event
 types such as `session_meta`. Conflicting evidence is reported as ambiguous instead of guessed.
 
-`msync` only reads the source directory. The archive contains the full conversation content, so it
-should be protected like the original `~/.claude` and `~/.codex` directories.
+The archive contains the full conversation content, so it should be protected like the original
+`~/.claude` and `~/.codex` directories. `upload` is read-only for provider directories; `sync`
+intentionally creates native transcripts in every directory passed to it.
 
 ## Development
 

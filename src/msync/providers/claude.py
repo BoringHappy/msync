@@ -2,16 +2,32 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from msync.models import Event
+from pydantic import ValidationError
+
+from msync.models import Conversation, Event
 from msync.providers.base import (
     ConversationDetails,
     HistoryProvider,
     as_string,
+    display_events,
+    encode_jsonl,
     event_object,
+    event_timestamp,
     message_parts,
+    stable_event_id,
+)
+from msync.schemas.claude import (
+    ClaudeAssistantMessage,
+    ClaudeAssistantRecord,
+    ClaudeContentBlock,
+    ClaudeRecord,
+    ClaudeUsage,
+    ClaudeUserMessage,
+    ClaudeUserRecord,
 )
 
 
@@ -25,36 +41,113 @@ class ClaudeProvider(HistoryProvider):
         return "sessionId" in record or "uuid" in record
 
     def decode_event(self, sequence: int, raw_json: str, value: dict[str, Any]) -> Event:
-        event_type = as_string(value.get("type")) or "unknown"
-        message = value.get("message")
-        message = message if isinstance(message, dict) else {}
-        role = as_string(message.get("role"))
+        try:
+            record = ClaudeRecord.model_validate(value)
+        except ValidationError as error:
+            return Event(
+                sequence=sequence,
+                raw_json=raw_json,
+                event_type=as_string(value.get("type")) or "invalid_record",
+                parse_error=str(error),
+            )
+
+        event_type = record.type
+        message = record.message
+        role = message.role if message is not None else None
         content: Any = None
         visibility = "metadata"
 
         if event_type in {"user", "assistant"}:
             role = role or event_type
             visibility = "display"
-            content = message.get("content")
+            content = message.model_dump(mode="json")["content"] if message is not None else None
         elif event_type == "system":
             role = "system"
-            content = value.get("content")
+            content = record.content
         elif event_type == "summary":
             role = "system"
-            content = value.get("summary")
+            content = record.summary
 
         return Event(
             sequence=sequence,
             raw_json=raw_json,
             event_type=event_type,
-            event_subtype=as_string(value.get("subtype")),
-            external_id=as_string(value.get("uuid") or value.get("messageId")),
-            parent_external_id=as_string(value.get("parentUuid")),
+            event_subtype=record.subtype,
+            external_id=record.uuid or as_string(value.get("messageId")),
+            parent_external_id=record.parent_uuid,
             role=role,
-            occurred_at=as_string(value.get("timestamp")),
+            occurred_at=record.timestamp,
             visibility=visibility,
             parts=message_parts(content),
         )
+
+    def encode_conversation(
+        self,
+        conversation: Conversation,
+        *,
+        session_id: str,
+        started_at: datetime,
+        source_key: str,
+    ) -> bytes:
+        events = display_events(conversation)
+        if not events:
+            raise ValueError("conversation has no displayable user or assistant messages")
+
+        cwd = conversation.cwd or str(Path.home())
+        records: list[ClaudeRecord] = []
+        parent_uuid: str | None = None
+        provenance = {
+            "sourceProvider": conversation.provider,
+            "sourceConversationId": conversation.external_id,
+            "sourceKey": source_key,
+        }
+        for offset, event in enumerate(events, start=1):
+            event_id = stable_event_id(session_id, event)
+            common = {
+                "sessionId": session_id,
+                "uuid": event_id,
+                "parentUuid": parent_uuid,
+                "timestamp": event_timestamp(event, started_at, offset),
+                "cwd": cwd,
+                "gitBranch": conversation.git_branch,
+                "version": "msync-0.1.0",
+                "entrypoint": "msync",
+                "msync": provenance,
+            }
+            text = event.searchable_text
+            if event.role == "user":
+                records.append(
+                    ClaudeUserRecord(
+                        **common,
+                        message=ClaudeUserMessage(content=text),
+                    )
+                )
+            else:
+                records.append(
+                    ClaudeAssistantRecord(
+                        **common,
+                        message=ClaudeAssistantMessage(
+                            id=f"msg_msync_{event_id.replace('-', '')}",
+                            model=conversation.model or "imported",
+                            content=[ClaudeContentBlock(type="text", text=text)],
+                            usage=ClaudeUsage(),
+                        ),
+                    )
+                )
+            parent_uuid = event_id
+        return encode_jsonl(records)
+
+    def export_relative_path(
+        self,
+        conversation: Conversation,
+        *,
+        session_id: str,
+        started_at: datetime,
+    ) -> Path:
+        del started_at
+        cwd = conversation.cwd or str(Path.home())
+        project = cwd.rstrip("/\\").replace("/", "-").replace("\\", "-").replace(":", "-")
+        return Path("projects") / (project or "-") / f"{session_id}.jsonl"
 
     def conversation_details(
         self, events: tuple[Event, ...], path: Path, relative_path: str

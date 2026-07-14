@@ -15,7 +15,7 @@ from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.orm import Session
 
 from msync.models import Conversation
-from msync.providers import HistoryProvider
+from msync.providers import HistoryProvider, get_provider
 from msync.tables import (
     Base,
     ConversationRow,
@@ -80,6 +80,16 @@ class SearchResult:
     role: str | None
     occurred_at: str | None
     text: str
+
+
+@dataclass(slots=True, frozen=True)
+class ArchivedConversation:
+    """One stored transcript together with its source-location identity."""
+
+    location_id: int
+    source_root: str
+    source_mtime_ns: int
+    conversation: Conversation
 
 
 class Archive:
@@ -186,6 +196,55 @@ class Archive:
         )
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
+
+    def conversations(self) -> list[ArchivedConversation]:
+        """Reconstruct every stored conversation from its lossless transcript blob."""
+
+        statement = (
+            select(
+                LocationRow.id,
+                LocationRow.root_path,
+                LocationRow.provider,
+                ConversationRow.relative_path,
+                ConversationRow.source_mtime_ns,
+                ConversationRow.content_sha256,
+                ConversationRow.transcript_codec,
+                ConversationRow.transcript,
+            )
+            .join(ConversationRow, ConversationRow.location_id == LocationRow.id)
+            .order_by(LocationRow.id, ConversationRow.relative_path)
+        )
+        with Session(self.engine) as session:
+            rows = list(session.execute(statement))
+
+        conversations: list[ArchivedConversation] = []
+        for row in rows:
+            if row.transcript_codec != "zlib":
+                raise RuntimeError(
+                    f"Unsupported transcript codec {row.transcript_codec!r} in archive."
+                )
+            try:
+                transcript = zlib.decompress(row.transcript)
+            except zlib.error as error:
+                raise RuntimeError(
+                    "A stored transcript is corrupt and cannot be decompressed."
+                ) from error
+            if hashlib.sha256(transcript).hexdigest() != row.content_sha256:
+                raise RuntimeError("A stored transcript failed its SHA-256 integrity check.")
+
+            root = Path(row.root_path)
+            path = root / Path(row.relative_path)
+            provider = get_provider(row.provider)
+            conversation = provider.read(path, root, transcript=transcript)
+            conversations.append(
+                ArchivedConversation(
+                    location_id=row.id,
+                    source_root=row.root_path,
+                    source_mtime_ns=row.source_mtime_ns,
+                    conversation=conversation,
+                )
+            )
+        return conversations
 
     def _initialize(self) -> None:
         with self.engine.begin() as connection:
