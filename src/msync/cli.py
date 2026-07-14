@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -11,7 +12,7 @@ from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
-from msync.database import Archive
+from msync.database import Archive, SearchResult
 from msync.providers import (
     HistoryFormatError,
     detect_provider,
@@ -133,7 +134,45 @@ def search(
         console.print("No matches found for ", Text(query), ".", sep="")
         return
 
-    console.print(f"[bold]Search results ({len(results)})[/bold]")
+    _print_results("Search results", results)
+
+
+@app.command()
+def sample(
+    limit: Annotated[
+        int,
+        typer.Argument(min=1, help="Maximum number of archived messages to inspect."),
+    ],
+    database: Annotated[
+        str,
+        typer.Option(
+            "--database",
+            "--db",
+            help="SQLite path or SQLAlchemy database URL.",
+            show_default=str(DEFAULT_DATABASE),
+        ),
+    ] = str(DEFAULT_DATABASE),
+) -> None:
+    """Show a random sample of archived conversation messages."""
+
+    try:
+        with Archive(database) as archive:
+            results = archive.sample(limit)
+    except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
+        error_console.print(f"[bold red]Sample failed:[/bold red] {error}")
+        raise typer.Exit(code=1) from error
+
+    if not results:
+        console.print("No archived messages found.")
+        return
+
+    _print_results("Samples", results)
+
+
+def _print_results(title: str, results: Sequence[SearchResult]) -> None:
+    """Render message results with their archive context."""
+
+    console.print(f"[bold]{title} ({len(results)})[/bold]")
     for index, result in enumerate(results, start=1):
         if index > 1:
             console.print()

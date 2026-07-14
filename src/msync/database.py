@@ -10,7 +10,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from sqlalchemy import URL, create_engine, delete, event, inspect, select
+from sqlalchemy import URL, create_engine, delete, event, func, inspect, select
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.orm import Session
 
@@ -71,7 +71,7 @@ class UploadResult:
 
 @dataclass(slots=True, frozen=True)
 class SearchResult:
-    """One archived event whose normalized text matched a search."""
+    """One archived event returned for search or inspection."""
 
     provider: str
     conversation_id: str
@@ -158,6 +158,31 @@ class Archive:
             .join(LocationRow, ConversationRow.location_id == LocationRow.id)
             .where(EventRow.searchable_text.like(f"%{search_text}%"))
             .order_by(EventRow.occurred_at.desc(), EventRow.id.desc())
+        )
+        with Session(self.engine) as session:
+            return [SearchResult(*row) for row in session.execute(statement)]
+
+    def sample(self, limit: int) -> list[SearchResult]:
+        """Return a random selection of non-empty archived message events."""
+
+        if limit < 1:
+            raise ValueError("Sample limit must be greater than zero.")
+        random_order = func.rand() if self.engine.dialect.name == "mysql" else func.random()
+        statement = (
+            select(
+                LocationRow.provider,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.relative_path,
+                EventRow.role,
+                EventRow.occurred_at,
+                EventRow.searchable_text,
+            )
+            .join(ConversationRow, EventRow.conversation_id == ConversationRow.id)
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .where(EventRow.searchable_text != "")
+            .order_by(random_order)
+            .limit(limit)
         )
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]

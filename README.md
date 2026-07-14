@@ -95,6 +95,13 @@ archive:
 $ msync search "blue widget" --database ./history.sqlite
 ```
 
+Randomly inspect a limited number of non-empty archived messages to spot-check imported data:
+
+```console
+$ msync sample 5
+$ msync sample 5 --database ./history.sqlite
+```
+
 ## Storage model
 
 The database is deliberately split into distinct storage and indexing layers:
