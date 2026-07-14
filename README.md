@@ -79,6 +79,29 @@ Uploads are idempotent. Each file is addressed by its source location and relati
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
 and unchanged files are skipped.
 
+## Search history
+
+Search the normalized message text in the default archive:
+
+```console
+$ msync search "blue widget"
+```
+
+Search uses a portable SQL `LIKE` query and returns each matching event with its provider,
+conversation, timestamp, role, and message text. Pass `--database` (or `--db`) to search a different
+archive:
+
+```console
+$ msync search "blue widget" --database ./history.sqlite
+```
+
+Randomly inspect a limited number of non-empty archived messages to spot-check imported data:
+
+```console
+$ msync sample 5
+$ msync sample 5 --database ./history.sqlite
+```
+
 ## Storage model
 
 The database is deliberately split into distinct storage and indexing layers:
