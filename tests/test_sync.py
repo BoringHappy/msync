@@ -325,6 +325,84 @@ def test_sync_reuses_a_managed_revision_from_an_older_path_scheme(tmp_path: Path
     assert _generated_paths(claude_root) == [legacy]
 
 
+def test_same_provider_revisions_are_cloned_instead_of_conflicting(tmp_path: Path) -> None:
+    first_root = tmp_path / "codex-a"
+    second_root = tmp_path / "codex-b"
+    relative_path = Path("sessions/2026/07/14/rollout-shared.jsonl")
+    first_path = first_root / relative_path
+    second_path = second_root / relative_path
+    first_records = _codex_records()
+    second_records = _codex_records()
+    second_records[1]["payload"] = {
+        "type": "user_message",
+        "message": "Question from the second Codex location",
+    }
+    _write_jsonl(first_path, first_records)
+    _write_jsonl(second_path, second_records)
+    first_original = first_path.read_bytes()
+    second_original = second_path.read_bytes()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(first_root),
+            "--dir",
+            str(second_root),
+            "--provider",
+            "codex",
+            "--provider",
+            "codex",
+            "--database",
+            str(tmp_path / "archive.sqlite"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(re.findall(r"Path conflicts\s+0", result.output)) == 2
+    assert first_path.read_bytes() == first_original
+    assert second_path.read_bytes() == second_original
+    for root in (first_root, second_root):
+        assert len(_generated_paths(root)) == 1
+        titles = {get_provider("codex").read(path, root).title for path in root.rglob("*.jsonl")}
+        assert titles == {"Question from Codex", "Question from the second Codex location"}
+
+
+def test_sync_rejects_symlinked_destination_components(tmp_path: Path) -> None:
+    codex_root = tmp_path / ".codex"
+    codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
+    _write_jsonl(codex_path, _codex_records())
+    database = tmp_path / "archive.sqlite"
+    upload = CliRunner().invoke(
+        app,
+        ["upload", "--dir", str(codex_root), "--database", str(database)],
+    )
+    assert upload.exit_code == 0, upload.output
+    destination = tmp_path / ".claude"
+    outside = tmp_path / "outside"
+    destination.mkdir()
+    outside.mkdir()
+    (destination / "projects").symlink_to(outside, target_is_directory=True)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(destination),
+            "--provider",
+            "claude",
+            "--database",
+            str(database),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Refusing to write through a symlink" in result.output
+    assert list(outside.rglob("*.jsonl")) == []
+
+
 def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_path: Path) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"

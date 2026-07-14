@@ -72,8 +72,9 @@ exist; `msync` creates and versions its tables automatically.
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
 unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
-triggers. A partial, older, or incompatible schema fails before any transcript is uploaded; create
-a new database instead of migrating it.
+triggers. Schema version 3 is migrated in place to version 4 by backfilling logical revision
+identities and collapsing duplicates before the unique index is created. Partial, older, or
+otherwise incompatible schemas fail before any transcript is uploaded.
 
 Uploads are idempotent. Each file is addressed by its source location and relative path, then
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
@@ -82,10 +83,11 @@ is already archived through another location or provider.
 
 The raw SHA-256 identifies an exact provider transcript. A canonical chat SHA-256 hashes the
 ordered visible `(role, text)` turns, while a stable logical session UUID follows the conversation
-through provider conversions and location changes. Both are stored under `metadata_json._msync`.
-The pair `(logical_session_id, chat_sha256)` identifies one revision, preventing an exported Claude
-or Codex copy from being archived again as a new conversation. A changed chat hash distinguishes a
-new revision of the same logical session.
+through provider conversions and location changes. Both have indexed columns on `conversations`
+and are also stored under `metadata_json._msync`. A database unique index on
+`(logical_session_id, chat_sha256)` prevents concurrent or sequential uploads of an exported Claude
+or Codex copy from creating another conversation row. A changed chat hash distinguishes a new
+revision of the same logical session.
 
 `upload` only reads the source directory. Use `sync` when native history files should also be
 written.
@@ -127,12 +129,13 @@ available in the archive but are not translated into the other provider's execut
 
 Every destination contains a `.msync-manifest.json` provenance file. It prevents exported copies
 from feeding back into the archive on the next sync. Existing sessions are immutable: a changed
-cross-provider source receives a new deterministic revision ID and path, while same-provider path
-collisions and sessions continued in Claude or Codex are left untouched. Revision IDs derive only
-from the stable logical session UUID and canonical chat SHA-256, so the same revision gets the same
-native ID regardless of its source provider or location. A session already native to the
-destination location is skipped. Unknown path collisions are reported and left untouched.
-Generated transcript and manifest files use owner-only permissions.
+source receives a new deterministic revision ID and path, and same-provider path collisions are
+cloned under that revision identity instead of overwriting either session. Sessions continued in
+Claude or Codex are left untouched. Revision IDs derive only from the stable logical session UUID
+and canonical chat SHA-256, so the same revision gets the same native ID regardless of its source
+provider or location. A session already native to the destination location is skipped. Unknown path
+collisions are reported and left untouched. Sync rejects symlinks in every destination path
+component, and generated transcript and manifest files use owner-only permissions.
 
 ## Search history
 
@@ -165,7 +168,7 @@ The database is deliberately split into distinct storage and indexing layers:
 | --- | --- |
 | `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
 | `locations` | One Claude/Codex data directory, allowing multiple installations of either provider. |
-| `conversations` | Session metadata and a zlib-compressed, byte-exact copy of the source JSONL. |
+| `conversations` | Session metadata, unique logical revision identity, and a zlib-compressed byte-exact source JSONL. |
 | `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
 | `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |

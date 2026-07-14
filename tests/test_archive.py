@@ -197,6 +197,11 @@ def test_upload_collapses_duplicate_rows_created_before_logical_identity(tmp_pat
                 "sessions/two.jsonl",
             ),
         )
+        connection.execute("DROP INDEX conversations_logical_revision_uq")
+        connection.execute("ALTER TABLE conversations DROP COLUMN logical_session_id")
+        connection.execute("ALTER TABLE conversations DROP COLUMN chat_sha256")
+        connection.execute("UPDATE schema_info SET value = '3' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 3")
         connection.commit()
 
     with Archive(database) as archive:

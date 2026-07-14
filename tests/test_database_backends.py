@@ -36,7 +36,20 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("3",)
+        ).fetchone() == ("4",)
+        primary_keys = {
+            table: tuple(
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})") if row[5]
+            )
+            for table in Base.metadata.tables
+        }
+        assert primary_keys == {
+            "schema_info": ("key",),
+            "locations": ("id",),
+            "conversations": ("id",),
+            "events": ("id",),
+            "message_parts": ("id",),
+        }
 
     with Archive(database) as archive:
         assert archive.initialized_new_database is False
@@ -62,6 +75,8 @@ def test_schema_compiles_for_postgresql_and_mysql() -> None:
     assert "LONGBLOB" in mysql_ddl
     assert "LONGTEXT" in mysql_ddl
     assert "conversations_location_path_hash_uq" in mysql_ddl
+    assert "conversations_logical_revision_uq" in postgresql_ddl
+    assert "conversations_logical_revision_uq" in mysql_ddl
 
 
 def test_common_database_urls_select_supported_drivers() -> None:

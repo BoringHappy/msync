@@ -91,6 +91,26 @@ def sync_conversations(
         if conversation.provider == provider.name:
             relative_path = Path(conversation.relative_path)
             content = conversation.transcript
+            _, native_path = _destination_path(destination, relative_path)
+            native_hash = hashlib.sha256(content).hexdigest()
+            if native_path.exists() and (
+                not native_path.is_file() or _file_hash(native_path) != native_hash
+            ):
+                try:
+                    content = provider.encode_conversation(
+                        conversation,
+                        session_id=session_id,
+                        started_at=started_at,
+                        source_key=source_key,
+                    )
+                except ValueError:
+                    skipped += 1
+                    continue
+                relative_path = provider.export_relative_path(
+                    conversation,
+                    session_id=session_id,
+                    started_at=started_at,
+                )
         else:
             try:
                 content = provider.encode_conversation(
@@ -108,17 +128,13 @@ def sync_conversations(
                 started_at=started_at,
             )
 
-        relative_key = _safe_relative_path(relative_path)
-        output_path = destination / relative_key
+        relative_key, output_path = _destination_path(destination, relative_path)
         expected_hash = hashlib.sha256(content).hexdigest()
         entry = files.get(relative_key)
         if not isinstance(entry, dict):
             entry = None
         sources = set(entry.get("sources", [])) if entry else set()
 
-        if output_path.is_symlink():
-            conflicts.append(relative_key)
-            continue
         if output_path.exists():
             actual_hash = _file_hash(output_path)
             if actual_hash == expected_hash:
@@ -130,7 +146,7 @@ def sync_conversations(
                 conflicts.append(relative_key)
                 continue
         else:
-            _atomic_write(output_path, content)
+            _atomic_write(output_path, content, destination=destination)
             written += 1
 
         sources.add(source_key)
@@ -160,11 +176,10 @@ def _manifest_revision_paths(
         if not isinstance(entry, dict):
             continue
         try:
-            relative_key = _safe_relative_path(Path(relative_path))
+            relative_key, path = _destination_path(destination, Path(relative_path))
         except HistoryFormatError:
             continue
-        path = destination / relative_key
-        if not path.is_file() or path.is_symlink():
+        if not path.is_file():
             continue
         try:
             conversation = provider.read(path, destination)
@@ -268,11 +283,24 @@ def _load_manifest(root: Path) -> dict[str, Any]:
 
 def _write_manifest(root: Path, manifest: dict[str, Any]) -> None:
     content = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    _atomic_write(root / MANIFEST_NAME, content)
+    _atomic_write(root / MANIFEST_NAME, content, destination=root)
 
 
-def _atomic_write(path: Path, content: bytes) -> None:
+def _destination_path(destination: Path, relative_path: Path) -> tuple[str, Path]:
+    relative_key = _safe_relative_path(relative_path)
+    path = destination
+    for part in Path(relative_key).parts:
+        path /= part
+        if path.is_symlink():
+            raise HistoryFormatError(
+                f"Refusing to write through a symlink in the destination: {path}"
+            )
+    return relative_key, path
+
+
+def _atomic_write(path: Path, content: bytes, *, destination: Path) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _destination_path(destination, path.relative_to(destination))
     descriptor, temporary_name = tempfile.mkstemp(prefix=".msync-", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
@@ -281,6 +309,7 @@ def _atomic_write(path: Path, content: bytes) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        _destination_path(destination, path.relative_to(destination))
         os.replace(temporary_path, path)
         os.chmod(path, 0o600)
     except BaseException:
