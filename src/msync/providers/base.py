@@ -1,0 +1,218 @@
+"""Shared contracts and JSONL machinery for history providers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, cast
+
+from msync.models import Conversation, Event, MessagePart
+
+
+class HistoryFormatError(ValueError):
+    """Raised when a history provider cannot be identified or loaded."""
+
+
+@dataclass(slots=True)
+class ConversationDetails:
+    """Provider-specific session fields normalized into the common schema."""
+
+    external_id: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    kind: str = "main"
+    parent_external_id: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    git_branch: str | None = None
+
+
+class HistoryProvider(ABC):
+    """Extension point implemented independently by each history source."""
+
+    name: str
+    search_directories: tuple[str, ...]
+    ignored_filenames: frozenset[str] = frozenset({"history.jsonl"})
+
+    @abstractmethod
+    def matches_record(self, record: dict[str, Any]) -> bool:
+        """Return whether a representative JSONL record belongs to this provider."""
+
+    @abstractmethod
+    def decode_event(self, sequence: int, raw_json: str, value: dict[str, Any]) -> Event:
+        """Normalize one valid JSON object without discarding its source representation."""
+
+    @abstractmethod
+    def conversation_details(
+        self, events: tuple[Event, ...], path: Path, relative_path: str
+    ) -> ConversationDetails:
+        """Extract provider-specific conversation metadata."""
+
+    def discover(self, root: Path) -> list[Path]:
+        """Find transcript files in this provider's standard subdirectories."""
+
+        search_roots = [
+            root / directory for directory in self.search_directories if (root / directory).is_dir()
+        ]
+        if not search_roots:
+            search_roots = [root]
+        paths = {
+            path.resolve()
+            for search_root in search_roots
+            for path in search_root.rglob("*.jsonl")
+            if path.is_file() and path.name not in self.ignored_filenames
+        }
+        return sorted(paths)
+
+    def matches_name(self, root: Path) -> bool:
+        """Match the provider name anywhere in the directory basename."""
+
+        return self.name.casefold() in root.name.casefold()
+
+    def detection_paths(self, root: Path) -> list[Path]:
+        """Return only fixed provider locations used for content detection."""
+
+        paths: set[Path] = set()
+        history = root / "history.jsonl"
+        if history.is_file():
+            paths.add(history.resolve())
+        for directory in self.search_directories:
+            search_root = root / directory
+            if search_root.is_dir():
+                paths.update(
+                    path.resolve() for path in search_root.rglob("*.jsonl") if path.is_file()
+                )
+        return sorted(paths)
+
+    def read(
+        self,
+        path: Path,
+        root: Path,
+        *,
+        transcript: bytes | None = None,
+    ) -> Conversation:
+        """Read one transcript while retaining its exact source bytes."""
+
+        transcript = path.read_bytes() if transcript is None else transcript
+        events = tuple(self._decode_events(transcript))
+        relative_path = path.relative_to(root).as_posix()
+        details = self.conversation_details(events, path, relative_path)
+        timestamps = [event.occurred_at for event in events if event.occurred_at]
+        return Conversation(
+            path=path,
+            relative_path=relative_path,
+            provider=self.name,
+            transcript=transcript,
+            sha256=hashlib.sha256(transcript).hexdigest(),
+            external_id=details.external_id,
+            events=events,
+            metadata=details.metadata,
+            kind=details.kind,
+            parent_external_id=details.parent_external_id,
+            title=first_user_title(events),
+            cwd=details.cwd,
+            model=details.model,
+            git_branch=details.git_branch,
+            started_at=min(timestamps) if timestamps else None,
+            ended_at=max(timestamps) if timestamps else None,
+        )
+
+    def _decode_events(self, transcript: bytes) -> Iterable[Event]:
+        for sequence, raw_line in enumerate(transcript.splitlines()):
+            if not raw_line.strip():
+                continue
+            raw_json = raw_line.decode("utf-8", errors="replace")
+            try:
+                value = json.loads(raw_json)
+                if not isinstance(value, dict):
+                    raise ValueError("JSON record is not an object")
+            except (json.JSONDecodeError, ValueError) as error:
+                yield Event(
+                    sequence=sequence,
+                    raw_json=raw_json,
+                    event_type="invalid_json",
+                    parse_error=str(error),
+                )
+                continue
+            yield self.decode_event(sequence, raw_json, value)
+
+
+def first_json_record(path: Path) -> dict[str, Any] | None:
+    """Read only enough of a transcript to identify its provider."""
+
+    try:
+        with path.open("rb") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                return value if isinstance(value, dict) else None
+    except OSError, UnicodeDecodeError, json.JSONDecodeError:
+        return None
+    return None
+
+
+def message_parts(content: Any) -> tuple[MessagePart, ...]:
+    """Normalize string or structured message content into ordered blocks."""
+
+    if content is None:
+        return ()
+    blocks = content if isinstance(content, list) else [content]
+    parts: list[MessagePart] = []
+    for sequence, block in enumerate(blocks):
+        if isinstance(block, dict):
+            content_type = as_string(block.get("type")) or "object"
+        else:
+            content_type = "text" if isinstance(block, str) else type(block).__name__
+        parts.append(
+            MessagePart(
+                sequence=sequence,
+                content_type=content_type,
+                text=block_text(block),
+                raw_json=json.dumps(block, ensure_ascii=False, separators=(",", ":")),
+            )
+        )
+    return tuple(parts)
+
+
+def block_text(block: Any) -> str | None:
+    """Extract human-readable text from a provider message block."""
+
+    if isinstance(block, str):
+        return block
+    if isinstance(block, list):
+        text = [item for value in block if (item := block_text(value))]
+        return "\n".join(text) or None
+    if not isinstance(block, dict):
+        return None
+    for key in ("text", "input_text", "output_text", "content", "message"):
+        if key in block and (text := block_text(block[key])):
+            return text
+    return None
+
+
+def event_object(event: Event) -> dict[str, Any] | None:
+    """Decode a retained event when extracting conversation-level metadata."""
+
+    try:
+        value = json.loads(event.raw_json)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def first_user_title(events: tuple[Event, ...]) -> str | None:
+    for event in events:
+        if event.role != "user" or event.visibility != "display":
+            continue
+        title = " ".join(event.searchable_text.split())
+        if title:
+            return title[:160]
+    return None
+
+
+def as_string(value: Any) -> str | None:
+    return cast(str, value) if isinstance(value, str) and value else None
