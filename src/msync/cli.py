@@ -8,6 +8,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
@@ -172,17 +173,29 @@ def sample(
 def _print_results(title: str, results: Sequence[SearchResult]) -> None:
     """Render message results with their archive context."""
 
-    console.print(f"[bold]{title} ({len(results)})[/bold]")
+    console.print(Text.assemble((title, "bold cyan"), (f" ({len(results)})", "bold")))
     for index, result in enumerate(results, start=1):
-        if index > 1:
-            console.print()
-        header = Text(f"{index}. {result.provider}", style="bold")
-        header.append(f" · {result.title or result.conversation_id}")
-        header.append(
-            f" · {result.occurred_at or 'unknown time'} · {result.role or 'unknown role'}",
-            style="dim",
+        heading = Text.assemble(
+            (f" {index} ", "bold white on cyan"),
+            (f" {result.provider} ", "bold cyan"),
         )
-        console.print(header)
+        console.print(Rule(heading, style="cyan"))
+
+        metadata = Table.grid(padding=(0, 1))
+        metadata.add_column(style="dim", no_wrap=True)
+        metadata.add_column()
+        metadata.add_row("Conversation", result.title or result.conversation_id)
+        metadata.add_row("Time", result.occurred_at or "unknown")
+        role = result.role or "unknown"
+        role_style = {
+            "assistant": "bold magenta",
+            "system": "bold blue",
+            "tool": "bold yellow",
+            "user": "bold green",
+        }.get(role, "bold")
+        metadata.add_row("Role", Text(role, style=role_style))
+        console.print(metadata)
+        console.print()
         console.print(Text(result.text.strip()))
 
 

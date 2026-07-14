@@ -189,9 +189,11 @@ def test_sample_command_limits_random_messages(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "Samples (2)" in result.output
-    assert "1. codex" in result.output
-    assert "2. codex" in result.output
-    assert "3. codex" not in result.output
+    assert " 1  codex " in result.output
+    assert " 2  codex " in result.output
+    assert result.output.count("─") > 2
+    assert result.output.count("Conversation") == 2
+    assert result.output.count("Role         user") == 2
 
 
 def test_sample_command_reports_empty_archive(tmp_path: Path) -> None:
