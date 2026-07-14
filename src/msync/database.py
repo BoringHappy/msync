@@ -65,6 +65,7 @@ class UploadResult:
     imported: int = 0
     updated: int = 0
     unchanged: int = 0
+    duplicates: int = 0
     events: int = 0
     message_parts: int = 0
 
@@ -411,10 +412,41 @@ class Archive:
         if existing is not None and existing.relative_path != relative_path:
             raise RuntimeError("A SHA-256 collision occurred while identifying a transcript.")
         if existing is not None and existing.content_sha256 == content_sha256:
+            identity = _stored_identity(existing.metadata_json)
+            conversation = None
+            if identity is None:
+                conversation = provider.read(path, root, transcript=transcript)
+                identity = _conversation_identity(conversation)
+            duplicate = _find_duplicate_identity(
+                session,
+                identity,
+                exclude_id=existing.id,
+            )
+            if duplicate is not None:
+                if duplicate < existing.id:
+                    session.delete(existing)
+                    result.duplicates += 1
+                    return
+                session.execute(delete(ConversationRow).where(ConversationRow.id == duplicate))
+                result.duplicates += 1
+            if conversation is not None:
+                existing.metadata_json = _metadata_with_identity(
+                    existing.metadata_json, conversation
+                )
             result.unchanged += 1
             return
 
         conversation = provider.read(path, root, transcript=transcript)
+        duplicate = _find_duplicate_conversation(
+            session,
+            conversation,
+            exclude_id=existing.id if existing is not None else None,
+        )
+        if duplicate is not None:
+            if existing is not None:
+                session.delete(existing)
+            result.duplicates += 1
+            return
         stat = path.stat()
         if existing is None:
             existing = ConversationRow(
@@ -492,8 +524,90 @@ def _update_conversation(
     row.content_sha256 = conversation.sha256
     row.transcript_codec = "zlib"
     row.transcript = zlib.compress(conversation.transcript)
-    row.metadata_json = conversation.metadata
+    row.metadata_json = _metadata_with_identity(conversation.metadata, conversation)
     row.imported_at = datetime.now(UTC)
+
+
+def _find_duplicate_conversation(
+    session: Session,
+    conversation: Conversation,
+    *,
+    exclude_id: int | None,
+) -> int | None:
+    return _find_duplicate_identity(
+        session,
+        _conversation_identity(conversation),
+        exclude_id=exclude_id,
+    )
+
+
+def _find_duplicate_identity(
+    session: Session,
+    identity: tuple[str, str | None],
+    *,
+    exclude_id: int | None,
+) -> int | None:
+    if identity[1] is None:
+        return None
+    rows = session.execute(
+        select(ConversationRow, LocationRow.root_path, LocationRow.provider).join(
+            LocationRow, ConversationRow.location_id == LocationRow.id
+        )
+    )
+    for row, root_path, provider_name in rows:
+        if row.id == exclude_id:
+            continue
+        stored_identity = _stored_identity(row.metadata_json)
+        if stored_identity is None:
+            transcript = _decompress_transcript(row)
+            root = Path(root_path)
+            conversation = get_provider(provider_name).read(
+                root / Path(row.relative_path),
+                root,
+                transcript=transcript,
+            )
+            row.metadata_json = _metadata_with_identity(row.metadata_json, conversation)
+            stored_identity = _conversation_identity(conversation)
+        if stored_identity == identity:
+            return row.id
+    return None
+
+
+def _decompress_transcript(row: ConversationRow) -> bytes:
+    if row.transcript_codec != "zlib":
+        raise RuntimeError(f"Unsupported transcript codec {row.transcript_codec!r} in archive.")
+    try:
+        transcript = zlib.decompress(row.transcript)
+    except zlib.error as error:
+        raise RuntimeError("A stored transcript is corrupt and cannot be decompressed.") from error
+    if hashlib.sha256(transcript).hexdigest() != row.content_sha256:
+        raise RuntimeError("A stored transcript failed its SHA-256 integrity check.")
+    return transcript
+
+
+def _conversation_identity(conversation: Conversation) -> tuple[str, str | None]:
+    return conversation.logical_session_id, conversation.chat_sha256
+
+
+def _stored_identity(metadata: dict[str, Any] | None) -> tuple[str, str | None] | None:
+    if not isinstance(metadata, dict):
+        return None
+    msync = metadata.get("_msync")
+    if not isinstance(msync, dict) or not isinstance(msync.get("logical_session_id"), str):
+        return None
+    chat_sha256 = msync.get("chat_sha256")
+    if chat_sha256 is not None and not isinstance(chat_sha256, str):
+        return None
+    return msync["logical_session_id"], chat_sha256
+
+
+def _metadata_with_identity(metadata: dict[str, Any], conversation: Conversation) -> dict[str, Any]:
+    stored = dict(metadata)
+    stored["_msync"] = {
+        "chat_sha256": conversation.chat_sha256,
+        "logical_session_id": conversation.logical_session_id,
+    }
+    return stored
 
 
 def _normalize_database(database: str | Path) -> tuple[URL, Path | None]:

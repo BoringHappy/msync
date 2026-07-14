@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ class ConversationDetails:
     """Provider-specific session fields normalized into the common schema."""
 
     external_id: str
+    logical_session_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     kind: str = "main"
     parent_external_id: str | None = None
@@ -128,6 +130,11 @@ class HistoryProvider(ABC):
         events = tuple(self._decode_events(transcript))
         relative_path = path.relative_to(root).as_posix()
         details = self.conversation_details(events, path, relative_path)
+        logical_session_id = normalized_session_id(
+            details.logical_session_id,
+            provider=self.name,
+            external_id=details.external_id,
+        )
         timestamps = [event.occurred_at for event in events if event.occurred_at]
         return Conversation(
             path=path,
@@ -135,7 +142,9 @@ class HistoryProvider(ABC):
             provider=self.name,
             transcript=transcript,
             sha256=hashlib.sha256(transcript).hexdigest(),
+            chat_sha256=canonical_chat_sha256(events),
             external_id=details.external_id,
+            logical_session_id=logical_session_id,
             events=events,
             metadata=details.metadata,
             kind=details.kind,
@@ -249,13 +258,65 @@ def as_string(value: Any) -> str | None:
 def display_events(conversation: Conversation) -> tuple[Event, ...]:
     """Return human-visible user/assistant turns that can cross provider boundaries."""
 
-    return tuple(
+    return transferable_events(conversation.events)
+
+
+def transferable_events(events: Iterable[Event]) -> tuple[Event, ...]:
+    """Return provider-neutral turns without double-counting mirrored model events."""
+
+    candidates = tuple(
         event
-        for event in conversation.events
-        if event.visibility == "display"
+        for event in events
+        if event.visibility in {"display", "model"}
         and event.role in {"user", "assistant"}
         and event.searchable_text.strip()
     )
+    display_counts = Counter(
+        (event.role, event.searchable_text) for event in candidates if event.visibility == "display"
+    )
+    selected: list[Event] = []
+    for event in candidates:
+        identity = (event.role, event.searchable_text)
+        if event.visibility == "model" and display_counts[identity]:
+            display_counts[identity] -= 1
+            continue
+        selected.append(event)
+    return tuple(selected)
+
+
+def canonical_chat_sha256(events: Iterable[Event]) -> str | None:
+    """Hash provider-independent visible turns while preserving order and boundaries."""
+
+    messages = [[event.role, event.searchable_text] for event in transferable_events(events)]
+    if not messages:
+        return None
+    canonical = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def canonical_session_id(provider: str, external_id: str) -> str:
+    """Return a stable UUID for one logical session across locations and formats."""
+
+    try:
+        return str(UUID(external_id))
+    except ValueError:
+        return str(uuid5(UUID("2561dd24-f9ac-4e7a-b4ca-4f72b1f5d907"), f"{provider}:{external_id}"))
+
+
+def normalized_session_id(
+    supplied: str | None,
+    *,
+    provider: str,
+    external_id: str,
+) -> str:
+    """Validate an inherited logical UUID or derive one from the native session identity."""
+
+    if supplied is not None:
+        try:
+            return str(UUID(supplied))
+        except ValueError:
+            pass
+    return canonical_session_id(provider, external_id)
 
 
 def stable_event_id(session_id: str, event: Event) -> str:

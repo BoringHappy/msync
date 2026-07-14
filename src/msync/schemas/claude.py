@@ -28,6 +28,15 @@ class ClaudeUsage(NativeRecord):
     cache_read_input_tokens: int = 0
 
 
+class ClaudeSyncProvenance(NativeRecord):
+    """Stable msync identity retained across provider conversions."""
+
+    source_provider: str | None = Field(default=None, alias="sourceProvider")
+    source_conversation_id: str | None = Field(default=None, alias="sourceConversationId")
+    source_key: str | None = Field(default=None, alias="sourceKey")
+    logical_session_id: str | None = Field(default=None, alias="logicalSessionId")
+
+
 class ClaudeMessage(NativeRecord):
     """Provider message nested inside a Claude transcript record."""
 
@@ -73,6 +82,7 @@ class ClaudeRecord(NativeRecord):
     content: Any = None
     summary: str | None = None
     subtype: str | None = None
+    msync: ClaudeSyncProvenance | None = None
 
 
 class ClaudeUserRecord(ClaudeRecord):

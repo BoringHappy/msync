@@ -18,7 +18,6 @@ from msync.providers import HistoryFormatError, HistoryProvider
 
 MANIFEST_NAME = ".msync-manifest.json"
 MANIFEST_VERSION = 1
-SESSION_NAMESPACE = UUID("bf0e673b-33eb-4b72-aed5-a34c11b4a2b6")
 
 
 @dataclass(slots=True, frozen=True)
@@ -30,6 +29,7 @@ class SyncResult:
     unchanged: int = 0
     protected: int = 0
     skipped: int = 0
+    equivalent: int = 0
     conflicts: tuple[str, ...] = ()
 
 
@@ -59,10 +59,16 @@ def sync_conversations(
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
     manifest = _load_manifest(destination)
     files: dict[str, dict[str, Any]] = manifest["files"]
-    current = written = unchanged = protected = skipped = 0
+    existing_revisions = _manifest_revision_paths(destination, provider, files)
+    selected, current, equivalent = _collapse_equivalent_chats(
+        conversations,
+        destination=destination,
+        provider=provider,
+    )
+    written = unchanged = protected = skipped = 0
     conflicts: list[str] = []
 
-    for archived in conversations:
+    for archived in selected:
         conversation = archived.conversation
         source_root = Path(archived.source_root).expanduser().resolve()
         if source_root == destination and conversation.provider == provider.name:
@@ -70,7 +76,17 @@ def sync_conversations(
             continue
 
         source_key = _source_key(archived)
-        session_id = str(uuid5(SESSION_NAMESPACE, source_key))
+        revision_hash = conversation.chat_sha256 or conversation.sha256
+        revision_identity = (conversation.logical_session_id, conversation.chat_sha256)
+        legacy_path = existing_revisions.get(revision_identity)
+        if conversation.chat_sha256 is not None and legacy_path is not None:
+            entry = files[legacy_path]
+            sources = set(entry.get("sources", []))
+            sources.add(source_key)
+            entry["sources"] = sorted(sources)
+            unchanged += 1
+            continue
+        session_id = str(uuid5(UUID(conversation.logical_session_id), revision_hash))
         started_at = _started_at(archived)
         if conversation.provider == provider.name:
             relative_path = Path(conversation.relative_path)
@@ -99,7 +115,6 @@ def sync_conversations(
         if not isinstance(entry, dict):
             entry = None
         sources = set(entry.get("sources", [])) if entry else set()
-        recorded_hash = entry.get("sha256") if entry else None
 
         if output_path.is_symlink():
             conflicts.append(relative_key)
@@ -108,12 +123,9 @@ def sync_conversations(
             actual_hash = _file_hash(output_path)
             if actual_hash == expected_hash:
                 unchanged += 1
-            elif source_key in sources and actual_hash != recorded_hash:
+            elif source_key in sources:
                 protected += 1
                 continue
-            elif source_key in sources and len(sources) == 1 and actual_hash == recorded_hash:
-                _atomic_write(output_path, content)
-                written += 1
             else:
                 conflicts.append(relative_key)
                 continue
@@ -131,8 +143,82 @@ def sync_conversations(
         unchanged=unchanged,
         protected=protected,
         skipped=skipped,
+        equivalent=equivalent,
         conflicts=tuple(conflicts),
     )
+
+
+def _manifest_revision_paths(
+    destination: Path,
+    provider: HistoryProvider,
+    files: dict[str, dict[str, Any]],
+) -> dict[tuple[str, str | None], str]:
+    """Index managed histories by logical revision, including older msync path schemes."""
+
+    revisions: dict[tuple[str, str | None], str] = {}
+    for relative_path, entry in files.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            relative_key = _safe_relative_path(Path(relative_path))
+        except HistoryFormatError:
+            continue
+        path = destination / relative_key
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            conversation = provider.read(path, destination)
+        except HistoryFormatError, OSError:
+            continue
+        if conversation.chat_sha256 is not None:
+            revisions.setdefault(
+                (conversation.logical_session_id, conversation.chat_sha256),
+                relative_key,
+            )
+    return revisions
+
+
+def _collapse_equivalent_chats(
+    conversations: list[ArchivedConversation],
+    *,
+    destination: Path,
+    provider: HistoryProvider,
+) -> tuple[list[ArchivedConversation], int, int]:
+    groups: dict[str, list[ArchivedConversation]] = {}
+    selected = []
+    for archived in conversations:
+        conversation = archived.conversation
+        chat_sha256 = conversation.chat_sha256
+        if chat_sha256 is None:
+            selected.append(archived)
+        else:
+            logical_revision = f"{conversation.logical_session_id}:{chat_sha256}"
+            groups.setdefault(logical_revision, []).append(archived)
+
+    current = 0
+    equivalent = 0
+    for group in groups.values():
+        local = [
+            archived
+            for archived in group
+            if Path(archived.source_root).expanduser().resolve() == destination
+            and archived.conversation.provider == provider.name
+        ]
+        equivalent += len(group) - 1
+        if local:
+            current += len(local)
+            continue
+        selected.append(
+            min(
+                group,
+                key=lambda archived: (
+                    archived.conversation.provider != provider.name,
+                    archived.source_root,
+                    archived.conversation.relative_path,
+                ),
+            )
+        )
+    return selected, current, equivalent
 
 
 def _source_key(archived: ArchivedConversation) -> str:

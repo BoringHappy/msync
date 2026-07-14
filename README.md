@@ -77,7 +77,15 @@ a new database instead of migrating it.
 
 Uploads are idempotent. Each file is addressed by its source location and relative path, then
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
-and unchanged files are skipped.
+and unchanged files are skipped. Before insertion, msync also skips a logical session revision that
+is already archived through another location or provider.
+
+The raw SHA-256 identifies an exact provider transcript. A canonical chat SHA-256 hashes the
+ordered visible `(role, text)` turns, while a stable logical session UUID follows the conversation
+through provider conversions and location changes. Both are stored under `metadata_json._msync`.
+The pair `(logical_session_id, chat_sha256)` identifies one revision, preventing an exported Claude
+or Codex copy from being archived again as a new conversation. A changed chat hash distinguishes a
+new revision of the same logical session.
 
 `upload` only reads the source directory. Use `sync` when native history files should also be
 written.
@@ -118,10 +126,13 @@ schemas. Provider-specific tool calls, reasoning, usage, and system metadata rem
 available in the archive but are not translated into the other provider's execution protocol.
 
 Every destination contains a `.msync-manifest.json` provenance file. It prevents exported copies
-from feeding back into the archive on the next sync, permits safe updates when the source changes,
-and ensures a session continued in Claude or Codex is never overwritten. Unknown path collisions
-are reported and left untouched. Generated transcript and manifest files use owner-only
-permissions.
+from feeding back into the archive on the next sync. Existing sessions are immutable: a changed
+cross-provider source receives a new deterministic revision ID and path, while same-provider path
+collisions and sessions continued in Claude or Codex are left untouched. Revision IDs derive only
+from the stable logical session UUID and canonical chat SHA-256, so the same revision gets the same
+native ID regardless of its source provider or location. A session already native to the
+destination location is skipped. Unknown path collisions are reported and left untouched.
+Generated transcript and manifest files use owner-only permissions.
 
 ## Search history
 
@@ -159,13 +170,14 @@ The database is deliberately split into distinct storage and indexing layers:
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
 | `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |
 
-The original transcript blob and per-event raw JSON retain all data needed for future export or
-conversation reconstruction. Normalized columns are an index, not a replacement for the source.
-Foreign keys tie records to the location they came from, so identical session IDs in `.codex` and
-`.codex_another` remain independent. Full-length text and binary column variants keep large events
-and transcripts safe on MySQL, while SHA-256 path identities avoid backend-specific index-length
-limits. PostgreSQL/MySQL full-text indexes can be added as search adapters without changing the
-portable archive records.
+The retained transcript blob and per-event raw JSON preserve all data needed for future export or
+conversation reconstruction. Normalized columns are an index, not a replacement for the retained
+source. Foreign keys record the location of the retained copy. Identical logical revisions found in
+another provider or location are skipped; different revisions remain distinct when they exist as
+separate source transcripts. Full-length text and binary column variants keep large events and
+transcripts safe on MySQL, while SHA-256 path identities avoid backend-specific index-length limits.
+PostgreSQL/MySQL full-text indexes can be added as search adapters without changing the portable
+archive records.
 
 ## Provider architecture
 

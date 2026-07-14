@@ -99,6 +99,7 @@ def upload(
     table.add_row("Imported", str(result.imported))
     table.add_row("Updated", str(result.updated))
     table.add_row("Unchanged", str(result.unchanged))
+    table.add_row("Duplicates skipped", str(result.duplicates))
     table.add_row("Events indexed", str(result.events))
     console.print(table)
 
@@ -315,11 +316,13 @@ def _print_sync_result(
     table.add_row("Archived", str(upload.imported))
     table.add_row("Archive updated", str(upload.updated))
     table.add_row("Archive unchanged", str(upload.unchanged))
+    table.add_row("Archive duplicates skipped", str(upload.duplicates))
     table.add_row("Native histories kept", str(result.current))
     table.add_row("Native histories written", str(result.written))
     table.add_row("Native histories unchanged", str(result.unchanged))
-    table.add_row("Continued exports protected", str(result.protected))
+    table.add_row("Existing histories protected", str(result.protected))
     table.add_row("Histories without messages skipped", str(result.skipped))
+    table.add_row("Equivalent histories collapsed", str(result.equivalent))
     table.add_row("Path conflicts", str(len(result.conflicts)))
     console.print(table)
     for conflict in result.conflicts:

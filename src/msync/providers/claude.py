@@ -13,6 +13,7 @@ from msync.providers.base import (
     ConversationDetails,
     HistoryProvider,
     as_string,
+    canonical_session_id,
     display_events,
     encode_jsonl,
     event_object,
@@ -100,6 +101,7 @@ class ClaudeProvider(HistoryProvider):
             "sourceProvider": conversation.provider,
             "sourceConversationId": conversation.external_id,
             "sourceKey": source_key,
+            "logicalSessionId": conversation.logical_session_id,
         }
         for offset, event in enumerate(events, start=1):
             event_id = stable_event_id(session_id, event)
@@ -153,6 +155,7 @@ class ClaudeProvider(HistoryProvider):
         self, events: tuple[Event, ...], path: Path, relative_path: str
     ) -> ConversationDetails:
         external_id: str | None = None
+        logical_session_id: str | None = None
         cwd: str | None = None
         model: str | None = None
         git_branch: str | None = None
@@ -163,6 +166,21 @@ class ClaudeProvider(HistoryProvider):
             if value is None:
                 continue
             external_id = as_string(value.get("sessionId")) or external_id
+            provenance = value.get("msync")
+            if isinstance(provenance, dict):
+                logical_session_id = (
+                    as_string(provenance.get("logicalSessionId")) or logical_session_id
+                )
+                source_provider = as_string(provenance.get("sourceProvider"))
+                source_conversation_id = as_string(provenance.get("sourceConversationId"))
+                if (
+                    logical_session_id is None
+                    and source_provider is not None
+                    and source_conversation_id is not None
+                ):
+                    logical_session_id = canonical_session_id(
+                        source_provider, source_conversation_id
+                    )
             cwd = as_string(value.get("cwd")) or cwd
             git_branch = as_string(value.get("gitBranch")) or git_branch
             if version := as_string(value.get("version")):
@@ -176,6 +194,7 @@ class ClaudeProvider(HistoryProvider):
         is_subagent = "/subagents/" in f"/{relative_path}"
         return ConversationDetails(
             external_id=external_id or path.stem,
+            logical_session_id=logical_session_id,
             metadata=metadata,
             kind="subagent" if is_subagent else "main",
             parent_external_id=path.parent.parent.name if is_subagent else None,

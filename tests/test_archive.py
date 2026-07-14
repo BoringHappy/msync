@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import zlib
@@ -121,7 +122,7 @@ def test_changed_transcript_replaces_normalized_events(tmp_path: Path) -> None:
         ).fetchone() == ("Updated answer",)
 
 
-def test_same_session_id_from_two_locations_stays_separate(tmp_path: Path) -> None:
+def test_same_logical_revision_from_two_locations_is_deduplicated(tmp_path: Path) -> None:
     first_root = tmp_path / ".codex"
     second_root = tmp_path / ".codex_another"
     first_path = first_root / "sessions/one.jsonl"
@@ -131,15 +132,83 @@ def test_same_session_id_from_two_locations_stays_separate(tmp_path: Path) -> No
     database = tmp_path / "archive.sqlite"
     provider = get_provider("codex")
     with Archive(database) as archive:
+        first = archive.upload(root=first_root, provider=provider, transcripts=[first_path])
+        second = archive.upload(root=second_root, provider=provider, transcripts=[second_path])
+
+    assert first.imported == 1
+    assert second.duplicates == 1
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT count(*) FROM locations").fetchone() == (2,)
+        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
+
+
+def test_changed_revision_with_same_session_id_stays_separate(tmp_path: Path) -> None:
+    first_root = tmp_path / ".codex"
+    second_root = tmp_path / ".codex_another"
+    first_path = first_root / "sessions/one.jsonl"
+    second_path = second_root / "sessions/two.jsonl"
+    _write_jsonl(first_path, _codex_records("shared-id"))
+    changed = _codex_records("shared-id")
+    changed[-1]["payload"] = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "A different revision"}],
+    }
+    _write_jsonl(second_path, changed)
+    database = tmp_path / "archive.sqlite"
+    provider = get_provider("codex")
+
+    with Archive(database) as archive:
+        archive.upload(root=first_root, provider=provider, transcripts=[first_path])
+        result = archive.upload(root=second_root, provider=provider, transcripts=[second_path])
+
+    assert result.imported == 1
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (2,)
+
+
+def test_upload_collapses_duplicate_rows_created_before_logical_identity(tmp_path: Path) -> None:
+    first_root = tmp_path / ".codex"
+    second_root = tmp_path / ".codex_another"
+    first_path = first_root / "sessions/one.jsonl"
+    second_path = second_root / "sessions/two.jsonl"
+    _write_jsonl(first_path, _codex_records("shared-id"))
+    _write_jsonl(second_path, _codex_records("different-id"))
+    database = tmp_path / "archive.sqlite"
+    provider = get_provider("codex")
+    with Archive(database) as archive:
         archive.upload(root=first_root, provider=provider, transcripts=[first_path])
         archive.upload(root=second_root, provider=provider, transcripts=[second_path])
 
+    duplicate = _write_jsonl(second_path, _codex_records("shared-id"))
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("SELECT count(*) FROM locations").fetchone() == (2,)
-        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (2,)
-        assert connection.execute(
-            "SELECT count(DISTINCT external_id) FROM conversations"
-        ).fetchone() == (1,)
+        connection.execute("UPDATE conversations SET metadata_json = '{}'")
+        connection.execute(
+            """
+            UPDATE conversations
+            SET external_id = ?, content_sha256 = ?, transcript = ?, source_size = ?
+            WHERE relative_path = ?
+            """,
+            (
+                "shared-id",
+                hashlib.sha256(duplicate).hexdigest(),
+                zlib.compress(duplicate),
+                len(duplicate),
+                "sessions/two.jsonl",
+            ),
+        )
+        connection.commit()
+
+    with Archive(database) as archive:
+        result = archive.upload(
+            root=second_root,
+            provider=provider,
+            transcripts=[second_path],
+        )
+
+    assert result.duplicates == 1
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
 
 
 def test_claude_transcript_and_subagent_metadata(tmp_path: Path) -> None:

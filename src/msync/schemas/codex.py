@@ -22,6 +22,15 @@ class CodexContentBlock(NativeRecord):
     text: str
 
 
+class CodexSyncProvenance(NativeRecord):
+    """Stable msync identity retained across provider conversions."""
+
+    source_provider: str | None = None
+    source_conversation_id: str | None = None
+    source_key: str | None = None
+    logical_session_id: str | None = None
+
+
 class CodexSessionMetaPayload(CodexPayload):
     """Metadata required for Codex to discover and resume a rollout."""
 
@@ -36,6 +45,7 @@ class CodexSessionMetaPayload(CodexPayload):
     base_instructions: dict[str, str] | None = None
     history_mode: str = "legacy"
     git: dict[str, str] | None = None
+    msync: CodexSyncProvenance | None = None
 
 
 class CodexResponseMessagePayload(CodexPayload):

@@ -13,6 +13,7 @@ from msync.providers.base import (
     ConversationDetails,
     HistoryProvider,
     as_string,
+    canonical_session_id,
     display_events,
     encode_jsonl,
     event_object,
@@ -111,6 +112,7 @@ class CodexProvider(HistoryProvider):
                         "source_provider": conversation.provider,
                         "source_conversation_id": conversation.external_id,
                         "source_key": source_key,
+                        "logical_session_id": conversation.logical_session_id,
                     },
                 ),
             )
@@ -185,6 +187,7 @@ class CodexProvider(HistoryProvider):
         del relative_path
         metadata: dict[str, Any] = {}
         external_id: str | None = None
+        logical_session_id: str | None = None
         cwd: str | None = None
         model: str | None = None
         git_branch: str | None = None
@@ -201,6 +204,21 @@ class CodexProvider(HistoryProvider):
                     as_string(payload.get("id") or payload.get("session_id")) or external_id
                 )
                 cwd = as_string(payload.get("cwd")) or cwd
+                provenance = payload.get("msync")
+                if isinstance(provenance, dict):
+                    logical_session_id = (
+                        as_string(provenance.get("logical_session_id")) or logical_session_id
+                    )
+                    source_provider = as_string(provenance.get("source_provider"))
+                    source_conversation_id = as_string(provenance.get("source_conversation_id"))
+                    if (
+                        logical_session_id is None
+                        and source_provider is not None
+                        and source_conversation_id is not None
+                    ):
+                        logical_session_id = canonical_session_id(
+                            source_provider, source_conversation_id
+                        )
                 git = payload.get("git")
                 if isinstance(git, dict):
                     git_branch = as_string(git.get("branch")) or git_branch
@@ -222,6 +240,7 @@ class CodexProvider(HistoryProvider):
 
         return ConversationDetails(
             external_id=external_id or path.stem,
+            logical_session_id=logical_session_id,
             metadata=metadata,
             cwd=cwd,
             model=model,

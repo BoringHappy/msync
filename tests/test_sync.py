@@ -224,14 +224,206 @@ def test_sync_does_not_overwrite_a_continued_export(tmp_path: Path) -> None:
     first = CliRunner().invoke(app, arguments)
     assert first.exit_code == 0, first.output
     generated = _generated_paths(destination)[0]
-    continued = generated.read_bytes() + b'{"type":"last-prompt","sessionId":"continued"}\n'
+    records = [json.loads(line) for line in generated.read_text().splitlines()]
+    continued_record = {
+        "type": "user",
+        "uuid": "continued-message",
+        "sessionId": records[0]["sessionId"],
+        "parentUuid": records[-1]["uuid"],
+        "timestamp": "2026-07-14T11:00:03Z",
+        "cwd": "/work/codex-project",
+        "message": {"role": "user", "content": "Continued in Claude"},
+    }
+    continued = generated.read_bytes() + (json.dumps(continued_record) + "\n").encode()
     generated.write_bytes(continued)
 
     second = CliRunner().invoke(app, arguments)
 
     assert second.exit_code == 0, second.output
-    assert re.search(r"Continued exports protected\s+1", second.output)
+    assert re.search(r"Existing histories protected\s+1", second.output)
     assert generated.read_bytes() == continued
+
+
+def test_changed_source_creates_new_session_without_overwriting_previous(
+    tmp_path: Path,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
+    _write_jsonl(codex_path, _codex_records())
+    destination = tmp_path / ".claude"
+    database = tmp_path / "sync.sqlite"
+    arguments = [
+        "sync",
+        "--dir",
+        str(codex_root),
+        "--dir",
+        str(destination),
+        "--provider",
+        "codex",
+        "--provider",
+        "claude",
+        "--database",
+        str(database),
+    ]
+    first = CliRunner().invoke(app, arguments)
+    assert first.exit_code == 0, first.output
+    previous = _generated_paths(destination)[0]
+    previous_content = previous.read_bytes()
+
+    records = _codex_records()
+    records.append(
+        {
+            "timestamp": "2026-07-14T11:00:03Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "A later Codex turn"},
+        }
+    )
+    _write_jsonl(codex_path, records)
+    second = CliRunner().invoke(app, arguments)
+
+    assert second.exit_code == 0, second.output
+    generated = _generated_paths(destination)
+    assert len(generated) == 2
+    assert previous.read_bytes() == previous_content
+    assert any("A later Codex turn" in path.read_text() for path in generated if path != previous)
+
+
+def test_sync_reuses_a_managed_revision_from_an_older_path_scheme(tmp_path: Path) -> None:
+    codex_root = tmp_path / ".codex"
+    codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
+    _write_jsonl(codex_path, _codex_records())
+    claude_root = tmp_path / ".claude"
+    database = tmp_path / "sync.sqlite"
+    arguments = [
+        "sync",
+        "--dir",
+        str(codex_root),
+        "--dir",
+        str(claude_root),
+        "--provider",
+        "codex",
+        "--provider",
+        "claude",
+        "--database",
+        str(database),
+    ]
+    first = CliRunner().invoke(app, arguments)
+    assert first.exit_code == 0, first.output
+    generated = _generated_paths(claude_root)[0]
+    legacy = generated.with_name("legacy-source-key-session.jsonl")
+    generated.rename(legacy)
+    manifest_path = claude_root / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    entry = manifest["files"].pop(generated.relative_to(claude_root).as_posix())
+    manifest["files"][legacy.relative_to(claude_root).as_posix()] = entry
+    manifest_path.write_text(json.dumps(manifest))
+
+    second = CliRunner().invoke(app, arguments)
+
+    assert second.exit_code == 0, second.output
+    assert re.search(r"Native histories unchanged\s+1", second.output)
+    assert _generated_paths(claude_root) == [legacy]
+
+
+def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_path: Path) -> None:
+    codex_root = tmp_path / ".codex"
+    codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
+    _write_jsonl(codex_path, _codex_records())
+    claude_root = tmp_path / ".claude"
+    database = tmp_path / "sync.sqlite"
+    first = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(codex_root),
+            "--dir",
+            str(claude_root),
+            "--provider",
+            "codex",
+            "--provider",
+            "claude",
+            "--database",
+            str(database),
+        ],
+    )
+    assert first.exit_code == 0, first.output
+    upload_copy = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(claude_root),
+            "--provider",
+            "claude",
+            "--database",
+            str(database),
+        ],
+    )
+    assert upload_copy.exit_code == 0, upload_copy.output
+    assert re.search(r"Duplicates skipped\s+1", upload_copy.output)
+
+    cycle_arguments = [
+        "sync",
+        "--dir",
+        str(codex_root),
+        "--dir",
+        str(claude_root),
+        "--provider",
+        "codex",
+        "--provider",
+        "claude",
+        "--database",
+        str(database),
+    ]
+    for _ in range(3):
+        repeated_upload = CliRunner().invoke(
+            app,
+            [
+                "upload",
+                "--dir",
+                str(claude_root),
+                "--provider",
+                "claude",
+                "--database",
+                str(database),
+            ],
+        )
+        assert repeated_upload.exit_code == 0, repeated_upload.output
+        assert re.search(r"Duplicates skipped\s+1", repeated_upload.output)
+        repeated_sync = CliRunner().invoke(app, cycle_arguments)
+        assert repeated_sync.exit_code == 0, repeated_sync.output
+        assert len(_generated_paths(claude_root)) == 1
+
+    with closing(sqlite3.connect(database)) as connection:
+        metadata = [
+            json.loads(row[0])
+            for row in connection.execute("SELECT metadata_json FROM conversations")
+        ]
+    assert len(metadata) == 1
+    identity = metadata[0]["_msync"]
+    assert identity["chat_sha256"]
+    assert identity["logical_session_id"] == "019f61a0-0000-7000-8000-000000000001"
+
+    merged = tmp_path / "merged-claude"
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(merged),
+            "--provider",
+            "claude",
+            "--database",
+            str(database),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(_generated_paths(merged)) == 1
+    assert _generated_paths(merged)[0].relative_to(merged) == _generated_paths(claude_root)[
+        0
+    ].relative_to(claude_root)
 
 
 def _generated_paths(root: Path) -> list[Path]:
