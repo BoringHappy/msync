@@ -1,0 +1,60 @@
+name: Spec
+description: Track a feature spec managed by the pm plugin
+title: "[Spec]: "
+labels: ["spec"]
+type: Spec
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue tracks a feature spec. It is managed automatically by the `/pm:spec-*` skills.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this solve and why does it matter?
+      placeholder: |
+        Users currently have to... which causes...
+        This spec addresses that by...
+    validations:
+      required: true
+
+  - type: textarea
+    id: user-stories
+    attributes:
+      label: User Stories
+      description: "As a <role>, I want to <action> so that <outcome>"
+      placeholder: |
+        - As a developer, I want to... so that...
+        - As an admin, I want to... so that...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Measurable outcomes that define done at the feature level
+      placeholder: |
+        - [ ] Users can...
+        - [ ] System handles...
+    validations:
+      required: true
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of Scope
+      description: What is explicitly excluded from this spec?
+      placeholder: |
+        - Not included: ...
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies & Constraints (optional)
+      description: What blocks or limits this spec?
+      placeholder: |
+        - Requires Auth service
+        - Must use existing DB schema
