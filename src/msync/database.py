@@ -69,6 +69,19 @@ class UploadResult:
     message_parts: int = 0
 
 
+@dataclass(slots=True, frozen=True)
+class SearchResult:
+    """One archived event whose normalized text matched a search."""
+
+    provider: str
+    conversation_id: str
+    title: str | None
+    relative_path: str
+    role: str | None
+    occurred_at: str | None
+    text: str
+
+
 class Archive:
     """A durable archive that supports SQLite, PostgreSQL, and MySQL."""
 
@@ -127,6 +140,27 @@ class Archive:
                 self._upload_file(session, result, root, provider, path)
             location.last_scanned_at = datetime.now(UTC)
         return result
+
+    def search(self, search_text: str) -> list[SearchResult]:
+        """Find archived events containing the supplied text."""
+
+        statement = (
+            select(
+                LocationRow.provider,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.relative_path,
+                EventRow.role,
+                EventRow.occurred_at,
+                EventRow.searchable_text,
+            )
+            .join(ConversationRow, EventRow.conversation_id == ConversationRow.id)
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .where(EventRow.searchable_text.like(f"%{search_text}%"))
+            .order_by(EventRow.occurred_at.desc(), EventRow.id.desc())
+        )
+        with Session(self.engine) as session:
+            return [SearchResult(*row) for row in session.execute(statement)]
 
     def _initialize(self) -> None:
         with self.engine.begin() as connection:

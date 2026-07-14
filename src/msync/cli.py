@@ -8,6 +8,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
 from msync.database import Archive
@@ -96,6 +97,54 @@ def upload(
     table.add_row("Unchanged", str(result.unchanged))
     table.add_row("Events indexed", str(result.events))
     console.print(table)
+
+
+@app.command()
+def search(
+    search_text: Annotated[
+        str,
+        typer.Argument(help="Text to find in archived conversation messages."),
+    ],
+    database: Annotated[
+        str,
+        typer.Option(
+            "--database",
+            "--db",
+            help="SQLite path or SQLAlchemy database URL.",
+            show_default=str(DEFAULT_DATABASE),
+        ),
+    ] = str(DEFAULT_DATABASE),
+) -> None:
+    """Search archived conversation messages."""
+
+    query = search_text.strip()
+    if not query:
+        error_console.print("[bold red]Search failed:[/bold red] Search text must not be empty.")
+        raise typer.Exit(code=1)
+
+    try:
+        with Archive(database) as archive:
+            results = archive.search(query)
+    except (ImportError, OSError, RuntimeError, SQLAlchemyError) as error:
+        error_console.print(f"[bold red]Search failed:[/bold red] {error}")
+        raise typer.Exit(code=1) from error
+
+    if not results:
+        console.print("No matches found for ", Text(query), ".", sep="")
+        return
+
+    console.print(f"[bold]Search results ({len(results)})[/bold]")
+    for index, result in enumerate(results, start=1):
+        if index > 1:
+            console.print()
+        header = Text(f"{index}. {result.provider}", style="bold")
+        header.append(f" · {result.title or result.conversation_id}")
+        header.append(
+            f" · {result.occurred_at or 'unknown time'} · {result.role or 'unknown role'}",
+            style="dim",
+        )
+        console.print(header)
+        console.print(Text(result.text.strip()))
 
 
 def main() -> None:
