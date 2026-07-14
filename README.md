@@ -2,7 +2,8 @@
 
 Keep your AI conversations, context, and decisions in sync. `msync` archives local
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex JSONL transcripts in one
-SQLite database without changing the source directories.
+database without changing the source directories. SQLAlchemy provides SQLite, PostgreSQL, and
+MySQL persistence through the same schema and upload flow.
 
 ## Install
 
@@ -19,7 +20,14 @@ To make the command available outside the checkout:
 $ uv tool install .
 ```
 
-Python 3.11 or newer is supported.
+SQLite support is included. Install the matching driver extra for a server database:
+
+```console
+$ uv tool install '.[postgres]'
+$ uv tool install '.[mysql]'
+```
+
+Python 3.14 or newer is required.
 
 ## Upload history
 
@@ -43,6 +51,23 @@ custom layout is ambiguous, and the database can be overridden for testing or ba
 $ msync upload --dir /mnt/history --provider codex --database ./history.sqlite
 ```
 
+`--database` also accepts a SQLAlchemy URL. Common PostgreSQL and MySQL URLs automatically select
+the bundled optional Psycopg and PyMySQL drivers:
+
+```console
+$ msync upload --dir ~/.codex --database 'postgresql://msync:secret@localhost/msync'
+$ msync upload --dir ~/.claude --database 'mysql://msync:secret@localhost/msync'
+```
+
+An explicitly selected SQLAlchemy driver works too, such as `postgresql+psycopg://...` or
+`mysql+pymysql://...`. Passwords are masked in command output. The target database must already
+exist; `msync` creates and versions its tables automatically.
+
+On every connection, `msync` detects whether its schema is absent, initializes a new database from
+the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
+unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
+triggers. A partial or incompatible schema fails before any transcript is uploaded.
+
 Uploads are idempotent. Each file is addressed by its source location and relative path, then
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
 and unchanged files are skipped.
@@ -53,16 +78,20 @@ The database is deliberately split into distinct storage and indexing layers:
 
 | Table | Purpose |
 | --- | --- |
+| `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
 | `locations` | One Claude/Codex data directory, allowing multiple installations of either provider. |
 | `conversations` | Session metadata and a zlib-compressed, byte-exact copy of the source JSONL. |
 | `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
-| `events_fts` | An automatically maintained SQLite FTS5 index for future full-text search. |
+| `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |
 
 The original transcript blob and per-event raw JSON retain all data needed for future export or
 conversation reconstruction. Normalized columns are an index, not a replacement for the source.
 Foreign keys tie records to the location they came from, so identical session IDs in `.codex` and
-`.codex_another` remain independent.
+`.codex_another` remain independent. Full-length text and binary column variants keep large events
+and transcripts safe on MySQL, while SHA-256 path identities avoid backend-specific index-length
+limits. PostgreSQL/MySQL full-text indexes can be added as search adapters without changing the
+portable archive records.
 
 `msync` only reads the source directory. The archive contains the full conversation content, so it
 should be protected like the original `~/.claude` and `~/.codex` directories.
@@ -70,6 +99,7 @@ should be protected like the original `~/.claude` and `~/.codex` directories.
 ## Development
 
 ```console
+$ uv sync --all-extras
 $ uv run pytest
 $ uv run ruff check .
 $ uv run ruff format --check .

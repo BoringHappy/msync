@@ -105,7 +105,7 @@ def _first_record(path: Path) -> dict[str, Any] | None:
                     continue
                 value = json.loads(line)
                 return value if isinstance(value, dict) else None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except OSError, UnicodeDecodeError, json.JSONDecodeError:
         return None
     return None
 

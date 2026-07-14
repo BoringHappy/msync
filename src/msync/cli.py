@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -10,6 +9,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.table import Table
+from sqlalchemy.exc import SQLAlchemyError
 
 from msync.database import Archive
 from msync.models import Provider
@@ -57,23 +57,22 @@ def upload(
         ),
     ],
     database: Annotated[
-        Path,
+        str,
         typer.Option(
             "--database",
             "--db",
-            help="SQLite archive path.",
+            help="SQLite path or SQLAlchemy database URL.",
             show_default=str(DEFAULT_DATABASE),
         ),
-    ] = DEFAULT_DATABASE,
+    ] = str(DEFAULT_DATABASE),
     provider: Annotated[
         ProviderChoice,
         typer.Option(help="History format; auto detects from the directory."),
     ] = ProviderChoice.auto,
 ) -> None:
-    """Read new and changed transcripts into the SQLite archive."""
+    """Read new and changed transcripts into the configured archive."""
 
     root = directory.expanduser().resolve()
-    database = database.expanduser().resolve()
     try:
         selected_provider: Provider = (
             detect_provider(root) if provider is ProviderChoice.auto else provider.value
@@ -81,12 +80,14 @@ def upload(
         transcripts = discover_transcripts(root, selected_provider)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
-        result = Archive(database).upload(
-            root=root,
-            provider=selected_provider,
-            transcripts=transcripts,
-        )
-    except (HistoryFormatError, OSError, RuntimeError, sqlite3.Error) as error:
+        with Archive(database) as archive:
+            result = archive.upload(
+                root=root,
+                provider=selected_provider,
+                transcripts=transcripts,
+            )
+            database_display = archive.display_database
+    except (HistoryFormatError, ImportError, OSError, RuntimeError, SQLAlchemyError) as error:
         error_console.print(f"[bold red]Upload failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
 
@@ -95,7 +96,7 @@ def upload(
     table.add_column()
     table.add_row("Provider", selected_provider)
     table.add_row("Location", str(root))
-    table.add_row("Database", str(database))
+    table.add_row("Database", database_display)
     table.add_row("Transcripts", str(result.scanned))
     table.add_row("Imported", str(result.imported))
     table.add_row("Updated", str(result.updated))

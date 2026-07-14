@@ -1,89 +1,33 @@
-"""SQLite schema and idempotent transcript archiving."""
+"""SQLAlchemy-backed, idempotent transcript archiving."""
 
 from __future__ import annotations
 
 import hashlib
-import json
-import sqlite3
 import zlib
-from contextlib import closing
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
+from typing import Any, Self
+
+from sqlalchemy import URL, create_engine, delete, event, inspect, select, text
+from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.orm import Session
 
 from msync.models import Conversation, Provider
 from msync.readers import read_conversation
+from msync.tables import (
+    Base,
+    ConversationRow,
+    EventRow,
+    LocationRow,
+    MessagePartRow,
+    SchemaInfoRow,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS locations (
-    id INTEGER PRIMARY KEY,
-    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
-    root_path TEXT NOT NULL UNIQUE,
-    display_name TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    last_scanned_at TEXT
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY,
-    location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
-    external_id TEXT NOT NULL,
-    relative_path TEXT NOT NULL,
-    conversation_kind TEXT NOT NULL DEFAULT 'main',
-    parent_external_id TEXT,
-    title TEXT,
-    cwd TEXT,
-    model TEXT,
-    git_branch TEXT,
-    started_at TEXT,
-    ended_at TEXT,
-    source_mtime_ns INTEGER NOT NULL,
-    source_size INTEGER NOT NULL,
-    content_sha256 TEXT NOT NULL,
-    transcript_codec TEXT NOT NULL DEFAULT 'zlib' CHECK (transcript_codec = 'zlib'),
-    transcript BLOB NOT NULL,
-    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
-    imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (location_id, relative_path)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS conversations_external_id_idx
-    ON conversations(location_id, external_id);
-CREATE INDEX IF NOT EXISTS conversations_time_idx
-    ON conversations(started_at, ended_at);
-
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    sequence INTEGER NOT NULL,
-    external_id TEXT,
-    parent_external_id TEXT,
-    event_type TEXT NOT NULL,
-    event_subtype TEXT,
-    role TEXT,
-    visibility TEXT NOT NULL CHECK (visibility IN ('display', 'model', 'metadata')),
-    occurred_at TEXT,
-    searchable_text TEXT NOT NULL DEFAULT '',
-    raw_json TEXT NOT NULL,
-    parse_error TEXT,
-    UNIQUE (conversation_id, sequence)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS events_conversation_time_idx
-    ON events(conversation_id, occurred_at);
-CREATE INDEX IF NOT EXISTS events_external_id_idx ON events(external_id);
-
-CREATE TABLE IF NOT EXISTS message_parts (
-    id INTEGER PRIMARY KEY,
-    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-    sequence INTEGER NOT NULL,
-    content_type TEXT NOT NULL,
-    text TEXT,
-    raw_json TEXT NOT NULL,
-    UNIQUE (event_id, sequence)
-) STRICT;
-
+SQLITE_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
     searchable_text,
     role UNINDEXED,
@@ -126,24 +70,45 @@ class UploadResult:
 
 
 class Archive:
-    """A durable SQLite archive for one or more provider locations."""
+    """A durable archive that supports SQLite, PostgreSQL, and MySQL."""
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
+    def __init__(self, database: str | Path) -> None:
+        self.url, self.sqlite_path = _normalize_database(database)
+        self.initialized_new_database = False
+        if self.sqlite_path is not None:
+            self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        self.engine = create_engine(self.url, pool_pre_ping=True)
+        if self.engine.dialect.name == "sqlite":
+            event.listen(self.engine, "connect", _configure_sqlite)
         try:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = NORMAL")
-            self._initialize(connection)
+            self._initialize()
         except Exception:
-            connection.close()
+            self.close()
             raise
-        return connection
+
+    @property
+    def display_database(self) -> str:
+        """Return a human-friendly database target without exposing passwords."""
+
+        if self.sqlite_path is not None:
+            return str(self.sqlite_path)
+        return self.url.render_as_string(hide_password=True)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release pooled database connections."""
+
+        self.engine.dispose()
 
     def upload(
         self,
@@ -155,55 +120,210 @@ class Archive:
         """Archive changed transcripts from a single source location."""
 
         root = root.resolve()
-        with closing(self.connect()) as connection, connection:
-            location_id = self._upsert_location(connection, root, provider)
-            result = UploadResult(location_id=location_id, scanned=len(transcripts))
+        with Session(self.engine) as session, session.begin():
+            location = self._upsert_location(session, root, provider)
+            result = UploadResult(location_id=location.id, scanned=len(transcripts))
             for path in transcripts:
-                self._upload_file(connection, result, root, provider, path)
-            connection.execute(
-                """
-                UPDATE locations
-                SET last_scanned_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE id = ?
-                """,
-                (location_id,),
-            )
+                self._upload_file(session, result, root, provider, path)
+            location.last_scanned_at = datetime.now(UTC)
         return result
 
-    @staticmethod
-    def _initialize(connection: sqlite3.Connection) -> None:
-        current_version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if current_version > SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Database schema version {current_version} is newer than this msync supports "
-                f"({SCHEMA_VERSION})."
-            )
-        if current_version == 0:
-            connection.executescript(SCHEMA)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    def _initialize(self) -> None:
+        with self.engine.begin() as connection:
+            expected_tables = set(Base.metadata.tables)
+            existing_tables = set(inspect(connection).get_table_names())
+            self.initialized_new_database = not expected_tables.intersection(existing_tables)
+            sqlite_version = 0
+            if self.engine.dialect.name == "sqlite":
+                sqlite_version = int(connection.exec_driver_sql("PRAGMA user_version").scalar_one())
+                if sqlite_version > SCHEMA_VERSION:
+                    _raise_newer_schema(sqlite_version)
+                if sqlite_version == 1:
+                    self._migrate_sqlite_v1(connection)
+
+            Base.metadata.create_all(connection)
+            self._validate_schema(connection)
+            stored_version = connection.execute(
+                select(SchemaInfoRow.value).where(SchemaInfoRow.key == "schema_version")
+            ).scalar_one_or_none()
+            if stored_version is not None and int(stored_version) > SCHEMA_VERSION:
+                _raise_newer_schema(int(stored_version))
+            if stored_version is None:
+                connection.execute(
+                    SchemaInfoRow.__table__.insert().values(
+                        key="schema_version", value=str(SCHEMA_VERSION)
+                    )
+                )
+            elif int(stored_version) < SCHEMA_VERSION:
+                connection.execute(
+                    SchemaInfoRow.__table__.update()
+                    .where(SchemaInfoRow.key == "schema_version")
+                    .values(value=str(SCHEMA_VERSION))
+                )
+
+            if self.engine.dialect.name == "sqlite":
+                for statement in _sqlite_statements(SQLITE_FTS_SCHEMA):
+                    connection.exec_driver_sql(statement)
+                self._validate_sqlite_fts(connection)
+                connection.exec_driver_sql(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
-    def _upsert_location(connection: sqlite3.Connection, root: Path, provider: Provider) -> int:
-        root_path = str(root)
-        connection.execute(
-            """
-            INSERT INTO locations(provider, root_path, display_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT(root_path) DO UPDATE SET
-                provider = excluded.provider,
-                display_name = excluded.display_name
-            """,
-            (provider, root_path, root.name or root_path),
+    def _validate_schema(connection: Connection) -> None:
+        """Ensure the loaded database matches every portable ORM mapping."""
+
+        inspector = inspect(connection)
+        actual_tables = set(inspector.get_table_names())
+        expected_tables = set(Base.metadata.tables)
+        problems = (
+            [f"missing tables: {', '.join(sorted(expected_tables - actual_tables))}"]
+            if (expected_tables - actual_tables)
+            else []
         )
-        row = connection.execute(
-            "SELECT id FROM locations WHERE root_path = ?", (root_path,)
-        ).fetchone()
-        assert row is not None
-        return int(row["id"])
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in actual_tables:
+                continue
+            actual_columns = {column["name"] for column in inspector.get_columns(table.name)}
+            expected_columns = set(table.columns.keys())
+            if missing_columns := expected_columns - actual_columns:
+                problems.append(
+                    f"{table.name} missing columns: {', '.join(sorted(missing_columns))}"
+                )
+
+            expected_primary_key = tuple(column.name for column in table.primary_key.columns)
+            actual_primary_key = tuple(
+                inspector.get_pk_constraint(table.name).get("constrained_columns") or ()
+            )
+            if expected_primary_key != actual_primary_key:
+                problems.append(
+                    f"{table.name} primary key is {actual_primary_key}, "
+                    f"expected {expected_primary_key}"
+                )
+
+            actual_unique_columns = {
+                tuple(constraint.get("column_names") or ())
+                for constraint in inspector.get_unique_constraints(table.name)
+            }
+            actual_unique_columns.update(
+                tuple(index.get("column_names") or ())
+                for index in inspector.get_indexes(table.name)
+                if index.get("unique")
+            )
+            for index in table.indexes:
+                expected_index = tuple(column.name for column in index.columns)
+                if index.unique and expected_index not in actual_unique_columns:
+                    problems.append(f"{table.name} missing unique index on {expected_index}")
+
+            actual_foreign_keys = {
+                (
+                    tuple(foreign_key.get("constrained_columns") or ()),
+                    foreign_key.get("referred_table"),
+                )
+                for foreign_key in inspector.get_foreign_keys(table.name)
+            }
+            for foreign_key in table.foreign_key_constraints:
+                expected_foreign_key = (
+                    tuple(column.name for column in foreign_key.columns),
+                    foreign_key.referred_table.name,
+                )
+                if expected_foreign_key not in actual_foreign_keys:
+                    problems.append(f"{table.name} missing foreign key {expected_foreign_key}")
+
+        if problems:
+            raise RuntimeError("Database schema validation failed: " + "; ".join(problems))
+
+    @staticmethod
+    def _validate_sqlite_fts(connection: Connection) -> None:
+        rows = connection.exec_driver_sql(
+            """
+            SELECT type, name FROM sqlite_master
+            WHERE name IN (
+                'events_fts', 'events_fts_insert', 'events_fts_delete', 'events_fts_update'
+            )
+            """
+        )
+        actual_objects = {(row[0], row[1]) for row in rows}
+        expected_objects = {
+            ("table", "events_fts"),
+            ("trigger", "events_fts_insert"),
+            ("trigger", "events_fts_delete"),
+            ("trigger", "events_fts_update"),
+        }
+        if missing_objects := expected_objects - actual_objects:
+            missing = ", ".join(name for _, name in sorted(missing_objects))
+            raise RuntimeError(f"Database schema validation failed: missing SQLite FTS: {missing}")
+
+    @staticmethod
+    def _migrate_sqlite_v1(connection: Connection) -> None:
+        """Add portable path hashes to databases created before SQLAlchemy."""
+
+        location_columns = {
+            row[1] for row in connection.exec_driver_sql("PRAGMA table_info(locations)")
+        }
+        if "root_path_hash" not in location_columns:
+            connection.exec_driver_sql("ALTER TABLE locations ADD COLUMN root_path_hash TEXT")
+            for location_id, root_path in connection.exec_driver_sql(
+                "SELECT id, root_path FROM locations"
+            ):
+                connection.execute(
+                    text("UPDATE locations SET root_path_hash = :hash WHERE id = :id"),
+                    {"hash": _text_hash(root_path), "id": location_id},
+                )
+
+        conversation_columns = {
+            row[1] for row in connection.exec_driver_sql("PRAGMA table_info(conversations)")
+        }
+        if "relative_path_hash" not in conversation_columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE conversations ADD COLUMN relative_path_hash TEXT"
+            )
+            for conversation_id, relative_path in connection.exec_driver_sql(
+                "SELECT id, relative_path FROM conversations"
+            ):
+                connection.execute(
+                    text("UPDATE conversations SET relative_path_hash = :hash WHERE id = :id"),
+                    {"hash": _text_hash(relative_path), "id": conversation_id},
+                )
+
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS locations_root_path_hash_uq "
+            "ON locations(root_path_hash)"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS conversations_location_path_hash_uq "
+            "ON conversations(location_id, relative_path_hash)"
+        )
+
+    @staticmethod
+    def _upsert_location(session: Session, root: Path, provider: Provider) -> LocationRow:
+        root_path = str(root)
+        root_path_hash = _text_hash(root_path)
+        location = session.scalar(
+            select(LocationRow).where(LocationRow.root_path_hash == root_path_hash)
+        )
+        if location is None:
+            location = LocationRow(
+                provider=provider,
+                root_path=root_path,
+                root_path_hash=root_path_hash,
+                display_name=root.name or root_path,
+            )
+            session.add(location)
+            session.flush()
+            return location
+        if location.root_path != root_path:
+            raise RuntimeError("A SHA-256 collision occurred while identifying a source location.")
+        if location.provider != provider:
+            session.execute(
+                delete(ConversationRow).where(ConversationRow.location_id == location.id)
+            )
+            location.provider = provider
+        location.display_name = root.name or root_path
+        return location
 
     @staticmethod
     def _upload_file(
-        connection: sqlite3.Connection,
+        session: Session,
         result: UploadResult,
         root: Path,
         provider: Provider,
@@ -212,141 +332,150 @@ class Archive:
         transcript = path.read_bytes()
         content_sha256 = hashlib.sha256(transcript).hexdigest()
         relative_path = path.relative_to(root).as_posix()
-        existing = connection.execute(
-            """
-            SELECT id, content_sha256 FROM conversations
-            WHERE location_id = ? AND relative_path = ?
-            """,
-            (result.location_id, relative_path),
-        ).fetchone()
-        if existing is not None and existing["content_sha256"] == content_sha256:
+        relative_path_hash = _text_hash(relative_path)
+        existing = session.scalar(
+            select(ConversationRow).where(
+                ConversationRow.location_id == result.location_id,
+                ConversationRow.relative_path_hash == relative_path_hash,
+            )
+        )
+        if existing is not None and existing.relative_path != relative_path:
+            raise RuntimeError("A SHA-256 collision occurred while identifying a transcript.")
+        if existing is not None and existing.content_sha256 == content_sha256:
             result.unchanged += 1
             return
 
         conversation = read_conversation(path, root, provider, transcript=transcript)
         stat = path.stat()
-        conversation_id = Archive._upsert_conversation(
-            connection, result.location_id, conversation, stat.st_mtime_ns
-        )
-        connection.execute("DELETE FROM events WHERE conversation_id = ?", (conversation_id,))
-        Archive._insert_events(connection, conversation_id, conversation, result)
         if existing is None:
+            existing = ConversationRow(
+                location_id=result.location_id,
+                external_id=conversation.external_id,
+                relative_path=relative_path,
+                relative_path_hash=relative_path_hash,
+            )
+            session.add(existing)
             result.imported += 1
         else:
+            session.execute(delete(EventRow).where(EventRow.conversation_id == existing.id))
             result.updated += 1
 
-    @staticmethod
-    def _upsert_conversation(
-        connection: sqlite3.Connection,
-        location_id: int,
-        conversation: Conversation,
-        source_mtime_ns: int,
-    ) -> int:
-        values = (
-            location_id,
-            conversation.external_id,
-            conversation.relative_path,
-            conversation.kind,
-            conversation.parent_external_id,
-            conversation.title,
-            conversation.cwd,
-            conversation.model,
-            conversation.git_branch,
-            conversation.started_at,
-            conversation.ended_at,
-            source_mtime_ns,
-            len(conversation.transcript),
-            conversation.sha256,
-            zlib.compress(conversation.transcript),
-            json.dumps(conversation.metadata, ensure_ascii=False, separators=(",", ":")),
-        )
-        row = connection.execute(
-            """
-            INSERT INTO conversations(
-                location_id, external_id, relative_path, conversation_kind,
-                parent_external_id, title, cwd, model, git_branch, started_at,
-                ended_at, source_mtime_ns, source_size, content_sha256,
-                transcript, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(location_id, relative_path) DO UPDATE SET
-                external_id = excluded.external_id,
-                conversation_kind = excluded.conversation_kind,
-                parent_external_id = excluded.parent_external_id,
-                title = excluded.title,
-                cwd = excluded.cwd,
-                model = excluded.model,
-                git_branch = excluded.git_branch,
-                started_at = excluded.started_at,
-                ended_at = excluded.ended_at,
-                source_mtime_ns = excluded.source_mtime_ns,
-                source_size = excluded.source_size,
-                content_sha256 = excluded.content_sha256,
-                transcript = excluded.transcript,
-                metadata_json = excluded.metadata_json,
-                imported_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            RETURNING id
-            """,
-            values,
-        ).fetchone()
-        assert row is not None
-        return int(row["id"])
+        _update_conversation(existing, conversation, stat.st_mtime_ns)
+        session.flush()
+        Archive._insert_events(session, existing.id, conversation, result)
 
     @staticmethod
     def _insert_events(
-        connection: sqlite3.Connection,
+        session: Session,
         conversation_id: int,
         conversation: Conversation,
         result: UploadResult,
     ) -> None:
-        connection.executemany(
-            """
-            INSERT INTO events(
-                conversation_id, sequence, external_id, parent_external_id,
-                event_type, event_subtype, role, visibility, occurred_at,
-                searchable_text, raw_json, parse_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                (
-                    conversation_id,
-                    event.sequence,
-                    event.external_id,
-                    event.parent_external_id,
-                    event.event_type,
-                    event.event_subtype,
-                    event.role,
-                    event.visibility,
-                    event.occurred_at,
-                    event.searchable_text,
-                    event.raw_json,
-                    event.parse_error,
-                )
-                for event in conversation.events
-            ),
-        )
-        event_ids = {
-            int(row["sequence"]): int(row["id"])
-            for row in connection.execute(
-                "SELECT id, sequence FROM events WHERE conversation_id = ?",
-                (conversation_id,),
+        rows = [
+            EventRow(
+                conversation_id=conversation_id,
+                sequence=source.sequence,
+                external_id=source.external_id,
+                parent_external_id=source.parent_external_id,
+                event_type=source.event_type,
+                event_subtype=source.event_subtype,
+                role=source.role,
+                visibility=source.visibility,
+                occurred_at=source.occurred_at,
+                searchable_text=source.searchable_text,
+                raw_json=source.raw_json,
+                parse_error=source.parse_error,
             )
-        }
-        connection.executemany(
-            """
-            INSERT INTO message_parts(event_id, sequence, content_type, text, raw_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                (
-                    event_ids[event.sequence],
-                    part.sequence,
-                    part.content_type,
-                    part.text,
-                    part.raw_json,
-                )
-                for event in conversation.events
-                for part in event.parts
-            ),
-        )
-        result.events += len(conversation.events)
-        result.message_parts += sum(len(event.parts) for event in conversation.events)
+            for source in conversation.events
+        ]
+        session.add_all(rows)
+        session.flush()
+        parts = [
+            MessagePartRow(
+                event_id=row.id,
+                sequence=part.sequence,
+                content_type=part.content_type,
+                text=part.text,
+                raw_json=part.raw_json,
+            )
+            for row, source in zip(rows, conversation.events, strict=True)
+            for part in source.parts
+        ]
+        session.add_all(parts)
+        result.events += len(rows)
+        result.message_parts += len(parts)
+
+
+def _update_conversation(
+    row: ConversationRow, conversation: Conversation, source_mtime_ns: int
+) -> None:
+    row.external_id = conversation.external_id
+    row.conversation_kind = conversation.kind
+    row.parent_external_id = conversation.parent_external_id
+    row.title = conversation.title
+    row.cwd = conversation.cwd
+    row.model = conversation.model
+    row.git_branch = conversation.git_branch
+    row.started_at = conversation.started_at
+    row.ended_at = conversation.ended_at
+    row.source_mtime_ns = source_mtime_ns
+    row.source_size = len(conversation.transcript)
+    row.content_sha256 = conversation.sha256
+    row.transcript_codec = "zlib"
+    row.transcript = zlib.compress(conversation.transcript)
+    row.metadata_json = conversation.metadata
+    row.imported_at = datetime.now(UTC)
+
+
+def _normalize_database(database: str | Path) -> tuple[URL, Path | None]:
+    raw = str(database)
+    if isinstance(database, Path) or "://" not in raw:
+        path = Path(raw).expanduser().resolve()
+        return URL.create("sqlite+pysqlite", database=str(path)), path
+
+    url = make_url(raw)
+    if url.drivername in {"postgres", "postgresql"}:
+        url = url.set(drivername="postgresql+psycopg")
+    elif url.drivername == "mysql":
+        url = url.set(drivername="mysql+pymysql")
+
+    if url.get_backend_name() != "sqlite" or url.database in {None, "", ":memory:"}:
+        return url, None
+    path = Path(url.database).expanduser().resolve()
+    return url.set(database=str(path)), path
+
+
+def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.execute("PRAGMA journal_mode = WAL")
+        cursor.execute("PRAGMA synchronous = NORMAL")
+    finally:
+        cursor.close()
+
+
+def _sqlite_statements(script: str) -> list[str]:
+    """Split the fixed FTS DDL into complete SQLite statements."""
+
+    statements: list[str] = []
+    current: list[str] = []
+    for line in script.splitlines():
+        current.append(line)
+        candidate = "\n".join(current).strip()
+        if candidate.endswith(";") and (
+            "CREATE TRIGGER" not in candidate or candidate.endswith("END;")
+        ):
+            statements.append(candidate)
+            current = []
+    return statements
+
+
+def _text_hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _raise_newer_schema(version: int) -> None:
+    raise RuntimeError(
+        f"Database schema version {version} is newer than this msync supports ({SCHEMA_VERSION})."
+    )

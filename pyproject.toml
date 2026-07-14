@@ -7,23 +7,29 @@ license = "Apache-2.0"
 authors = [
     { name = "veinkr-bot", email = "262730805+veinkr-bot@users.noreply.github.com" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "rich>=13.9",
+    "sqlalchemy>=2.0.41",
     "typer>=0.16",
 ]
 
 [project.scripts]
 msync = "msync:main"
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.2",
+]
+mysql = [
+    "pymysql>=1.1",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -42,7 +48,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
