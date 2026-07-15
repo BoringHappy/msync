@@ -142,6 +142,29 @@ def test_same_logical_revision_from_two_locations_is_deduplicated(tmp_path: Path
         assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
 
 
+def test_same_path_on_different_hosts_creates_distinct_locations(tmp_path: Path) -> None:
+    root = tmp_path / ".codex"
+    path = root / "sessions/session.jsonl"
+    database = tmp_path / "archive.sqlite"
+    provider = get_provider("codex")
+    _write_jsonl(path, _codex_records("host-a-session"))
+    with Archive(database, hostname="workstation-a") as archive:
+        archive.upload(root=root, provider=provider, transcripts=[path])
+
+    _write_jsonl(path, _codex_records("host-b-session"))
+    with Archive(database, hostname="workstation-b") as archive:
+        archive.upload(root=root, provider=provider, transcripts=[path])
+
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT hostname, root_path FROM locations ORDER BY hostname"
+        ).fetchall() == [
+            ("workstation-a", str(root.resolve())),
+            ("workstation-b", str(root.resolve())),
+        ]
+        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (2,)
+
+
 def test_changed_revision_with_same_session_id_stays_separate(tmp_path: Path) -> None:
     first_root = tmp_path / ".codex"
     second_root = tmp_path / ".codex_another"

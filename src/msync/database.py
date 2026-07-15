@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import socket
 import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from sqlalchemy import URL, create_engine, delete, event, func, inspect, select, update
+from sqlalchemy import URL, case, create_engine, delete, event, func, inspect, or_, select, update
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -26,7 +27,8 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+LEGACY_HOSTNAME = "unknown"
 
 SQLITE_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
@@ -94,10 +96,84 @@ class ArchivedConversation:
     conversation: Conversation
 
 
+@dataclass(slots=True, frozen=True)
+class ArchiveLocation:
+    """A source location available to the history browser."""
+
+    id: int
+    provider: str
+    hostname: str
+    root_path: str
+    display_name: str
+    last_scanned_at: datetime | None
+    conversation_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class ConversationSummary:
+    """Compact conversation metadata used by the history browser list."""
+
+    id: int
+    location_id: int
+    provider: str
+    hostname: str
+    external_id: str
+    title: str | None
+    conversation_kind: str
+    cwd: str | None
+    model: str | None
+    git_branch: str | None
+    started_at: str | None
+    ended_at: str | None
+    event_count: int
+    message_count: int
+    preview: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class ArchivedMessagePart:
+    """One structured content block displayed in expanded event details."""
+
+    sequence: int
+    content_type: str
+    text: str | None
+    raw_json: str
+
+
+@dataclass(slots=True, frozen=True)
+class ArchivedEvent:
+    """One normalized event plus its lossless source representation."""
+
+    sequence: int
+    external_id: str | None
+    parent_external_id: str | None
+    event_type: str
+    event_subtype: str | None
+    role: str | None
+    visibility: str
+    occurred_at: str | None
+    text: str
+    raw_json: str
+    parse_error: str | None
+    parts: tuple[ArchivedMessagePart, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ConversationDetail:
+    """A complete browser view of an archived conversation."""
+
+    summary: ConversationSummary
+    relative_path: str
+    parent_external_id: str | None
+    metadata: dict[str, Any]
+    events: tuple[ArchivedEvent, ...]
+
+
 class Archive:
     """A durable archive that supports SQLite, PostgreSQL, and MySQL."""
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, hostname: str | None = None) -> None:
+        self.hostname = _normalize_hostname(hostname)
         self.url, self.sqlite_path = _normalize_database(database)
         self.initialized_new_database = False
         if self.sqlite_path is not None:
@@ -146,7 +222,7 @@ class Archive:
 
         root = root.resolve()
         with Session(self.engine) as session, session.begin():
-            location = self._upsert_location(session, root, provider.name)
+            location = self._upsert_location(session, root, provider.name, self.hostname)
             result = UploadResult(location_id=location.id, scanned=len(transcripts))
             for path in transcripts:
                 for attempt in range(2):
@@ -208,6 +284,236 @@ class Archive:
         )
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
+
+    def browse_locations(self) -> list[ArchiveLocation]:
+        """Return source locations and their conversation counts for the web UI."""
+
+        statement = (
+            select(
+                LocationRow.id,
+                LocationRow.provider,
+                LocationRow.hostname,
+                LocationRow.root_path,
+                LocationRow.display_name,
+                LocationRow.last_scanned_at,
+                func.count(ConversationRow.id),
+            )
+            .outerjoin(ConversationRow, ConversationRow.location_id == LocationRow.id)
+            .group_by(
+                LocationRow.id,
+                LocationRow.provider,
+                LocationRow.hostname,
+                LocationRow.root_path,
+                LocationRow.display_name,
+                LocationRow.last_scanned_at,
+            )
+            .order_by(LocationRow.display_name, LocationRow.id)
+        )
+        with Session(self.engine) as session:
+            return [ArchiveLocation(*row) for row in session.execute(statement)]
+
+    def browse_conversations(
+        self,
+        *,
+        location_id: int | None = None,
+        search_text: str = "",
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[ConversationSummary]:
+        """Return recent conversations, optionally filtered by location and text."""
+
+        if limit < 1 or limit > 500:
+            raise ValueError("Conversation limit must be between 1 and 500.")
+        if offset < 0:
+            raise ValueError("Conversation offset must not be negative.")
+
+        event_stats = (
+            select(
+                EventRow.conversation_id.label("conversation_id"),
+                func.count(EventRow.id).label("event_count"),
+                func.sum(
+                    case(
+                        (
+                            EventRow.role.in_(("user", "assistant"))
+                            & (EventRow.searchable_text != ""),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("message_count"),
+            )
+            .group_by(EventRow.conversation_id)
+            .subquery()
+        )
+        preview = (
+            select(EventRow.searchable_text)
+            .where(
+                EventRow.conversation_id == ConversationRow.id,
+                EventRow.role == "user",
+                EventRow.searchable_text != "",
+            )
+            .order_by(EventRow.sequence)
+            .limit(1)
+            .correlate(ConversationRow)
+            .scalar_subquery()
+        )
+        statement = (
+            select(
+                ConversationRow.id,
+                ConversationRow.location_id,
+                LocationRow.provider,
+                LocationRow.hostname,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.conversation_kind,
+                ConversationRow.cwd,
+                ConversationRow.model,
+                ConversationRow.git_branch,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+                func.coalesce(event_stats.c.event_count, 0),
+                func.coalesce(event_stats.c.message_count, 0),
+                preview,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .outerjoin(event_stats, event_stats.c.conversation_id == ConversationRow.id)
+        )
+        if location_id is not None:
+            statement = statement.where(ConversationRow.location_id == location_id)
+        if query := search_text.strip():
+            pattern = f"%{query}%"
+            matching_event = (
+                select(EventRow.id)
+                .where(
+                    EventRow.conversation_id == ConversationRow.id,
+                    EventRow.searchable_text.ilike(pattern),
+                )
+                .exists()
+            )
+            statement = statement.where(
+                or_(
+                    ConversationRow.title.ilike(pattern),
+                    ConversationRow.external_id.ilike(pattern),
+                    ConversationRow.cwd.ilike(pattern),
+                    matching_event,
+                )
+            )
+        statement = (
+            statement.order_by(
+                func.coalesce(ConversationRow.ended_at, ConversationRow.started_at).desc(),
+                ConversationRow.id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+        with Session(self.engine) as session:
+            return [ConversationSummary(*row) for row in session.execute(statement)]
+
+    def browse_conversation(self, conversation_id: int) -> ConversationDetail | None:
+        """Return a conversation and every event needed for normal and expanded views."""
+
+        statement = (
+            select(
+                ConversationRow.id,
+                ConversationRow.location_id,
+                LocationRow.provider,
+                LocationRow.hostname,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.conversation_kind,
+                ConversationRow.cwd,
+                ConversationRow.model,
+                ConversationRow.git_branch,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+                ConversationRow.relative_path,
+                ConversationRow.parent_external_id,
+                ConversationRow.metadata_json,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .where(ConversationRow.id == conversation_id)
+        )
+        with Session(self.engine) as session:
+            row = session.execute(statement).one_or_none()
+            if row is None:
+                return None
+
+            event_rows = list(
+                session.execute(
+                    select(EventRow)
+                    .where(EventRow.conversation_id == conversation_id)
+                    .order_by(EventRow.sequence)
+                ).scalars()
+            )
+            part_rows = (
+                list(
+                    session.execute(
+                        select(MessagePartRow)
+                        .where(MessagePartRow.event_id.in_([event.id for event in event_rows]))
+                        .order_by(MessagePartRow.event_id, MessagePartRow.sequence)
+                    ).scalars()
+                )
+                if event_rows
+                else []
+            )
+
+        parts_by_event: dict[int, list[ArchivedMessagePart]] = {}
+        for part in part_rows:
+            parts_by_event.setdefault(part.event_id, []).append(
+                ArchivedMessagePart(
+                    sequence=part.sequence,
+                    content_type=part.content_type,
+                    text=part.text,
+                    raw_json=part.raw_json,
+                )
+            )
+        events = tuple(
+            ArchivedEvent(
+                sequence=event.sequence,
+                external_id=event.external_id,
+                parent_external_id=event.parent_external_id,
+                event_type=event.event_type,
+                event_subtype=event.event_subtype,
+                role=event.role,
+                visibility=event.visibility,
+                occurred_at=event.occurred_at,
+                text=event.searchable_text,
+                raw_json=event.raw_json,
+                parse_error=event.parse_error,
+                parts=tuple(parts_by_event.get(event.id, [])),
+            )
+            for event in event_rows
+        )
+        event_count = len(events)
+        message_count = sum(
+            event.role in {"user", "assistant"} and bool(event.text) for event in events
+        )
+        summary = ConversationSummary(
+            id=row.id,
+            location_id=row.location_id,
+            provider=row.provider,
+            hostname=row.hostname,
+            external_id=row.external_id,
+            title=row.title,
+            conversation_kind=row.conversation_kind,
+            cwd=row.cwd,
+            model=row.model,
+            git_branch=row.git_branch,
+            started_at=row.started_at,
+            ended_at=row.ended_at,
+            event_count=event_count,
+            message_count=message_count,
+            preview=next(
+                (event.text for event in events if event.role == "user" and event.text), None
+            ),
+        )
+        return ConversationDetail(
+            summary=summary,
+            relative_path=row.relative_path,
+            parent_external_id=row.parent_external_id,
+            metadata=row.metadata_json,
+            events=events,
+        )
 
     def conversations(self) -> list[ArchivedConversation]:
         """Reconstruct every stored conversation from its lossless transcript blob."""
@@ -274,11 +580,14 @@ class Archive:
             sqlite_version = 0
             if self.engine.dialect.name == "sqlite":
                 sqlite_version = int(connection.exec_driver_sql("PRAGMA user_version").scalar_one())
-                if sqlite_version not in {0, 3, SCHEMA_VERSION}:
+                if sqlite_version not in {0, 3, 4, SCHEMA_VERSION}:
                     _raise_incompatible_schema(sqlite_version)
 
             if stored_version == 3 and {"conversations", "locations"} <= existing_tables:
                 _migrate_v3_to_v4(connection)
+                stored_version = 4
+            if stored_version == 4 and "locations" in existing_tables:
+                _migrate_v4_to_v5(connection)
                 stored_version = SCHEMA_VERSION
             elif stored_version is not None and stored_version != SCHEMA_VERSION:
                 _raise_incompatible_schema(stored_version)
@@ -390,15 +699,35 @@ class Archive:
             raise RuntimeError(f"Database schema validation failed: missing SQLite FTS: {missing}")
 
     @staticmethod
-    def _upsert_location(session: Session, root: Path, provider: str) -> LocationRow:
+    def _upsert_location(
+        session: Session,
+        root: Path,
+        provider: str,
+        hostname: str,
+    ) -> LocationRow:
         root_path = str(root)
-        root_path_hash = _text_hash(root_path)
+        root_path_hash = _location_hash(hostname, root_path)
         location = session.scalar(
             select(LocationRow).where(LocationRow.root_path_hash == root_path_hash)
         )
+        if location is None and hostname.casefold() != LEGACY_HOSTNAME:
+            legacy_hash = _location_hash(LEGACY_HOSTNAME, root_path)
+            location = session.scalar(
+                select(LocationRow)
+                .where(LocationRow.root_path_hash == legacy_hash)
+                .with_for_update()
+            )
+            if location is not None:
+                if location.root_path != root_path or location.hostname != LEGACY_HOSTNAME:
+                    raise RuntimeError(
+                        "A SHA-256 collision occurred while identifying a source location."
+                    )
+                location.hostname = hostname
+                location.root_path_hash = root_path_hash
         if location is None:
             location = LocationRow(
                 provider=provider,
+                hostname=hostname,
                 root_path=root_path,
                 root_path_hash=root_path_hash,
                 display_name=root.name or root_path,
@@ -406,8 +735,9 @@ class Archive:
             session.add(location)
             session.flush()
             return location
-        if location.root_path != root_path:
+        if location.root_path != root_path or location.hostname.casefold() != hostname.casefold():
             raise RuntimeError("A SHA-256 collision occurred while identifying a source location.")
+        location.hostname = hostname
         if location.provider != provider:
             session.execute(
                 delete(ConversationRow).where(ConversationRow.location_id == location.id)
@@ -619,6 +949,39 @@ def _migrate_v3_to_v4(connection: Connection) -> None:
     )
     revision_index.create(connection, checkfirst=True)
     connection.execute(
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="4")
+    )
+
+
+def _migrate_v4_to_v5(connection: Connection) -> None:
+    """Add hostname-aware source location identity without guessing legacy hosts."""
+
+    columns = {column["name"] for column in inspect(connection).get_columns("locations")}
+    if "hostname" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE locations ADD COLUMN hostname VARCHAR(255) "
+            f"NOT NULL DEFAULT '{LEGACY_HOSTNAME}'"
+        )
+
+    rows = list(
+        connection.execute(
+            select(LocationRow.id, LocationRow.hostname, LocationRow.root_path).order_by(
+                LocationRow.id
+            )
+        )
+    )
+    for row in rows:
+        hostname = row.hostname or LEGACY_HOSTNAME
+        connection.execute(
+            update(LocationRow)
+            .where(LocationRow.id == row.id)
+            .values(
+                hostname=hostname,
+                root_path_hash=_location_hash(hostname, row.root_path),
+            )
+        )
+
+    connection.execute(
         update(SchemaInfoRow)
         .where(SchemaInfoRow.key == "schema_version")
         .values(value=str(SCHEMA_VERSION))
@@ -737,6 +1100,20 @@ def _sqlite_statements(script: str) -> list[str]:
 
 def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _location_hash(hostname: str, root_path: str) -> str:
+    return _text_hash(f"{hostname.casefold()}\0{root_path}")
+
+
+def _normalize_hostname(hostname: str | None) -> str:
+    value = socket.gethostname() if hostname is None else hostname
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("Location hostname must not be empty.")
+    if len(normalized) > 255:
+        raise ValueError("Location hostname must not exceed 255 characters.")
+    return normalized
 
 
 def _raise_incompatible_schema(version: int) -> None:

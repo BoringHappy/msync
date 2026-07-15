@@ -69,6 +69,13 @@ def upload(
         str,
         typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
     ] = "auto",
+    hostname: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_HOSTNAME",
+            help="Hostname recorded for this source location (defaults to this machine).",
+        ),
+    ] = None,
 ) -> None:
     """Read new and changed transcripts into the configured archive."""
 
@@ -78,14 +85,22 @@ def upload(
         transcripts = selected_provider.discover(root)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
-        with Archive(database) as archive:
+        with Archive(database, hostname=hostname) as archive:
             result = archive.upload(
                 root=root,
                 provider=selected_provider,
                 transcripts=transcripts,
             )
             database_display = archive.display_database
-    except (HistoryFormatError, ImportError, OSError, RuntimeError, SQLAlchemyError) as error:
+            location_hostname = archive.hostname
+    except (
+        HistoryFormatError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        SQLAlchemyError,
+        ValueError,
+    ) as error:
         error_console.print(f"[bold red]Upload failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
 
@@ -93,6 +108,7 @@ def upload(
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Provider", selected_provider.name)
+    table.add_row("Hostname", location_hostname)
     table.add_row("Location", str(root))
     table.add_row("Database", database_display)
     table.add_row("Transcripts", str(result.scanned))
@@ -136,6 +152,13 @@ def sync(
             ),
         ),
     ] = None,
+    hostname: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_HOSTNAME",
+            help="Hostname recorded for these source locations (defaults to this machine).",
+        ),
+    ] = None,
 ) -> None:
     """Merge histories through the archive and write each provider's native format."""
 
@@ -150,7 +173,7 @@ def sync(
         for root in roots:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        with Archive(database) as archive:
+        with Archive(database, hostname=hostname) as archive:
             uploads = []
             for root, selected_provider in zip(roots, selected_providers, strict=True):
                 transcripts = unmanaged_transcripts(
@@ -174,7 +197,15 @@ def sync(
                 for root, selected_provider in zip(roots, selected_providers, strict=True)
             ]
             database_display = archive.display_database
-    except (HistoryFormatError, ImportError, OSError, RuntimeError, SQLAlchemyError) as error:
+            location_hostname = archive.hostname
+    except (
+        HistoryFormatError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        SQLAlchemyError,
+        ValueError,
+    ) as error:
         error_console.print(f"[bold red]Sync failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
 
@@ -184,10 +215,71 @@ def sync(
         _print_sync_result(
             root=root,
             provider=selected_provider,
+            hostname=location_hostname,
             database=database_display,
             upload=upload_result,
             result=sync_result,
         )
+
+
+@app.command()
+def server(
+    password: Annotated[
+        str,
+        typer.Option(
+            "--password",
+            envvar="MSYNC_SERVER_PASSWORD",
+            prompt="Server password",
+            hide_input=True,
+            help="Password required by the web UI (or set MSYNC_SERVER_PASSWORD).",
+        ),
+    ],
+    database: Annotated[
+        str,
+        typer.Option(
+            "--database",
+            "--db",
+            help="SQLite path or SQLAlchemy database URL.",
+            show_default=str(DEFAULT_DATABASE),
+        ),
+    ] = str(DEFAULT_DATABASE),
+    host: Annotated[
+        str,
+        typer.Option(help="Address on which the web server listens."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(min=1, max=65535, help="TCP port on which the web server listens."),
+    ] = 8000,
+    username: Annotated[
+        str,
+        typer.Option(
+            envvar="MSYNC_SERVER_USERNAME",
+            help="Username required by the web UI.",
+        ),
+    ] = "msync",
+) -> None:
+    """Start the authenticated web UI for browsing archived chat history."""
+
+    try:
+        import uvicorn
+
+        from msync.server import create_app
+
+        web_app = create_app(database, username=username, password=password)
+    except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
+        error_console.print(f"[bold red]Server failed:[/bold red] {error}")
+        raise typer.Exit(code=1) from error
+
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    console.print(f"History browser: [bold cyan]http://{display_host}:{port}[/bold cyan]")
+    console.print(f"Sign in as [bold]{username}[/bold]. Press Ctrl+C to stop.")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        error_console.print(
+            "[yellow]Security note:[/yellow] Basic authentication requires an HTTPS reverse "
+            "proxy when exposed beyond this machine."
+        )
+    uvicorn.run(web_app, host=host, port=port)
 
 
 @app.command()
@@ -302,6 +394,7 @@ def _print_sync_result(
     *,
     root: Path,
     provider: HistoryProvider,
+    hostname: str,
     database: str,
     upload: UploadResult,
     result: SyncResult,
@@ -310,6 +403,7 @@ def _print_sync_result(
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Provider", provider.name)
+    table.add_row("Hostname", hostname)
     table.add_row("Location", str(root))
     table.add_row("Database", database)
     table.add_row("Transcripts scanned", str(upload.scanned))

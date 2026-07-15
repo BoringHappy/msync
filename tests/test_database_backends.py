@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -9,6 +10,7 @@ from sqlalchemy.dialects import mysql, postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from msync.database import Archive, _normalize_database
+from msync.providers import get_provider
 from msync.tables import Base
 
 
@@ -36,7 +38,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("4",)
+        ).fetchone() == ("5",)
         primary_keys = {
             table: tuple(
                 row[1] for row in connection.execute(f"PRAGMA table_info({table})") if row[5]
@@ -53,6 +55,32 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
 
     with Archive(database) as archive:
         assert archive.initialized_new_database is False
+
+
+def test_v4_location_migrates_and_is_claimed_by_next_upload(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    root = (tmp_path / ".codex").resolve()
+    root.mkdir()
+    with Archive(database, hostname="old-host") as archive:
+        archive.upload(root=root, provider=get_provider("codex"), transcripts=[])
+
+    old_root_hash = hashlib.sha256(str(root).encode()).hexdigest()
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("ALTER TABLE locations DROP COLUMN hostname")
+        connection.execute("UPDATE locations SET root_path_hash = ?", (old_root_hash,))
+        connection.execute("UPDATE schema_info SET value = '4' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+
+    with Archive(database, hostname="workstation-a") as archive:
+        assert archive.browse_locations()[0].hostname == "unknown"
+        archive.upload(root=root, provider=get_provider("codex"), transcripts=[])
+
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("SELECT hostname FROM locations").fetchall() == [
+            ("workstation-a",)
+        ]
 
 
 def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:
