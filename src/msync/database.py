@@ -27,7 +27,7 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LEGACY_HOSTNAME = "unknown"
 
 SQLITE_FTS_SCHEMA = """
@@ -580,7 +580,7 @@ class Archive:
             sqlite_version = 0
             if self.engine.dialect.name == "sqlite":
                 sqlite_version = int(connection.exec_driver_sql("PRAGMA user_version").scalar_one())
-                if sqlite_version not in {0, 3, 4, SCHEMA_VERSION}:
+                if sqlite_version not in {0, 3, 4, 5, SCHEMA_VERSION}:
                     _raise_incompatible_schema(sqlite_version)
 
             if stored_version == 3 and {"conversations", "locations"} <= existing_tables:
@@ -588,8 +588,11 @@ class Archive:
                 stored_version = 4
             if stored_version == 4 and "locations" in existing_tables:
                 _migrate_v4_to_v5(connection)
+                stored_version = 5
+            if stored_version == 5 and "conversations" in existing_tables:
+                _migrate_v5_to_v6(connection)
                 stored_version = SCHEMA_VERSION
-            elif stored_version is not None and stored_version != SCHEMA_VERSION:
+            if stored_version is not None and stored_version != SCHEMA_VERSION:
                 _raise_incompatible_schema(stored_version)
 
             Base.metadata.create_all(connection)
@@ -982,10 +985,125 @@ def _migrate_v4_to_v5(connection: Connection) -> None:
         )
 
     connection.execute(
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="5")
+    )
+
+
+def _migrate_v5_to_v6(connection: Connection) -> None:
+    """Reindex native transcripts with content-block-aware message roles."""
+
+    conversation_ids = list(
+        connection.scalars(select(ConversationRow.id).order_by(ConversationRow.id))
+    )
+
+    # Clear the old unique values before applying re-derived hashes so two rows
+    # whose identities swap cannot transiently violate the revision index.
+    connection.execute(update(ConversationRow).values(chat_sha256=None))
+    seen: set[tuple[str, str]] = set()
+    for conversation_id in conversation_ids:
+        row = connection.execute(
+            select(
+                ConversationRow.id,
+                ConversationRow.relative_path,
+                ConversationRow.content_sha256,
+                ConversationRow.transcript_codec,
+                ConversationRow.transcript,
+                ConversationRow.metadata_json,
+                LocationRow.root_path,
+                LocationRow.provider,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .where(ConversationRow.id == conversation_id)
+        ).one()
+        if row.transcript_codec != "zlib":
+            raise RuntimeError(f"Unsupported transcript codec {row.transcript_codec!r} in archive.")
+        try:
+            transcript = zlib.decompress(row.transcript)
+        except zlib.error as error:
+            raise RuntimeError(
+                "A stored transcript is corrupt and cannot be decompressed."
+            ) from error
+        if hashlib.sha256(transcript).hexdigest() != row.content_sha256:
+            raise RuntimeError("A stored transcript failed its SHA-256 integrity check.")
+
+        root = Path(row.root_path)
+        conversation = get_provider(row.provider).read(
+            root / Path(row.relative_path),
+            root,
+            transcript=transcript,
+        )
+        identity = _conversation_identity(conversation)
+        if identity[1] is not None and identity in seen:
+            connection.execute(delete(ConversationRow).where(ConversationRow.id == row.id))
+            continue
+        if identity[1] is not None:
+            seen.add(identity)
+
+        connection.execute(delete(EventRow).where(EventRow.conversation_id == row.id))
+        _insert_migrated_events(connection, row.id, conversation)
+        connection.execute(
+            update(ConversationRow)
+            .where(ConversationRow.id == row.id)
+            .values(
+                external_id=conversation.external_id,
+                logical_session_id=conversation.logical_session_id,
+                chat_sha256=conversation.chat_sha256,
+                conversation_kind=conversation.kind,
+                parent_external_id=conversation.parent_external_id,
+                title=conversation.title,
+                cwd=conversation.cwd,
+                model=conversation.model,
+                git_branch=conversation.git_branch,
+                started_at=conversation.started_at,
+                ended_at=conversation.ended_at,
+                metadata_json=_metadata_with_identity(row.metadata_json, conversation),
+            )
+        )
+
+    connection.execute(
         update(SchemaInfoRow)
         .where(SchemaInfoRow.key == "schema_version")
         .values(value=str(SCHEMA_VERSION))
     )
+
+
+def _insert_migrated_events(
+    connection: Connection, conversation_id: int, conversation: Conversation
+) -> None:
+    """Insert freshly normalized events while retaining the native source JSON."""
+
+    for source in conversation.events:
+        result = connection.execute(
+            EventRow.__table__.insert().values(
+                conversation_id=conversation_id,
+                sequence=source.sequence,
+                external_id=source.external_id,
+                parent_external_id=source.parent_external_id,
+                event_type=source.event_type,
+                event_subtype=source.event_subtype,
+                role=source.role,
+                visibility=source.visibility,
+                occurred_at=source.occurred_at,
+                searchable_text=source.searchable_text,
+                raw_json=source.raw_json,
+                parse_error=source.parse_error,
+            )
+        )
+        event_id = result.inserted_primary_key[0]
+        if source.parts:
+            connection.execute(
+                MessagePartRow.__table__.insert(),
+                [
+                    {
+                        "event_id": event_id,
+                        "sequence": part.sequence,
+                        "content_type": part.content_type,
+                        "text": part.text,
+                        "raw_json": part.raw_json,
+                    }
+                    for part in source.parts
+                ],
+            )
 
 
 def _update_conversation(

@@ -213,7 +213,9 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert missing.status_code == 404
     assert "Raw events" in page.text
     assert "ctrlKey" in script.text
+    assert "moveEventFocus" in script.text
     assert "location.hostname" in script.text
+    assert 'data-transcript-filter="tools"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
@@ -245,8 +247,11 @@ def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Pat
     assert detail["events"][2]["event_subtype"] == "tool_result"
     assert detail["events"][2]["text"] == "Build completed successfully"
     assert "conversationItems" in script
-    assert "Tool ${entry.tool.kind}" in script
-    assert ".event.tool-result .message-text" in styles
+    assert "appendToolItem" in script
+    assert "renderMarkdown" in script
+    assert "innerHTML" not in script
+    assert "navigator.clipboard" in script
+    assert "tool-output-disclosure" in styles
 
 
 def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None:

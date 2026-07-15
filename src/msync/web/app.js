@@ -6,6 +6,7 @@ const state = {
   activeConversation: null,
   detailsExpanded: false,
   searchTimer: null,
+  transcriptFilter: "all",
 };
 
 const elements = {
@@ -25,6 +26,7 @@ const elements = {
   toggleDetails: document.querySelector("#toggle-details"),
   detailLabel: document.querySelector("#detail-button-label"),
   footerStatus: document.querySelector("#footer-status"),
+  filterButtons: [...document.querySelectorAll("[data-transcript-filter]")],
   toast: document.querySelector("#toast"),
 };
 
@@ -204,7 +206,6 @@ function renderConversation() {
   addMetadata("events", `${summary.message_count} messages / ${summary.event_count} total`);
   updateDetailsButton();
   renderEvents();
-  elements.footerStatus.textContent = `${summary.message_count} messages · ${summary.provider}`;
   elements.content.scrollTo({ top: 0 });
 }
 
@@ -259,22 +260,21 @@ function prettyValue(value) {
   return parsed === null ? value : JSON.stringify(parsed, null, 2);
 }
 
-function describeTool(event, part, toolNames) {
+function describeTool(event, part) {
   const value = toolPayload(event, part);
   const type = part?.content_type || value.type || event.event_subtype || "tool";
   const result = type.includes("result")
     || type.includes("output")
     || type.endsWith("_response");
   const callId = value.tool_use_id || value.call_id || value.id || event.external_id || "";
-  const directName = value.name || value.tool_name || value.server_name || "";
-  if (!result && callId && directName) toolNames.set(callId, directName);
-  const name = directName || toolNames.get(callId) || "";
+  const name = value.name || value.tool_name || value.server_name || "";
   const body = result
     ? value.content ?? value.output ?? value.result ?? part?.text ?? event.text
     : value.input ?? value.arguments ?? value.action ?? value.query ?? part?.text;
   return {
     body: prettyValue(body),
     callId,
+    error: Boolean(value.is_error || value.error),
     kind: result ? "result" : "call",
     name,
     type,
@@ -287,16 +287,52 @@ function eventRole(event) {
   return "metadata";
 }
 
+function appendToolItem(items, pendingTools, event, part) {
+  const tool = describeTool(event, part);
+  if (tool.kind === "call") {
+    const entry = {
+      event,
+      events: [event],
+      part,
+      role: "tool",
+      text: tool.body,
+      tool: { call: tool, name: tool.name, result: null },
+    };
+    items.push(entry);
+    if (tool.callId) pendingTools.set(tool.callId, entry);
+    return;
+  }
+
+  const callEntry = tool.callId ? pendingTools.get(tool.callId) : null;
+  if (callEntry) {
+    callEntry.tool.result = tool;
+    callEntry.tool.name ||= tool.name;
+    if (!callEntry.events.includes(event)) callEntry.events.push(event);
+    pendingTools.delete(tool.callId);
+    return;
+  }
+  items.push({
+    event,
+    events: [event],
+    part,
+    role: "tool",
+    text: tool.body,
+    tool: { call: null, name: tool.name, result: tool },
+  });
+}
+
 function conversationItems() {
   const items = [];
-  const toolNames = new Map();
+  const pendingTools = new Map();
   for (const event of state.activeConversation.events) {
     let added = false;
     for (const part of event.parts || []) {
       const role = partRole(event, part);
       if (role === "tool") {
-        const tool = describeTool(event, part, toolNames);
-        items.push({ event, part, role, text: tool.body, tool });
+        appendToolItem(items, pendingTools, event, part);
+        added = true;
+      } else if (role === "reasoning" && part.text) {
+        items.push({ event, events: [event], part, role, text: part.text, tool: null });
         added = true;
       } else if (
         event.visibility === "display"
@@ -304,62 +340,267 @@ function conversationItems() {
         && isTextType(part.content_type)
         && part.text
       ) {
-        items.push({ event, part, role, text: part.text, tool: null });
+        items.push({ event, events: [event], part, role, text: part.text, tool: null });
         added = true;
       }
     }
 
     if (!added && isToolType(event.event_subtype || "")) {
-      const tool = describeTool(event, null, toolNames);
-      items.push({ event, part: null, role: "tool", text: tool.body, tool });
+      appendToolItem(items, pendingTools, event, null);
     } else if (!added && event.visibility === "display" && event.text) {
       const role = eventRole(event);
-      if (role !== "reasoning") {
-        items.push({ event, part: null, role, text: event.text, tool: null });
-      }
+      items.push({ event, events: [event], part: null, role, text: event.text, tool: null });
+    } else if (!added && eventRole(event) === "reasoning" && event.text) {
+      items.push({
+        event,
+        events: [event],
+        part: null,
+        role: "reasoning",
+        text: event.text,
+        tool: null,
+      });
     }
   }
   return items;
+}
+
+function filteredConversationItems() {
+  const items = conversationItems();
+  if (state.transcriptFilter === "chat") {
+    return items.filter((item) => ["user", "assistant", "system"].includes(item.role));
+  }
+  if (state.transcriptFilter === "tools") return items.filter((item) => item.role === "tool");
+  if (state.transcriptFilter === "reasoning") {
+    return items.filter((item) => item.role === "reasoning");
+  }
+  return items.filter((item) => item.role !== "reasoning");
 }
 
 function eventMarker(role) {
   return { user: "›", assistant: "◆", tool: "⚙", reasoning: "∿", system: "•", metadata: "·" }[role] || "·";
 }
 
+function appendInlineMarkdown(parent, text) {
+  const pattern = /(`[^`\n]+`|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*)/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > cursor) parent.append(document.createTextNode(text.slice(cursor, match.index)));
+    if (match[0].startsWith("`")) {
+      parent.append(node("code", "inline-code", match[0].slice(1, -1)));
+    } else if (match[2] && match[3]) {
+      const link = node("a", "", match[2]);
+      link.href = match[3];
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      parent.append(link);
+    } else if (match[4]) {
+      parent.append(node("strong", "", match[4]));
+    } else if (match[5]) {
+      parent.append(node("em", "", match[5]));
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) parent.append(document.createTextNode(text.slice(cursor)));
+}
+
+function copyButton(value) {
+  const button = node("button", "copy-button", "copy");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      button.textContent = "copied";
+      window.setTimeout(() => { button.textContent = "copy"; }, 1400);
+    } catch (_) {
+      showToast("Clipboard access is unavailable in this browser.");
+    }
+  });
+  return button;
+}
+
+function startsMarkdownBlock(line) {
+  return /^(```|#{1,6}\s|>\s?|[-*+]\s+|\d+\.\s+| {0,3}([-*_])(?:\s*\2){2,}\s*$)/.test(line);
+}
+
+function renderMarkdown(value) {
+  const root = node("div", "message-text markdown");
+  const lines = value.replace(/\r\n?/g, "\n").split("\n");
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^```\s*([\w.+-]*)\s*$/);
+    if (fence) {
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const code = codeLines.join("\n");
+      const block = node("div", "code-block");
+      const heading = node("div", "code-heading");
+      heading.append(node("span", "", fence[1] || "code"), copyButton(code));
+      block.append(heading, node("pre", "", code));
+      root.append(block);
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const heading = node(`h${headingMatch[1].length}`);
+      appendInlineMarkdown(heading, headingMatch[2]);
+      root.append(heading);
+      index += 1;
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quote = node("blockquote");
+      while (index < lines.length && /^>\s?/.test(lines[index])) {
+        const quoteLine = node("div");
+        appendInlineMarkdown(quoteLine, lines[index].replace(/^>\s?/, ""));
+        quote.append(quoteLine);
+        index += 1;
+      }
+      root.append(quote);
+      continue;
+    }
+
+    const listMatch = line.match(/^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/);
+    if (listMatch) {
+      const ordered = Boolean(listMatch[2]);
+      const list = node(ordered ? "ol" : "ul");
+      while (index < lines.length) {
+        const itemMatch = lines[index].match(/^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/);
+        if (!itemMatch || Boolean(itemMatch[2]) !== ordered) break;
+        const item = node("li");
+        appendInlineMarkdown(item, itemMatch[3]);
+        list.append(item);
+        index += 1;
+      }
+      root.append(list);
+      continue;
+    }
+
+    if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+      root.append(node("hr"));
+      index += 1;
+      continue;
+    }
+
+    const paragraphLines = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !startsMarkdownBlock(lines[index])) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    const paragraph = node("p");
+    appendInlineMarkdown(paragraph, paragraphLines.join("\n"));
+    root.append(paragraph);
+  }
+  return root;
+}
+
+function toolDuration(entry) {
+  if (!entry.tool.call || !entry.tool.result || entry.events.length < 2) return "";
+  if (!entry.events[0].occurred_at || !entry.events.at(-1).occurred_at) return "";
+  const started = new Date(entry.events[0].occurred_at).valueOf();
+  const ended = new Date(entry.events.at(-1).occurred_at).valueOf();
+  if (!Number.isFinite(started) || !Number.isFinite(ended) || ended < started) return "";
+  const milliseconds = ended - started;
+  return milliseconds < 1000 ? `${milliseconds} ms` : `${(milliseconds / 1000).toFixed(1)} s`;
+}
+
+function toolSection(label, value) {
+  const section = node("div", "tool-section");
+  const heading = node("div", "tool-section-heading", label);
+  if (value) heading.append(copyButton(value));
+  section.append(heading);
+  if (value) section.append(node("pre", "tool-payload", value));
+  else section.append(node("div", "tool-empty", "No textual payload"));
+  return section;
+}
+
+function renderToolActivity(entry) {
+  const card = node("div", "tool-card");
+  if (entry.tool.call) card.append(toolSection("INPUT", entry.tool.call.body));
+  if (entry.tool.result) {
+    const result = toolSection("OUTPUT", entry.tool.result.body);
+    if ((entry.tool.result.body || "").length > 900) {
+      const disclosure = node("details", "tool-output-disclosure");
+      disclosure.append(
+        node("summary", "", `Output · ${entry.tool.result.body.length.toLocaleString()} characters`),
+        result,
+      );
+      card.append(disclosure);
+    } else {
+      card.append(result);
+    }
+  } else {
+    card.append(node("div", "tool-pending", "Awaiting result"));
+  }
+  return card;
+}
+
 function renderEvents() {
   elements.transcript.replaceChildren();
   elements.transcript.classList.toggle("raw-mode", state.detailsExpanded);
+  for (const button of elements.filterButtons) {
+    button.setAttribute("aria-pressed", String(button.dataset.transcriptFilter === state.transcriptFilter));
+    button.disabled = state.detailsExpanded;
+  }
   const entries = state.detailsExpanded
-    ? state.activeConversation.events.map((event) => ({ event, raw: true }))
-    : conversationItems();
+    ? state.activeConversation.events.map((event) => ({ event, events: [event], raw: true }))
+    : filteredConversationItems();
   if (!entries.length) {
-    elements.transcript.append(node("div", "no-results", "This session has no visible messages. Expand details to inspect its raw events."));
+    elements.transcript.append(node("div", "no-results", "No events match this view."));
+    elements.footerStatus.textContent = `0 visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}`;
     return;
   }
   for (const entry of entries) elements.transcript.append(renderEvent(entry));
+  elements.footerStatus.textContent = `${entries.length} visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}`;
 }
 
 function renderEvent(entry) {
   const event = entry.event;
   const role = entry.raw ? eventRole(event) : entry.role;
-  const toolClass = entry.tool ? ` tool-${entry.tool.kind}` : "";
+  const toolState = entry.tool
+    ? (entry.tool.result?.error ? "failed" : (entry.tool.result ? "complete" : "pending"))
+    : "";
+  const toolClass = entry.tool ? ` tool-${toolState}` : "";
   const wrapper = node("section", `event ${role}${toolClass}`);
+  wrapper.tabIndex = -1;
   wrapper.append(node("span", "event-marker", eventMarker(role)));
 
   const heading = node("div", "event-heading");
   let roleLabel = role === "user" ? "You" : role;
   if (entry.tool) {
-    roleLabel = `Tool ${entry.tool.kind}`;
+    roleLabel = "Tool";
     if (entry.tool.name) roleLabel += ` · ${entry.tool.name}`;
   }
   heading.append(
     node("span", "event-role", roleLabel),
     node("span", "event-time", event.occurred_at ? formatDate(event.occurred_at, true) : ""),
   );
-  const type = entry.tool?.type || [event.event_type, event.event_subtype].filter(Boolean).join(" / ");
+  const toolTypes = entry.tool
+    ? [entry.tool.call?.type, entry.tool.result?.type].filter(Boolean).join(" → ")
+    : "";
+  const type = toolTypes || [event.event_type, event.event_subtype].filter(Boolean).join(" / ");
   const eventType = node("span", "event-type", type);
   eventType.title = type;
   heading.append(eventType);
+  if (entry.tool) {
+    const duration = toolDuration(entry);
+    const statusText = toolState === "failed"
+      ? "× failed"
+      : (toolState === "complete" ? `✓ ${duration || "done"}` : "… running");
+    heading.append(node("span", `tool-status ${toolState}`, statusText));
+  }
   const toggle = node("button", "detail-toggle", entry.raw ? "hide" : "raw");
   toggle.type = "button";
   toggle.setAttribute("aria-expanded", String(Boolean(entry.raw)));
@@ -368,15 +609,20 @@ function renderEvent(entry) {
   wrapper.append(heading);
 
   const text = entry.raw ? event.text : entry.text;
-  if (text) {
-    wrapper.append(node("div", role === "tool" ? "message-text tool-text" : "message-text", text));
-  } else if (role === "tool") {
-    wrapper.append(node("div", "tool-empty", "No textual payload"));
+  if (entry.tool) {
+    wrapper.append(renderToolActivity(entry));
+  } else if (text) {
+    wrapper.append(entry.raw ? node("div", "message-text", text) : renderMarkdown(text));
   } else {
     wrapper.append(node("div", "metadata-event", `${event.visibility} event · no normalized text`));
   }
 
-  const details = renderEventDetails(event);
+  const details = node("div", "entry-details");
+  const seenSequences = new Set();
+  for (const detailEvent of entry.events || [event]) {
+    if (!seenSequences.has(detailEvent.sequence)) details.append(renderEventDetails(detailEvent));
+    seenSequences.add(detailEvent.sequence);
+  }
   details.classList.toggle("hidden", !entry.raw);
   wrapper.append(details);
   toggle.addEventListener("click", () => {
@@ -441,11 +687,50 @@ function toggleSidebar() {
   elements.sidebar.classList.toggle("open");
 }
 
+function setTranscriptFilter(filter) {
+  if (!state.activeConversation) return;
+  state.transcriptFilter = filter;
+  state.detailsExpanded = false;
+  updateDetailsButton();
+  renderEvents();
+  elements.content.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function moveEventFocus(delta) {
+  const events = [...elements.transcript.querySelectorAll(".event")];
+  if (!events.length) return;
+  const active = document.activeElement?.closest?.(".event");
+  const current = events.indexOf(active);
+  const next = current < 0
+    ? (delta > 0 ? 0 : events.length - 1)
+    : Math.min(events.length - 1, Math.max(0, current + delta));
+  events[next].focus({ preventScroll: true });
+  events[next].scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function moveSession(delta) {
+  const activeId = state.activeConversation?.summary.id;
+  const current = state.conversations.findIndex((conversation) => conversation.id === activeId);
+  if (current < 0 || !state.conversations.length) return;
+  const next = Math.min(state.conversations.length - 1, Math.max(0, current + delta));
+  if (next !== current) openConversation(state.conversations[next].id);
+}
+
+function isTypingTarget(target) {
+  return target instanceof HTMLInputElement
+    || target instanceof HTMLSelectElement
+    || target instanceof HTMLTextAreaElement
+    || target?.isContentEditable;
+}
+
 elements.location.addEventListener("change", () => loadConversations().catch(handleError));
 elements.search.addEventListener("input", () => {
   window.clearTimeout(state.searchTimer);
   state.searchTimer = window.setTimeout(() => loadConversations().catch(handleError), 250);
 });
+for (const button of elements.filterButtons) {
+  button.addEventListener("click", () => setTranscriptFilter(button.dataset.transcriptFilter));
+}
 elements.toggleDetails.addEventListener("click", toggleAllDetails);
 document.querySelector("#footer-details").addEventListener("click", toggleAllDetails);
 document.querySelector("#sessions-button").addEventListener("click", toggleSidebar);
@@ -462,6 +747,24 @@ document.addEventListener("keydown", (event) => {
   } else if (event.key === "Escape") {
     elements.sidebar.classList.remove("open");
     elements.search.blur();
+  } else if (!isTypingTarget(event.target) && ["1", "2", "3", "4"].includes(event.key)) {
+    event.preventDefault();
+    setTranscriptFilter({ 1: "all", 2: "chat", 3: "tools", 4: "reasoning" }[event.key]);
+  } else if (!isTypingTarget(event.target) && event.key.toLowerCase() === "j") {
+    event.preventDefault();
+    moveEventFocus(1);
+  } else if (!isTypingTarget(event.target) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    moveEventFocus(-1);
+  } else if (!isTypingTarget(event.target) && event.key === "]") {
+    event.preventDefault();
+    moveSession(1);
+  } else if (!isTypingTarget(event.target) && event.key === "[") {
+    event.preventDefault();
+    moveSession(-1);
+  } else if (event.key === "Enter" && document.activeElement?.classList.contains("event")) {
+    event.preventDefault();
+    document.activeElement.querySelector(".detail-toggle")?.click();
   }
 });
 
