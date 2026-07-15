@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import socket
 import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,7 +27,8 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+LEGACY_HOSTNAME = "unknown"
 
 SQLITE_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
@@ -100,6 +102,7 @@ class ArchiveLocation:
 
     id: int
     provider: str
+    hostname: str
     root_path: str
     display_name: str
     last_scanned_at: datetime | None
@@ -113,6 +116,7 @@ class ConversationSummary:
     id: int
     location_id: int
     provider: str
+    hostname: str
     external_id: str
     title: str | None
     conversation_kind: str
@@ -168,7 +172,8 @@ class ConversationDetail:
 class Archive:
     """A durable archive that supports SQLite, PostgreSQL, and MySQL."""
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(self, database: str | Path, *, hostname: str | None = None) -> None:
+        self.hostname = _normalize_hostname(hostname)
         self.url, self.sqlite_path = _normalize_database(database)
         self.initialized_new_database = False
         if self.sqlite_path is not None:
@@ -217,7 +222,7 @@ class Archive:
 
         root = root.resolve()
         with Session(self.engine) as session, session.begin():
-            location = self._upsert_location(session, root, provider.name)
+            location = self._upsert_location(session, root, provider.name, self.hostname)
             result = UploadResult(location_id=location.id, scanned=len(transcripts))
             for path in transcripts:
                 for attempt in range(2):
@@ -287,6 +292,7 @@ class Archive:
             select(
                 LocationRow.id,
                 LocationRow.provider,
+                LocationRow.hostname,
                 LocationRow.root_path,
                 LocationRow.display_name,
                 LocationRow.last_scanned_at,
@@ -296,6 +302,7 @@ class Archive:
             .group_by(
                 LocationRow.id,
                 LocationRow.provider,
+                LocationRow.hostname,
                 LocationRow.root_path,
                 LocationRow.display_name,
                 LocationRow.last_scanned_at,
@@ -355,6 +362,7 @@ class Archive:
                 ConversationRow.id,
                 ConversationRow.location_id,
                 LocationRow.provider,
+                LocationRow.hostname,
                 ConversationRow.external_id,
                 ConversationRow.title,
                 ConversationRow.conversation_kind,
@@ -409,6 +417,7 @@ class Archive:
                 ConversationRow.id,
                 ConversationRow.location_id,
                 LocationRow.provider,
+                LocationRow.hostname,
                 ConversationRow.external_id,
                 ConversationRow.title,
                 ConversationRow.conversation_kind,
@@ -483,6 +492,7 @@ class Archive:
             id=row.id,
             location_id=row.location_id,
             provider=row.provider,
+            hostname=row.hostname,
             external_id=row.external_id,
             title=row.title,
             conversation_kind=row.conversation_kind,
@@ -570,11 +580,14 @@ class Archive:
             sqlite_version = 0
             if self.engine.dialect.name == "sqlite":
                 sqlite_version = int(connection.exec_driver_sql("PRAGMA user_version").scalar_one())
-                if sqlite_version not in {0, 3, SCHEMA_VERSION}:
+                if sqlite_version not in {0, 3, 4, SCHEMA_VERSION}:
                     _raise_incompatible_schema(sqlite_version)
 
             if stored_version == 3 and {"conversations", "locations"} <= existing_tables:
                 _migrate_v3_to_v4(connection)
+                stored_version = 4
+            if stored_version == 4 and "locations" in existing_tables:
+                _migrate_v4_to_v5(connection)
                 stored_version = SCHEMA_VERSION
             elif stored_version is not None and stored_version != SCHEMA_VERSION:
                 _raise_incompatible_schema(stored_version)
@@ -686,15 +699,35 @@ class Archive:
             raise RuntimeError(f"Database schema validation failed: missing SQLite FTS: {missing}")
 
     @staticmethod
-    def _upsert_location(session: Session, root: Path, provider: str) -> LocationRow:
+    def _upsert_location(
+        session: Session,
+        root: Path,
+        provider: str,
+        hostname: str,
+    ) -> LocationRow:
         root_path = str(root)
-        root_path_hash = _text_hash(root_path)
+        root_path_hash = _location_hash(hostname, root_path)
         location = session.scalar(
             select(LocationRow).where(LocationRow.root_path_hash == root_path_hash)
         )
+        if location is None and hostname.casefold() != LEGACY_HOSTNAME:
+            legacy_hash = _location_hash(LEGACY_HOSTNAME, root_path)
+            location = session.scalar(
+                select(LocationRow)
+                .where(LocationRow.root_path_hash == legacy_hash)
+                .with_for_update()
+            )
+            if location is not None:
+                if location.root_path != root_path or location.hostname != LEGACY_HOSTNAME:
+                    raise RuntimeError(
+                        "A SHA-256 collision occurred while identifying a source location."
+                    )
+                location.hostname = hostname
+                location.root_path_hash = root_path_hash
         if location is None:
             location = LocationRow(
                 provider=provider,
+                hostname=hostname,
                 root_path=root_path,
                 root_path_hash=root_path_hash,
                 display_name=root.name or root_path,
@@ -702,8 +735,9 @@ class Archive:
             session.add(location)
             session.flush()
             return location
-        if location.root_path != root_path:
+        if location.root_path != root_path or location.hostname.casefold() != hostname.casefold():
             raise RuntimeError("A SHA-256 collision occurred while identifying a source location.")
+        location.hostname = hostname
         if location.provider != provider:
             session.execute(
                 delete(ConversationRow).where(ConversationRow.location_id == location.id)
@@ -915,6 +949,39 @@ def _migrate_v3_to_v4(connection: Connection) -> None:
     )
     revision_index.create(connection, checkfirst=True)
     connection.execute(
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="4")
+    )
+
+
+def _migrate_v4_to_v5(connection: Connection) -> None:
+    """Add hostname-aware source location identity without guessing legacy hosts."""
+
+    columns = {column["name"] for column in inspect(connection).get_columns("locations")}
+    if "hostname" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE locations ADD COLUMN hostname VARCHAR(255) "
+            f"NOT NULL DEFAULT '{LEGACY_HOSTNAME}'"
+        )
+
+    rows = list(
+        connection.execute(
+            select(LocationRow.id, LocationRow.hostname, LocationRow.root_path).order_by(
+                LocationRow.id
+            )
+        )
+    )
+    for row in rows:
+        hostname = row.hostname or LEGACY_HOSTNAME
+        connection.execute(
+            update(LocationRow)
+            .where(LocationRow.id == row.id)
+            .values(
+                hostname=hostname,
+                root_path_hash=_location_hash(hostname, row.root_path),
+            )
+        )
+
+    connection.execute(
         update(SchemaInfoRow)
         .where(SchemaInfoRow.key == "schema_version")
         .values(value=str(SCHEMA_VERSION))
@@ -1033,6 +1100,20 @@ def _sqlite_statements(script: str) -> list[str]:
 
 def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _location_hash(hostname: str, root_path: str) -> str:
+    return _text_hash(f"{hostname.casefold()}\0{root_path}")
+
+
+def _normalize_hostname(hostname: str | None) -> str:
+    value = socket.gethostname() if hostname is None else hostname
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("Location hostname must not be empty.")
+    if len(normalized) > 255:
+        raise ValueError("Location hostname must not exceed 255 characters.")
+    return normalized
 
 
 def _raise_incompatible_schema(version: int) -> None:

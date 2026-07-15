@@ -49,6 +49,14 @@ $ msync upload --dir ~/.claude
 $ msync upload --dir ~/.codex_another
 ```
 
+Locations are identified by both hostname and directory path, so machines that use the same path
+remain distinct in a shared PostgreSQL archive. Both `upload` and `sync` default to the local
+machine name; override it with `--hostname` or `MSYNC_HOSTNAME` when a stable alias is preferable:
+
+```console
+$ msync upload --dir ~/.codex --hostname workstation-a
+```
+
 The provider is detected from the directory layout and JSONL records. It can be specified when a
 custom layout is ambiguous, and the database can be overridden for testing or backups:
 
@@ -71,9 +79,11 @@ exist; `msync` creates and versions its tables automatically.
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
 unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
-triggers. Schema version 3 is migrated in place to version 4 by backfilling logical revision
-identities and collapsing duplicates before the unique index is created. Partial, older, or
-otherwise incompatible schemas fail before any transcript is uploaded.
+triggers. Schema version 3 is migrated in place by backfilling logical revision identities and
+collapsing duplicates before the unique index is created. Version 4 archives are then migrated to
+hostname-aware location identities. A legacy location is recorded with hostname `unknown` until
+its source uploads again or uses an explicit `--hostname`. Partial, older, or otherwise
+incompatible schemas fail before any transcript is uploaded.
 
 Uploads are idempotent. Each file is addressed by its source location and relative path, then
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
@@ -191,7 +201,7 @@ The database is deliberately split into distinct storage and indexing layers:
 | Table | Purpose |
 | --- | --- |
 | `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
-| `locations` | One Claude/Codex data directory, allowing multiple installations of either provider. |
+| `locations` | One hostname and Claude/Codex data-directory pair, allowing multiple machines and installations. |
 | `conversations` | Session metadata, unique logical revision identity, and a zlib-compressed byte-exact source JSONL. |
 | `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
@@ -202,7 +212,8 @@ conversation reconstruction. Normalized columns are an index, not a replacement 
 source. Foreign keys record the location of the retained copy. Identical logical revisions found in
 another provider or location are skipped; different revisions remain distinct when they exist as
 separate source transcripts. Full-length text and binary column variants keep large events and
-transcripts safe on MySQL, while SHA-256 path identities avoid backend-specific index-length limits.
+transcripts safe on MySQL, while SHA-256 hostname/path identities avoid backend-specific
+index-length limits.
 PostgreSQL/MySQL full-text indexes can be added as search adapters without changing the portable
 archive records.
 

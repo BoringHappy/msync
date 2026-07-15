@@ -91,7 +91,7 @@ async function loadLocations() {
   const params = new URLSearchParams(window.location.search);
   const requested = params.get("location") || "";
   for (const location of state.locations) {
-    const option = node("option", "", `${location.display_name} · ${location.provider} (${location.conversation_count})`);
+    const option = node("option", "", `${location.display_name} · ${location.hostname} · ${location.provider} (${location.conversation_count})`);
     option.value = String(location.id);
     option.title = location.root_path;
     elements.location.append(option);
@@ -151,7 +151,7 @@ function renderConversationList() {
       top,
       node("div", "session-title", title),
       node("div", "session-preview", oneLine(conversation.preview, "No visible user message")),
-      node("div", "session-meta", `${conversation.message_count} messages · ${conversation.event_count} events`),
+      node("div", "session-meta", `${conversation.hostname} · ${conversation.message_count} messages · ${conversation.event_count} events`),
     );
     elements.sessionList.append(card);
   }
@@ -196,6 +196,7 @@ function renderConversation() {
   elements.subtitle.title = detail.relative_path;
   elements.metadata.replaceChildren();
   addMetadata("provider", summary.provider);
+  addMetadata("hostname", summary.hostname);
   addMetadata("time", formatDate(summary.started_at || summary.ended_at, true));
   addMetadata("model", summary.model);
   addMetadata("branch", summary.git_branch);

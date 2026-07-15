@@ -110,8 +110,10 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
 
     assert locations.status_code == 200
     assert len(locations.json()) == 2
+    assert all(location["hostname"] for location in locations.json())
     assert {location["conversation_count"] for location in locations.json()} == {1}
     assert len(all_conversations.json()) == 2
+    assert all(conversation["hostname"] for conversation in all_conversations.json())
     assert [item["external_id"] for item in search_results.json()] == ["first-session"]
     assert len(selected_location.json()) == 1
     assert selected_location.json()[0]["location_id"] == location_id
@@ -139,6 +141,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert response.status_code == 200
     detail = response.json()
     assert detail["summary"]["external_id"] == "detail-session"
+    assert detail["summary"]["hostname"]
     assert detail["relative_path"] == "sessions/detail-session.jsonl"
     assert detail["summary"]["event_count"] == 4
     assert detail["summary"]["message_count"] == 2
@@ -149,6 +152,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert missing.status_code == 404
     assert "Expand details" in page.text
     assert "ctrlKey" in script.text
+    assert "location.hostname" in script.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text

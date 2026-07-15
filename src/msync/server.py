@@ -28,6 +28,7 @@ class LocationResponse(BaseModel):
 
     id: int
     provider: str
+    hostname: str
     root_path: str
     display_name: str
     last_scanned_at: datetime | None
@@ -42,6 +43,7 @@ class ConversationSummaryResponse(BaseModel):
     id: int
     location_id: int
     provider: str
+    hostname: str
     external_id: str
     title: str | None
     conversation_kind: str

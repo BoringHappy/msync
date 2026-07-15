@@ -39,13 +39,14 @@ class SchemaInfoRow(Base):
 
 
 class LocationRow(Base):
-    """A physical Claude or Codex history directory."""
+    """A physical Claude or Codex history directory on one host."""
 
     __tablename__ = "locations"
     __table_args__ = (Index("locations_root_path_hash_uq", "root_path_hash", unique=True),)
 
     id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
     root_path: Mapped[str] = mapped_column(LONG_TEXT, nullable=False)
     root_path_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
