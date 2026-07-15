@@ -33,6 +33,18 @@ LEGACY_HOSTNAME = "unknown"
 
 SchemaUpgradeReporter = Callable[[int, int], None]
 SchemaUpgradeProgressReporter = Callable[[int, int], None]
+SchemaMigrationFunction = Callable[
+    [Connection, SchemaUpgradeProgressReporter | None],
+    None,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaMigration:
+    """One sequential archive schema migration."""
+
+    target_version: int
+    upgrade: SchemaMigrationFunction
 
 
 class SchemaUpgradeRequiredError(RuntimeError):
@@ -631,11 +643,13 @@ class Archive:
                     sqlite_version = int(
                         connection.exec_driver_sql("PRAGMA user_version").scalar_one()
                     )
-                    if sqlite_version not in {0, 3, 4, 5, SCHEMA_VERSION}:
+                    if sqlite_version not in {0, SCHEMA_VERSION, *SCHEMA_MIGRATIONS}:
                         _raise_incompatible_schema(sqlite_version)
 
                 self.schema_version_before = stored_version or sqlite_version or None
-                if stored_version in {3, 4, 5}:
+                if stored_version is not None and stored_version != SCHEMA_VERSION:
+                    if stored_version not in SCHEMA_MIGRATIONS:
+                        _raise_incompatible_schema(stored_version)
                     if not self.auto_upgrade:
                         raise SchemaUpgradeRequiredError(stored_version)
                     upgrade_from = stored_version
@@ -646,18 +660,13 @@ class Archive:
                             self.schema_lock_timeout,
                         )
 
-                if stored_version == 3 and {"conversations", "locations"} <= existing_tables:
-                    self._report_schema_upgrade(3, 4)
-                    _migrate_v3_to_v4(connection)
-                    stored_version = 4
-                if stored_version == 4 and "locations" in existing_tables:
-                    self._report_schema_upgrade(4, 5)
-                    _migrate_v4_to_v5(connection)
-                    stored_version = 5
-                if stored_version == 5 and "conversations" in existing_tables:
-                    self._report_schema_upgrade(5, SCHEMA_VERSION)
-                    _migrate_v5_to_v6(connection, self.upgrade_progress_reporter)
-                    stored_version = SCHEMA_VERSION
+                while stored_version is not None and stored_version != SCHEMA_VERSION:
+                    migration = SCHEMA_MIGRATIONS.get(stored_version)
+                    if migration is None:
+                        _raise_incompatible_schema(stored_version)
+                    self._report_schema_upgrade(stored_version, migration.target_version)
+                    migration.upgrade(connection, self.upgrade_progress_reporter)
+                    stored_version = migration.target_version
                 if stored_version is not None and stored_version != SCHEMA_VERSION:
                     _raise_incompatible_schema(stored_version)
 
@@ -957,112 +966,6 @@ def _accumulate_upload_result(result: UploadResult, file_result: UploadResult) -
         setattr(result, field_name, getattr(result, field_name) + getattr(file_result, field_name))
 
 
-def _migrate_v3_to_v4(connection: Connection) -> None:
-    """Add indexed logical revision identity and collapse existing duplicate rows."""
-
-    columns = {column["name"] for column in inspect(connection).get_columns("conversations")}
-    if "logical_session_id" not in columns:
-        connection.exec_driver_sql(
-            "ALTER TABLE conversations ADD COLUMN logical_session_id VARCHAR(36)"
-        )
-    if "chat_sha256" not in columns:
-        connection.exec_driver_sql("ALTER TABLE conversations ADD COLUMN chat_sha256 VARCHAR(64)")
-
-    rows = list(
-        connection.execute(
-            select(
-                ConversationRow.id,
-                ConversationRow.relative_path,
-                ConversationRow.content_sha256,
-                ConversationRow.transcript_codec,
-                ConversationRow.transcript,
-                ConversationRow.metadata_json,
-                LocationRow.root_path,
-                LocationRow.provider,
-            )
-            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
-            .order_by(ConversationRow.id)
-        )
-    )
-    seen: set[tuple[str, str]] = set()
-    for row in rows:
-        if row.transcript_codec != "zlib":
-            raise RuntimeError(f"Unsupported transcript codec {row.transcript_codec!r} in archive.")
-        try:
-            transcript = zlib.decompress(row.transcript)
-        except zlib.error as error:
-            raise RuntimeError(
-                "A stored transcript is corrupt and cannot be decompressed."
-            ) from error
-        if hashlib.sha256(transcript).hexdigest() != row.content_sha256:
-            raise RuntimeError("A stored transcript failed its SHA-256 integrity check.")
-
-        root = Path(row.root_path)
-        conversation = get_provider(row.provider).read(
-            root / Path(row.relative_path),
-            root,
-            transcript=transcript,
-        )
-        identity = _conversation_identity(conversation)
-        if identity[1] is not None and (identity[0], identity[1]) in seen:
-            connection.execute(delete(ConversationRow).where(ConversationRow.id == row.id))
-            continue
-        if identity[1] is not None:
-            seen.add((identity[0], identity[1]))
-        connection.execute(
-            update(ConversationRow)
-            .where(ConversationRow.id == row.id)
-            .values(
-                logical_session_id=identity[0],
-                chat_sha256=identity[1],
-                metadata_json=_metadata_with_identity(row.metadata_json, conversation),
-            )
-        )
-
-    revision_index = next(
-        index
-        for index in ConversationRow.__table__.indexes
-        if index.name == "conversations_logical_revision_uq"
-    )
-    revision_index.create(connection, checkfirst=True)
-    connection.execute(
-        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="4")
-    )
-
-
-def _migrate_v4_to_v5(connection: Connection) -> None:
-    """Add hostname-aware source location identity without guessing legacy hosts."""
-
-    columns = {column["name"] for column in inspect(connection).get_columns("locations")}
-    if "hostname" not in columns:
-        connection.exec_driver_sql(
-            "ALTER TABLE locations ADD COLUMN hostname VARCHAR(255) "
-            f"NOT NULL DEFAULT '{LEGACY_HOSTNAME}'"
-        )
-
-    rows = list(
-        connection.execute(
-            select(LocationRow.id, LocationRow.hostname, LocationRow.root_path).order_by(
-                LocationRow.id
-            )
-        )
-    )
-    for row in rows:
-        hostname = row.hostname or LEGACY_HOSTNAME
-        connection.execute(
-            update(LocationRow)
-            .where(LocationRow.id == row.id)
-            .values(
-                hostname=hostname,
-                root_path_hash=_location_hash(hostname, row.root_path),
-            )
-        )
-
-    connection.execute(
-        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="5")
-    )
-
-
 def _migrate_v5_to_v6(
     connection: Connection,
     progress_reporter: SchemaUpgradeProgressReporter | None = None,
@@ -1188,6 +1091,11 @@ def _insert_migrated_events(
                     for part in source.parts
                 ],
             )
+
+
+SCHEMA_MIGRATIONS: dict[int, SchemaMigration] = {
+    5: SchemaMigration(target_version=6, upgrade=_migrate_v5_to_v6),
+}
 
 
 def _update_conversation(
@@ -1346,7 +1254,12 @@ def _normalize_hostname(hostname: str | None) -> str:
 
 
 def _raise_incompatible_schema(version: int) -> None:
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {version} is newer than this msync schema "
+            f"({SCHEMA_VERSION}); upgrade msync before opening the database."
+        )
     raise RuntimeError(
-        f"Database schema version {version} is incompatible with this msync schema "
-        f"({SCHEMA_VERSION}); create a new database."
+        f"Database schema version {version} has no supported upgrade path to "
+        f"{SCHEMA_VERSION}; export it with a compatible msync release or create a new database."
     )

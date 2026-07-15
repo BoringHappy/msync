@@ -80,11 +80,11 @@ On every connection, `msync` detects whether its schema is absent, initializes a
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
 unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
 triggers. Existing schemas are migrated by the explicit `msync upgrade` maintenance command.
-Schema version 3 is upgraded by backfilling logical revision identities and collapsing duplicates
-before the unique index is created. Version 4 archives are then migrated to hostname-aware
-location identities. A legacy location is recorded with hostname `unknown` until its source
-uploads again or uses an explicit `--hostname`. Partial, older, or otherwise incompatible schemas
-fail before any transcript is uploaded.
+During the development phase, version 5 is the oldest supported upgrade baseline; earlier
+development schemas should be recreated or exported with their compatible msync release. Known
+migrations are registered as sequential steps, so future releases can add a `6 → 7` step without
+changing the CLI workflow. Partial or otherwise incompatible schemas fail before any transcript is
+uploaded.
 
 For a shared or large archive, stop uploads and run the schema upgrade explicitly before starting
 the web server:

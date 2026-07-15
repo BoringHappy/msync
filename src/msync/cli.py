@@ -250,8 +250,6 @@ def upgrade(
     def report_upgrade(current_version: int, target_version: int) -> None:
         steps.append((current_version, target_version))
         detail = {
-            (3, 4): "backfilling logical conversation identities",
-            (4, 5): "adding hostname-aware location identities",
             (5, 6): "rebuilding normalized events from retained transcripts",
         }.get((current_version, target_version), "applying archive changes")
         console.print(f"Upgrading database schema {current_version} → {target_version}: {detail}.")
