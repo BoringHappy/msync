@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -38,7 +39,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("5",)
+        ).fetchone() == ("6",)
         primary_keys = {
             table: tuple(
                 row[1] for row in connection.execute(f"PRAGMA table_info({table})") if row[5]
@@ -77,10 +78,76 @@ def test_v4_location_migrates_and_is_claimed_by_next_upload(tmp_path: Path) -> N
         archive.upload(root=root, provider=get_provider("codex"), transcripts=[])
 
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         assert connection.execute("SELECT hostname FROM locations").fetchall() == [
             ("workstation-a",)
         ]
+
+
+def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    root = (tmp_path / ".claude").resolve()
+    transcript = root / "projects" / "-work" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "sessionId": "session-1",
+            "message": {"role": "user", "content": "Inspect the log"},
+        },
+        {
+            "type": "user",
+            "uuid": "tool-result-1",
+            "sessionId": "session-1",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "command output",
+                    }
+                ],
+            },
+        },
+    ]
+    source = "".join(json.dumps(record) + "\n" for record in records).encode()
+    transcript.write_bytes(source)
+    with Archive(database) as archive:
+        archive.upload(
+            root=root,
+            provider=get_provider("claude"),
+            transcripts=[transcript],
+        )
+
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute(
+            "UPDATE events SET role = 'user', event_subtype = NULL WHERE sequence = 1"
+        )
+        connection.execute("UPDATE conversations SET title = 'command output'")
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+
+    with Archive(database) as archive:
+        summary = archive.browse_conversations()[0]
+        detail = archive.browse_conversation(summary.id)
+        stored = archive.conversations()[0].conversation.transcript
+        matches = archive.search("command output")
+
+    assert detail is not None
+    assert summary.title == "Inspect the log"
+    assert summary.message_count == 1
+    assert [event.role for event in detail.events] == ["user", "tool"]
+    assert detail.events[1].event_subtype == "tool_result"
+    assert [match.role for match in matches] == ["tool"]
+    assert stored == source
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute(
+            "SELECT value FROM schema_info WHERE key = 'schema_version'"
+        ).fetchone() == ("6",)
 
 
 def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:

@@ -68,6 +68,67 @@ def _archive_codex_conversation(
         archive.upload(root=root, provider=get_provider("codex"), transcripts=[transcript])
 
 
+def _archive_claude_tool_conversation(database: Path, root: Path) -> None:
+    transcript = root / "projects" / "-work" / "tool-session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "sessionId": "tool-session",
+            "timestamp": "2026-07-14T12:00:00Z",
+            "message": {"role": "user", "content": "Inspect the build log"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-1",
+            "sessionId": "tool-session",
+            "timestamp": "2026-07-14T12:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will check it."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {"file_path": "/work/build.log"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "tool-result-1",
+            "sessionId": "tool-session",
+            "timestamp": "2026-07-14T12:00:02Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "Build completed successfully",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-2",
+            "sessionId": "tool-session",
+            "timestamp": "2026-07-14T12:00:03Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "The build passed."}],
+            },
+        },
+    ]
+    transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with Archive(database) as archive:
+        archive.upload(root=root, provider=get_provider("claude"), transcripts=[transcript])
+
+
 def test_server_requires_basic_auth_for_ui_and_api(tmp_path: Path) -> None:
     web_app = create_app(tmp_path / "archive.sqlite", username="reader", password="secret")
 
@@ -150,13 +211,50 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert json.loads(detail["events"][1]["raw_json"])["type"] == "event_msg"
     assert any(event["visibility"] == "model" for event in detail["events"])
     assert missing.status_code == 404
-    assert "Expand details" in page.text
+    assert "Raw events" in page.text
     assert "ctrlKey" in script.text
+    assert "moveEventFocus" in script.text
     assert "location.hostname" in script.text
+    assert 'data-transcript-filter="tools"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
+
+
+def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    _archive_claude_tool_conversation(database, tmp_path / ".claude")
+    web_app = create_app(database, username="reader", password="secret")
+
+    with TestClient(web_app) as client:
+        client.auth = ("reader", "secret")
+        summary = client.get("/api/conversations").json()[0]
+        detail = client.get(f"/api/conversations/{summary['id']}").json()
+        script = client.get("/assets/app.js").text
+        styles = client.get("/assets/styles.css").text
+
+    assert summary["title"] == "Inspect the build log"
+    assert summary["preview"] == "Inspect the build log"
+    assert summary["message_count"] == 3
+    assert [event["role"] for event in detail["events"]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert detail["events"][1]["text"] == "I will check it."
+    assert detail["events"][2]["event_subtype"] == "tool_result"
+    assert detail["events"][2]["text"] == "Build completed successfully"
+    assert "conversationItems" in script
+    assert "appendToolItem" in script
+    assert "renderMarkdown" in script
+    assert "hasEmbeddedOutput" in script
+    assert "Completed without textual output" in script
+    assert "innerHTML" not in script
+    assert "navigator.clipboard" in script
+    assert "tool-output-disclosure" in styles
+    assert ".tool-finished" in styles
 
 
 def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None:

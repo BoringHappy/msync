@@ -175,3 +175,109 @@ def test_registry_rejects_duplicates_and_unknown_names() -> None:
         registry.register(ExampleProvider())
     with pytest.raises(HistoryFormatError, match="Available providers: example"):
         registry.get("missing")
+
+
+def test_claude_tool_blocks_are_not_normalized_as_user_messages() -> None:
+    provider = get_provider("claude")
+    tool_result = {
+        "type": "user",
+        "uuid": "tool-result-1",
+        "sessionId": "session-1",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-use-1",
+                    "content": "command output",
+                }
+            ],
+        },
+    }
+
+    event = provider.decode_event(0, json.dumps(tool_result), tool_result)
+
+    assert event.role == "tool"
+    assert event.event_subtype == "tool_result"
+    assert event.visibility == "display"
+    assert event.searchable_text == "command output"
+    assert [part.content_type for part in event.parts] == ["tool_result"]
+
+
+def test_claude_mixed_message_keeps_prose_separate_from_tool_payload() -> None:
+    provider = get_provider("claude")
+    mixed_message = {
+        "type": "assistant",
+        "uuid": "assistant-1",
+        "sessionId": "session-1",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I will inspect the file."},
+                {
+                    "type": "tool_use",
+                    "id": "tool-use-1",
+                    "name": "Read",
+                    "input": {"file_path": "/work/example.py"},
+                },
+            ],
+        },
+    }
+
+    event = provider.decode_event(0, json.dumps(mixed_message), mixed_message)
+
+    assert event.role == "assistant"
+    assert event.searchable_text == "I will inspect the file."
+    assert [part.content_type for part in event.parts] == ["text", "tool_use"]
+    assert json.loads(event.parts[1].raw_json)["name"] == "Read"
+
+
+@pytest.mark.parametrize("subtype", ["function_call", "function_call_output", "mcp_call"])
+def test_codex_tool_items_are_separate_display_events(subtype: str) -> None:
+    provider = get_provider("codex")
+    payload = {
+        "type": subtype,
+        "call_id": "call-1",
+        "name": "exec_command",
+        "arguments": '{"cmd":"pwd"}',
+        "output": "finished",
+    }
+    value = {"type": "response_item", "payload": payload}
+
+    event = provider.decode_event(0, json.dumps(value), value)
+
+    assert event.role == "tool"
+    assert event.event_subtype == subtype
+    assert event.visibility == "display"
+    assert event.parts[0].content_type == subtype
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "web_search_call",
+            "id": "web-1",
+            "status": "completed",
+            "action": {"type": "search", "query": "latest release"},
+        },
+        {
+            "type": "image_generation_call",
+            "id": "image-1",
+            "status": "completed",
+            "revised_prompt": "A terminal history browser",
+            "result": "base64-image-result",
+        },
+    ],
+)
+def test_codex_self_contained_tool_payloads_remain_structured(
+    payload: dict[str, Any],
+) -> None:
+    provider = get_provider("codex")
+    value = {"type": "response_item", "payload": payload}
+
+    event = provider.decode_event(0, json.dumps(value), value)
+
+    assert event.role == "tool"
+    assert event.visibility == "display"
+    assert json.loads(event.parts[0].raw_json)["status"] == "completed"

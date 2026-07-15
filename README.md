@@ -179,8 +179,11 @@ $ MSYNC_SERVER_PASSWORD='choose-a-strong-password' msync server
 
 Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a terminal-inspired
 Claude/Codex layout with a location picker, session search, chronological message rendering, and
-lossless event inspection. Select **Expand details** (or press Ctrl+O) to include metadata/model
-events and raw source JSON; each visible message also has its own **details** button.
+lossless event inspection. Tool calls and results share compact activity cards, while assistant
+messages render common Markdown and fenced code blocks without accepting embedded HTML. Use the
+**Activity**, **Chat**, **Tools**, and **Reasoning** filters (or keys 1–4), navigate messages with
+J/K and sessions with `[`/`]`, and select **Raw events** (or press Ctrl+O) to inspect every native
+record and its source JSON.
 
 Choose a different archive, login, address, or port with command options:
 
@@ -209,7 +212,9 @@ The database is deliberately split into distinct storage and indexing layers:
 
 The retained transcript blob and per-event raw JSON preserve all data needed for future export or
 conversation reconstruction. Normalized columns are an index, not a replacement for the retained
-source. Foreign keys record the location of the retained copy. Identical logical revisions found in
+source. Schema upgrades can therefore rebuild normalized events from the byte-exact transcript;
+schema v6 does this once to distinguish human messages from tool content in existing archives.
+Foreign keys record the location of the retained copy. Identical logical revisions found in
 another provider or location are skipped; different revisions remain distinct when they exist as
 separate source transcripts. Full-length text and binary column variants keep large events and
 transcripts safe on MySQL, while SHA-256 hostname/path identities avoid backend-specific

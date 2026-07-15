@@ -225,7 +225,16 @@ def block_text(block: Any) -> str | None:
         return "\n".join(text) or None
     if not isinstance(block, dict):
         return None
-    for key in ("text", "input_text", "output_text", "content", "message"):
+    for key in (
+        "text",
+        "input_text",
+        "output_text",
+        "content",
+        "message",
+        "arguments",
+        "output",
+        "result",
+    ):
         if key in block and (text := block_text(block[key])):
             return text
     return None

@@ -36,7 +36,7 @@
           <input id="search-input" type="search" placeholder="search sessions" autocomplete="off">
         </label>
         <div class="session-list" id="session-list" aria-live="polite"></div>
-        <div class="sidebar-foot"><kbd>/</kbd> search <span>·</span> newest first</div>
+        <div class="sidebar-foot"><kbd>/</kbd> search <span>·</span> <kbd>[ ]</kbd> switch session</div>
       </aside>
 
       <main class="content" id="content">
@@ -57,10 +57,18 @@
               </div>
               <button class="terminal-button" id="toggle-details" type="button" aria-pressed="false">
                 <span class="button-key">Ctrl O</span>
-                <span id="detail-button-label">Expand details</span>
+                <span id="detail-button-label">Raw events</span>
               </button>
             </div>
             <dl class="metadata-strip" id="metadata-strip"></dl>
+            <div class="transcript-controls" id="transcript-controls" role="toolbar" aria-label="Transcript view">
+              <span class="control-label">VIEW</span>
+              <button type="button" data-transcript-filter="all" aria-pressed="true">Activity</button>
+              <button type="button" data-transcript-filter="chat" aria-pressed="false">Chat</button>
+              <button type="button" data-transcript-filter="tools" aria-pressed="false">Tools</button>
+              <button type="button" data-transcript-filter="reasoning" aria-pressed="false">Reasoning</button>
+              <span class="control-hint"><kbd>1–4</kbd> filter <kbd>j k</kbd> move</span>
+            </div>
           </header>
           <div class="transcript" id="transcript" aria-live="polite"></div>
         </article>
@@ -69,7 +77,7 @@
 
     <footer class="command-bar">
       <button id="footer-sessions" type="button"><span>☰</span> Sessions</button>
-      <button id="footer-details" type="button"><span>⊕</span> Expand detail</button>
+      <button id="footer-details" type="button"><span>⊕</span> Raw events</button>
       <button id="scroll-top" type="button"><span>↑</span> Top</button>
       <span class="command-spacer"></span>
       <span id="footer-status">Ready</span>
