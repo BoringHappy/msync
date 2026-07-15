@@ -28,6 +28,26 @@ from msync.schemas.codex import (
     CodexSessionMetaPayload,
 )
 
+_CODEX_NON_TOOL_CALL_TYPES = frozenset({"message", "reasoning"})
+
+
+def _is_tool_item(subtype: str | None) -> bool:
+    """Recognize current and future Responses API tool item variants."""
+
+    if subtype is None or subtype in _CODEX_NON_TOOL_CALL_TYPES:
+        return False
+    return (
+        subtype.endswith(("_call", "_call_output"))
+        or subtype.endswith(("_tool", "_tool_output"))
+        or subtype
+        in {
+            "mcp_approval_request",
+            "mcp_approval_response",
+            "mcp_list_tools",
+            "tool_search_output",
+        }
+    )
+
 
 class CodexProvider(HistoryProvider):
     """Read Codex session and archived-session JSONL files."""
@@ -67,8 +87,13 @@ class CodexProvider(HistoryProvider):
             visibility = "model"
             content = payload.get("content")
         elif event_type == "response_item" and subtype == "reasoning":
+            role = "reasoning"
             visibility = "model"
             content = payload.get("summary")
+        elif event_type == "response_item" and _is_tool_item(subtype):
+            role = "tool"
+            visibility = "display"
+            content = payload
 
         return Event(
             sequence=sequence,

@@ -31,6 +31,15 @@ from msync.schemas.claude import (
     ClaudeUserRecord,
 )
 
+_CLAUDE_TEXT_BLOCK_TYPES = frozenset({"text"})
+_CLAUDE_REASONING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+
+
+def _is_tool_block(content_type: str) -> bool:
+    """Recognize client and server tool blocks without coupling to individual tools."""
+
+    return content_type.endswith(("tool_use", "tool_result"))
+
 
 class ClaudeProvider(HistoryProvider):
     """Read Claude Code project and subagent JSONL files."""
@@ -69,17 +78,47 @@ class ClaudeProvider(HistoryProvider):
             role = "system"
             content = record.summary
 
+        parts = message_parts(content)
+        normalized_text = None
+        event_subtype = record.subtype
+        if event_type in {"user", "assistant"}:
+            block_types = {part.content_type for part in parts}
+            text = "\n".join(
+                part.text
+                for part in parts
+                if part.text and part.content_type in _CLAUDE_TEXT_BLOCK_TYPES
+            )
+            if text:
+                # Claude can put prose and tool blocks in one native message. Keep the
+                # tool blocks as parts, but do not fold their payload into the prose.
+                normalized_text = text
+            elif any(_is_tool_block(content_type) for content_type in block_types):
+                role = "tool"
+                visibility = "display"
+                event_type_detail = next(iter(block_types)) if len(block_types) == 1 else "tools"
+                event_subtype = record.subtype or event_type_detail
+                normalized_text = "\n".join(part.text for part in parts if part.text)
+            elif block_types and block_types <= _CLAUDE_REASONING_BLOCK_TYPES:
+                role = "reasoning"
+                visibility = "model"
+                event_type_detail = (
+                    next(iter(block_types)) if len(block_types) == 1 else "reasoning"
+                )
+                event_subtype = record.subtype or event_type_detail
+                normalized_text = "\n".join(part.text for part in parts if part.text)
+
         return Event(
             sequence=sequence,
             raw_json=raw_json,
             event_type=event_type,
-            event_subtype=record.subtype,
+            event_subtype=event_subtype,
             external_id=record.uuid or as_string(value.get("messageId")),
             parent_external_id=record.parent_uuid,
             role=role,
             occurred_at=record.timestamp,
             visibility=visibility,
-            parts=message_parts(content),
+            parts=parts,
+            normalized_text=normalized_text,
         )
 
     def encode_conversation(

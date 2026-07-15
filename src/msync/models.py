@@ -34,9 +34,12 @@ class Event:
     visibility: str = "metadata"
     parse_error: str | None = None
     parts: tuple[MessagePart, ...] = ()
+    normalized_text: str | None = None
 
     @property
     def searchable_text(self) -> str:
+        if self.normalized_text is not None:
+            return self.normalized_text
         return "\n".join(part.text for part in self.parts if part.text)
 
 

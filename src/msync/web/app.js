@@ -210,71 +210,179 @@ function renderConversation() {
 
 function updateDetailsButton() {
   elements.toggleDetails.setAttribute("aria-pressed", String(state.detailsExpanded));
-  elements.detailLabel.textContent = state.detailsExpanded ? "Collapse details" : "Expand details";
+  elements.detailLabel.textContent = state.detailsExpanded ? "Conversation" : "Raw events";
   document.querySelector("#footer-details").lastChild.textContent = state.detailsExpanded
-    ? " Collapse detail"
-    : " Expand detail";
+    ? " Conversation"
+    : " Raw events";
 }
 
-function visibleEvents() {
-  if (state.detailsExpanded) return state.activeConversation.events;
-  return state.activeConversation.events.filter((event) => event.visibility === "display" && event.text);
+function parseJson(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+function isToolType(type = "") {
+  return type.includes("tool")
+    || type.endsWith("_call")
+    || type.endsWith("_call_output")
+    || type === "mcp_approval_request"
+    || type === "mcp_approval_response";
+}
+
+function isReasoningType(type = "") {
+  return ["reasoning", "summary_text", "thinking", "redacted_thinking"].includes(type);
+}
+
+function isTextType(type = "") {
+  return ["text", "input_text", "output_text"].includes(type);
+}
+
+function partRole(event, part) {
+  if (isToolType(part.content_type)) return "tool";
+  if (isReasoningType(part.content_type)) return "reasoning";
+  return eventRole(event);
+}
+
+function toolPayload(event, part) {
+  const source = parseJson(part?.raw_json || event.raw_json) || {};
+  if (source.payload && typeof source.payload === "object") return source.payload;
+  return source;
+}
+
+function prettyValue(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value !== "string") return JSON.stringify(value, null, 2);
+  const parsed = parseJson(value);
+  return parsed === null ? value : JSON.stringify(parsed, null, 2);
+}
+
+function describeTool(event, part, toolNames) {
+  const value = toolPayload(event, part);
+  const type = part?.content_type || value.type || event.event_subtype || "tool";
+  const result = type.includes("result")
+    || type.includes("output")
+    || type.endsWith("_response");
+  const callId = value.tool_use_id || value.call_id || value.id || event.external_id || "";
+  const directName = value.name || value.tool_name || value.server_name || "";
+  if (!result && callId && directName) toolNames.set(callId, directName);
+  const name = directName || toolNames.get(callId) || "";
+  const body = result
+    ? value.content ?? value.output ?? value.result ?? part?.text ?? event.text
+    : value.input ?? value.arguments ?? value.action ?? value.query ?? part?.text;
+  return {
+    body: prettyValue(body),
+    callId,
+    kind: result ? "result" : "call",
+    name,
+    type,
+  };
 }
 
 function eventRole(event) {
   if (event.role) return event.role;
-  if (event.event_type.includes("tool")) return "tool";
+  if (isToolType(event.event_subtype || "") || event.event_type.includes("tool")) return "tool";
   return "metadata";
 }
 
+function conversationItems() {
+  const items = [];
+  const toolNames = new Map();
+  for (const event of state.activeConversation.events) {
+    let added = false;
+    for (const part of event.parts || []) {
+      const role = partRole(event, part);
+      if (role === "tool") {
+        const tool = describeTool(event, part, toolNames);
+        items.push({ event, part, role, text: tool.body, tool });
+        added = true;
+      } else if (
+        event.visibility === "display"
+        && ["user", "assistant", "system"].includes(role)
+        && isTextType(part.content_type)
+        && part.text
+      ) {
+        items.push({ event, part, role, text: part.text, tool: null });
+        added = true;
+      }
+    }
+
+    if (!added && isToolType(event.event_subtype || "")) {
+      const tool = describeTool(event, null, toolNames);
+      items.push({ event, part: null, role: "tool", text: tool.body, tool });
+    } else if (!added && event.visibility === "display" && event.text) {
+      const role = eventRole(event);
+      if (role !== "reasoning") {
+        items.push({ event, part: null, role, text: event.text, tool: null });
+      }
+    }
+  }
+  return items;
+}
+
 function eventMarker(role) {
-  return { user: "›", assistant: "◆", tool: "⚙", system: "•", metadata: "·" }[role] || "·";
+  return { user: "›", assistant: "◆", tool: "⚙", reasoning: "∿", system: "•", metadata: "·" }[role] || "·";
 }
 
 function renderEvents() {
   elements.transcript.replaceChildren();
-  const events = visibleEvents();
-  if (!events.length) {
+  elements.transcript.classList.toggle("raw-mode", state.detailsExpanded);
+  const entries = state.detailsExpanded
+    ? state.activeConversation.events.map((event) => ({ event, raw: true }))
+    : conversationItems();
+  if (!entries.length) {
     elements.transcript.append(node("div", "no-results", "This session has no visible messages. Expand details to inspect its raw events."));
     return;
   }
-  for (const event of events) elements.transcript.append(renderEvent(event));
+  for (const entry of entries) elements.transcript.append(renderEvent(entry));
 }
 
-function renderEvent(event) {
-  const role = eventRole(event);
-  const wrapper = node("section", `event ${role}`);
+function renderEvent(entry) {
+  const event = entry.event;
+  const role = entry.raw ? eventRole(event) : entry.role;
+  const toolClass = entry.tool ? ` tool-${entry.tool.kind}` : "";
+  const wrapper = node("section", `event ${role}${toolClass}`);
   wrapper.append(node("span", "event-marker", eventMarker(role)));
 
   const heading = node("div", "event-heading");
-  const roleLabel = role === "user" ? "You" : role;
+  let roleLabel = role === "user" ? "You" : role;
+  if (entry.tool) {
+    roleLabel = `Tool ${entry.tool.kind}`;
+    if (entry.tool.name) roleLabel += ` · ${entry.tool.name}`;
+  }
   heading.append(
     node("span", "event-role", roleLabel),
     node("span", "event-time", event.occurred_at ? formatDate(event.occurred_at, true) : ""),
   );
-  const type = [event.event_type, event.event_subtype].filter(Boolean).join(" / ");
+  const type = entry.tool?.type || [event.event_type, event.event_subtype].filter(Boolean).join(" / ");
   const eventType = node("span", "event-type", type);
   eventType.title = type;
   heading.append(eventType);
-  const toggle = node("button", "detail-toggle", state.detailsExpanded ? "hide" : "details");
+  const toggle = node("button", "detail-toggle", entry.raw ? "hide" : "raw");
   toggle.type = "button";
-  toggle.setAttribute("aria-expanded", String(state.detailsExpanded));
+  toggle.setAttribute("aria-expanded", String(Boolean(entry.raw)));
+  toggle.setAttribute("aria-label", `Toggle raw detail for event ${event.sequence}`);
   heading.append(toggle);
   wrapper.append(heading);
 
-  if (event.text) {
-    wrapper.append(node("div", "message-text", event.text));
+  const text = entry.raw ? event.text : entry.text;
+  if (text) {
+    wrapper.append(node("div", role === "tool" ? "message-text tool-text" : "message-text", text));
+  } else if (role === "tool") {
+    wrapper.append(node("div", "tool-empty", "No textual payload"));
   } else {
     wrapper.append(node("div", "metadata-event", `${event.visibility} event · no normalized text`));
   }
 
   const details = renderEventDetails(event);
-  details.classList.toggle("hidden", !state.detailsExpanded);
+  details.classList.toggle("hidden", !entry.raw);
   wrapper.append(details);
   toggle.addEventListener("click", () => {
     const expanded = toggle.getAttribute("aria-expanded") !== "true";
     toggle.setAttribute("aria-expanded", String(expanded));
-    toggle.textContent = expanded ? "hide" : "details";
+    toggle.textContent = expanded ? "hide" : "raw";
     details.classList.toggle("hidden", !expanded);
   });
   return wrapper;
