@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
-from msync.database import Archive, SearchResult, UploadResult
+from msync.database import Archive, SchemaUpgradeRequiredError, SearchResult, UploadResult
 from msync.providers import (
     HistoryFormatError,
     HistoryProvider,
@@ -328,7 +328,20 @@ def server(
 
         from msync.server import create_app
 
-        web_app = create_app(database, username=username, password=password)
+        try:
+            web_app = create_app(database, username=username, password=password)
+        except SchemaUpgradeRequiredError as error:
+            console.print(
+                f"Database schema version {error.current_version} must be upgraded to "
+                f"{error.target_version} before the server can start."
+            )
+            if not typer.confirm("Upgrade the database now?", default=False):
+                error_console.print("Server not started; the database was not upgraded.")
+                raise typer.Exit(code=1) from error
+            upgrade(database=database, lock_timeout=10)
+            web_app = create_app(database, username=username, password=password)
+    except typer.Exit:
+        raise
     except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
         error_console.print(f"[bold red]Server failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error

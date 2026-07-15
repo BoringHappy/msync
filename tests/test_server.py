@@ -292,7 +292,9 @@ def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None
     assert "http://127.0.0.1:8765" in result.output
 
 
-def test_server_command_requires_explicit_schema_upgrade(tmp_path: Path) -> None:
+def test_server_command_leaves_old_schema_unchanged_when_upgrade_declined(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "server.sqlite"
     with Archive(database):
         pass
@@ -303,11 +305,50 @@ def test_server_command_requires_explicit_schema_upgrade(tmp_path: Path) -> None
     result = CliRunner().invoke(
         app,
         ["server", "--password", "secret", "--database", str(database)],
+        input="n\n",
     )
 
     assert result.exit_code == 1
-    assert "must be upgraded to 6" in result.output
-    assert "msync upgrade --database <database>" in result.output
+    assert "Upgrade the database now? [y/N]" in result.output
+    assert "database was not upgraded" in result.output
+    assert "Server failed" not in result.output
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_info WHERE key = 'schema_version'"
+        ).fetchone() == ("5",)
+
+
+def test_server_command_upgrades_old_schema_when_confirmed(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    database = tmp_path / "server.sqlite"
+    with Archive(database):
+        pass
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(web_app: Any, *, host: str, port: int) -> None:
+        captured.update(app=web_app, host=host, port=port)
+        web_app.state.archive.close()
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    result = CliRunner().invoke(
+        app,
+        ["server", "--password", "secret", "--database", str(database)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Upgrade the database now? [y/N]" in result.output
+    assert "Database schema upgrade complete: 5 → 6" in result.output
+    assert captured["app"].title == "msync history browser"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_info WHERE key = 'schema_version'"
+        ).fetchone() == ("6",)
 
 
 def test_server_rejects_empty_credentials(tmp_path: Path) -> None:

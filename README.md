@@ -200,8 +200,10 @@ messages render common Markdown and fenced code blocks without accepting embedde
 J/K and sessions with `[`/`]`, and select **Raw events** (or press Ctrl+O) to inspect every native
 record and its source JSON.
 
-If startup reports an old schema, stop other msync processes, run `msync upgrade` against the same
-database, and start the server again.
+If startup detects an old schema, it asks whether to upgrade the database. Answer `y` to run the
+registered migrations with the same bounded lock wait and progress reporting as `msync upgrade`,
+or accept the default `N` to leave the database unchanged and stop the server. For unattended
+startup, run `msync upgrade` explicitly during a maintenance window before launching the server.
 
 Choose a different archive, login, address, or port with command options:
 
