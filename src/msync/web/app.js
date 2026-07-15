@@ -260,23 +260,48 @@ function prettyValue(value) {
   return parsed === null ? value : JSON.stringify(parsed, null, 2);
 }
 
+function firstDefined(value, keys) {
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null) return value[key];
+  }
+  return undefined;
+}
+
 function describeTool(event, part) {
   const value = toolPayload(event, part);
   const type = part?.content_type || value.type || event.event_subtype || "tool";
-  const result = type.includes("result")
+  const resultItem = type.includes("result")
     || type.includes("output")
     || type.endsWith("_response");
   const callId = value.tool_use_id || value.call_id || value.id || event.external_id || "";
   const name = value.name || value.tool_name || value.server_name || "";
-  const body = result
-    ? value.content ?? value.output ?? value.result ?? part?.text ?? event.text
-    : value.input ?? value.arguments ?? value.action ?? value.query ?? part?.text;
+  const status = typeof value.status === "string" ? value.status.toLowerCase() : "";
+  const failure = ["failed", "cancelled", "canceled", "incomplete"].includes(status);
+  const error = Boolean(value.is_error || value.error || failure);
+  const terminal = resultItem || error || ["completed", "succeeded"].includes(status);
+  const embeddedOutput = resultItem
+    ? undefined
+    : firstDefined(value, ["output", "result", "results", "outputs", "tools"]);
+  const input = firstDefined(
+    value,
+    ["input", "arguments", "action", "query", "queries", "code", "revised_prompt"],
+  );
+  const body = resultItem
+    ? firstDefined(value, ["content", "output", "result", "results", "outputs", "tools"])
+      ?? part?.text
+      ?? event.text
+    : input ?? (embeddedOutput === undefined ? part?.text : undefined);
   return {
     body: prettyValue(body),
     callId,
-    error: Boolean(value.is_error || value.error),
-    kind: result ? "result" : "call",
+    embeddedOutput: prettyValue(embeddedOutput),
+    error,
+    hasEmbeddedOutput: embeddedOutput !== undefined,
+    kind: resultItem ? "result" : "call",
     name,
+    pending: ["in_progress", "queued", "running"].includes(status),
+    status,
+    terminal,
     type,
   };
 }
@@ -290,13 +315,23 @@ function eventRole(event) {
 function appendToolItem(items, pendingTools, event, part) {
   const tool = describeTool(event, part);
   if (tool.kind === "call") {
+    const embeddedResult = tool.hasEmbeddedOutput
+      ? { ...tool, body: tool.embeddedOutput, kind: "result", type: "embedded result" }
+      : null;
     const entry = {
       event,
       events: [event],
       part,
       role: "tool",
       text: tool.body,
-      tool: { call: tool, name: tool.name, result: null },
+      tool: {
+        call: tool,
+        complete: tool.terminal || (tool.hasEmbeddedOutput && !tool.pending),
+        error: tool.error,
+        name: tool.name,
+        result: embeddedResult,
+        status: tool.status,
+      },
     };
     items.push(entry);
     if (tool.callId) pendingTools.set(tool.callId, entry);
@@ -306,7 +341,10 @@ function appendToolItem(items, pendingTools, event, part) {
   const callEntry = tool.callId ? pendingTools.get(tool.callId) : null;
   if (callEntry) {
     callEntry.tool.result = tool;
+    callEntry.tool.complete = true;
+    callEntry.tool.error ||= tool.error;
     callEntry.tool.name ||= tool.name;
+    callEntry.tool.status = tool.status || callEntry.tool.status;
     if (!callEntry.events.includes(event)) callEntry.events.push(event);
     pendingTools.delete(tool.callId);
     return;
@@ -317,7 +355,14 @@ function appendToolItem(items, pendingTools, event, part) {
     part,
     role: "tool",
     text: tool.body,
-    tool: { call: null, name: tool.name, result: tool },
+    tool: {
+      call: null,
+      complete: true,
+      error: tool.error,
+      name: tool.name,
+      result: tool,
+      status: tool.status,
+    },
   });
 }
 
@@ -541,8 +586,10 @@ function renderToolActivity(entry) {
     } else {
       card.append(result);
     }
-  } else {
+  } else if (!entry.tool.complete) {
     card.append(node("div", "tool-pending", "Awaiting result"));
+  } else {
+    card.append(node("div", "tool-finished", "Completed without textual output"));
   }
   return card;
 }
@@ -570,7 +617,7 @@ function renderEvent(entry) {
   const event = entry.event;
   const role = entry.raw ? eventRole(event) : entry.role;
   const toolState = entry.tool
-    ? (entry.tool.result?.error ? "failed" : (entry.tool.result ? "complete" : "pending"))
+    ? (entry.tool.error ? "failed" : (entry.tool.complete ? "complete" : "pending"))
     : "";
   const toolClass = entry.tool ? ` tool-${toolState}` : "";
   const wrapper = node("section", `event ${role}${toolClass}`);
@@ -596,9 +643,10 @@ function renderEvent(entry) {
   heading.append(eventType);
   if (entry.tool) {
     const duration = toolDuration(entry);
+    const nativeStatus = entry.tool.status;
     const statusText = toolState === "failed"
-      ? "× failed"
-      : (toolState === "complete" ? `✓ ${duration || "done"}` : "… running");
+      ? `× ${nativeStatus || "failed"}`
+      : (toolState === "complete" ? `✓ ${duration || nativeStatus || "done"}` : "… running");
     heading.append(node("span", `tool-status ${toolState}`, statusText));
   }
   const toggle = node("button", "detail-toggle", entry.raw ? "hide" : "raw");

@@ -249,9 +249,12 @@ def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Pat
     assert "conversationItems" in script
     assert "appendToolItem" in script
     assert "renderMarkdown" in script
+    assert "hasEmbeddedOutput" in script
+    assert "Completed without textual output" in script
     assert "innerHTML" not in script
     assert "navigator.clipboard" in script
     assert "tool-output-disclosure" in styles
+    assert ".tool-finished" in styles
 
 
 def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None:

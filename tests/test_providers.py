@@ -250,3 +250,34 @@ def test_codex_tool_items_are_separate_display_events(subtype: str) -> None:
     assert event.event_subtype == subtype
     assert event.visibility == "display"
     assert event.parts[0].content_type == subtype
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "web_search_call",
+            "id": "web-1",
+            "status": "completed",
+            "action": {"type": "search", "query": "latest release"},
+        },
+        {
+            "type": "image_generation_call",
+            "id": "image-1",
+            "status": "completed",
+            "revised_prompt": "A terminal history browser",
+            "result": "base64-image-result",
+        },
+    ],
+)
+def test_codex_self_contained_tool_payloads_remain_structured(
+    payload: dict[str, Any],
+) -> None:
+    provider = get_provider("codex")
+    value = {"type": "response_item", "payload": payload}
+
+    event = provider.decode_event(0, json.dumps(value), value)
+
+    assert event.role == "tool"
+    assert event.visibility == "display"
+    assert json.loads(event.parts[0].raw_json)["status"] == "completed"
