@@ -134,6 +134,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
         missing = client.get("/api/conversations/999999")
         page = client.get("/")
         script = client.get("/assets/app.js")
+        styles = client.get("/assets/styles.css")
 
     assert response.status_code == 200
     detail = response.json()
@@ -148,6 +149,9 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert missing.status_code == 404
     assert "Expand details" in page.text
     assert "ctrlKey" in script.text
+    assert ".session-list" in styles.text
+    assert "overflow-y: auto" in styles.text
+    assert "min-height: 0" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
 
