@@ -112,7 +112,10 @@ def create_app(
     if not password:
         raise ValueError("Server password must not be empty.")
 
-    archive = Archive(database)
+    # Long-running schema migrations belong in the explicit CLI maintenance workflow. Starting
+    # the web process against an old archive should fail quickly with upgrade instructions instead
+    # of silently waiting for uploads or rewriting a large archive before Uvicorn can report ready.
+    archive = Archive(database, auto_upgrade=False)
 
     def require_auth(credentials: _BasicCredentials) -> str:
         valid_username = credentials is not None and secrets.compare_digest(

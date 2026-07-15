@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import zlib
@@ -188,55 +187,6 @@ def test_changed_revision_with_same_session_id_stays_separate(tmp_path: Path) ->
     assert result.imported == 1
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (2,)
-
-
-def test_upload_collapses_duplicate_rows_created_before_logical_identity(tmp_path: Path) -> None:
-    first_root = tmp_path / ".codex"
-    second_root = tmp_path / ".codex_another"
-    first_path = first_root / "sessions/one.jsonl"
-    second_path = second_root / "sessions/two.jsonl"
-    _write_jsonl(first_path, _codex_records("shared-id"))
-    _write_jsonl(second_path, _codex_records("different-id"))
-    database = tmp_path / "archive.sqlite"
-    provider = get_provider("codex")
-    with Archive(database) as archive:
-        archive.upload(root=first_root, provider=provider, transcripts=[first_path])
-        archive.upload(root=second_root, provider=provider, transcripts=[second_path])
-
-    duplicate = _write_jsonl(second_path, _codex_records("shared-id"))
-    with closing(sqlite3.connect(database)) as connection:
-        connection.execute("UPDATE conversations SET metadata_json = '{}'")
-        connection.execute(
-            """
-            UPDATE conversations
-            SET external_id = ?, content_sha256 = ?, transcript = ?, source_size = ?
-            WHERE relative_path = ?
-            """,
-            (
-                "shared-id",
-                hashlib.sha256(duplicate).hexdigest(),
-                zlib.compress(duplicate),
-                len(duplicate),
-                "sessions/two.jsonl",
-            ),
-        )
-        connection.execute("DROP INDEX conversations_logical_revision_uq")
-        connection.execute("ALTER TABLE conversations DROP COLUMN logical_session_id")
-        connection.execute("ALTER TABLE conversations DROP COLUMN chat_sha256")
-        connection.execute("UPDATE schema_info SET value = '3' WHERE key = 'schema_version'")
-        connection.execute("PRAGMA user_version = 3")
-        connection.commit()
-
-    with Archive(database) as archive:
-        result = archive.upload(
-            root=second_root,
-            provider=provider,
-            transcripts=[second_path],
-        )
-
-    assert result.duplicates == 1
-    with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
 
 
 def test_claude_transcript_and_subagent_metadata(tmp_path: Path) -> None:

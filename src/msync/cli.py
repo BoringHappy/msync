@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
-from msync.database import Archive, SearchResult, UploadResult
+from msync.database import Archive, SchemaUpgradeRequiredError, SearchResult, UploadResult
 from msync.providers import (
     HistoryFormatError,
     HistoryProvider,
@@ -85,7 +85,7 @@ def upload(
         transcripts = selected_provider.discover(root)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
-        with Archive(database, hostname=hostname) as archive:
+        with Archive(database, hostname=hostname, auto_upgrade=False) as archive:
             result = archive.upload(
                 root=root,
                 provider=selected_provider,
@@ -173,7 +173,7 @@ def sync(
         for root in roots:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        with Archive(database, hostname=hostname) as archive:
+        with Archive(database, hostname=hostname, auto_upgrade=False) as archive:
             uploads = []
             for root, selected_provider in zip(roots, selected_providers, strict=True):
                 transcripts = unmanaged_transcripts(
@@ -223,6 +223,67 @@ def sync(
 
 
 @app.command()
+def upgrade(
+    database: Annotated[
+        str,
+        typer.Option(
+            "--database",
+            "--db",
+            help="SQLite path or SQLAlchemy database URL.",
+            show_default=str(DEFAULT_DATABASE),
+        ),
+    ] = str(DEFAULT_DATABASE),
+    lock_timeout: Annotated[
+        int,
+        typer.Option(
+            "--lock-timeout",
+            min=1,
+            max=3600,
+            help="Seconds to wait for concurrent database transactions during an upgrade.",
+        ),
+    ] = 10,
+) -> None:
+    """Upgrade an archive schema during a maintenance window."""
+
+    steps: list[tuple[int, int]] = []
+
+    def report_upgrade(current_version: int, target_version: int) -> None:
+        steps.append((current_version, target_version))
+        detail = {
+            (5, 6): "rebuilding normalized events from retained transcripts",
+        }.get((current_version, target_version), "applying archive changes")
+        console.print(f"Upgrading database schema {current_version} → {target_version}: {detail}.")
+
+    def report_progress(completed: int, total: int) -> None:
+        if completed == 0 or completed == total or completed % 100 == 0:
+            console.print(f"Reindexing conversations: {completed}/{total}")
+
+    console.print("Checking database schema...")
+    try:
+        with Archive(
+            database,
+            schema_lock_timeout=lock_timeout,
+            upgrade_reporter=report_upgrade,
+            upgrade_progress_reporter=report_progress,
+        ) as archive:
+            database_display = archive.display_database
+            initialized = archive.initialized_new_database
+    except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
+        error_console.print(f"[bold red]Upgrade failed:[/bold red] {error}")
+        raise typer.Exit(code=1) from error
+
+    if initialized:
+        console.print(f"Database initialized at schema version {archive.schema_version}.")
+    elif steps:
+        console.print(
+            f"Database schema upgrade complete: {steps[0][0]} → {archive.schema_version}."
+        )
+    else:
+        console.print(f"Database schema is current at version {archive.schema_version}.")
+    console.print(f"Database: {database_display}")
+
+
+@app.command()
 def server(
     password: Annotated[
         str,
@@ -261,12 +322,26 @@ def server(
 ) -> None:
     """Start the authenticated web UI for browsing archived chat history."""
 
+    console.print("Checking database schema...")
     try:
         import uvicorn
 
         from msync.server import create_app
 
-        web_app = create_app(database, username=username, password=password)
+        try:
+            web_app = create_app(database, username=username, password=password)
+        except SchemaUpgradeRequiredError as error:
+            console.print(
+                f"Database schema version {error.current_version} must be upgraded to "
+                f"{error.target_version} before the server can start."
+            )
+            if not typer.confirm("Upgrade the database now?", default=False):
+                error_console.print("Server not started; the database was not upgraded.")
+                raise typer.Exit(code=1) from error
+            upgrade(database=database, lock_timeout=10)
+            web_app = create_app(database, username=username, password=password)
+    except typer.Exit:
+        raise
     except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
         error_console.print(f"[bold red]Server failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
@@ -306,7 +381,7 @@ def search(
         raise typer.Exit(code=1)
 
     try:
-        with Archive(database) as archive:
+        with Archive(database, auto_upgrade=False) as archive:
             results = archive.search(query)
     except (ImportError, OSError, RuntimeError, SQLAlchemyError) as error:
         error_console.print(f"[bold red]Search failed:[/bold red] {error}")
@@ -338,7 +413,7 @@ def sample(
     """Show a random sample of archived conversation messages."""
 
     try:
-        with Archive(database) as archive:
+        with Archive(database, auto_upgrade=False) as archive:
             results = archive.sample(limit)
     except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
         error_console.print(f"[bold red]Sample failed:[/bold red] {error}")
