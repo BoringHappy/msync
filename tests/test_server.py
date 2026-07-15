@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -289,6 +290,24 @@ def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None
     assert captured["port"] == 8765
     assert captured["app"].title == "msync history browser"
     assert "http://127.0.0.1:8765" in result.output
+
+
+def test_server_command_requires_explicit_schema_upgrade(tmp_path: Path) -> None:
+    database = tmp_path / "server.sqlite"
+    with Archive(database):
+        pass
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+
+    result = CliRunner().invoke(
+        app,
+        ["server", "--password", "secret", "--database", str(database)],
+    )
+
+    assert result.exit_code == 1
+    assert "must be upgraded to 6" in result.output
+    assert "msync upgrade --database <database>" in result.output
 
 
 def test_server_rejects_empty_credentials(tmp_path: Path) -> None:

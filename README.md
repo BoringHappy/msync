@@ -79,11 +79,26 @@ exist; `msync` creates and versions its tables automatically.
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
 unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
-triggers. Schema version 3 is migrated in place by backfilling logical revision identities and
-collapsing duplicates before the unique index is created. Version 4 archives are then migrated to
-hostname-aware location identities. A legacy location is recorded with hostname `unknown` until
-its source uploads again or uses an explicit `--hostname`. Partial, older, or otherwise
-incompatible schemas fail before any transcript is uploaded.
+triggers. Existing schemas are migrated by the explicit `msync upgrade` maintenance command.
+Schema version 3 is upgraded by backfilling logical revision identities and collapsing duplicates
+before the unique index is created. Version 4 archives are then migrated to hostname-aware
+location identities. A legacy location is recorded with hostname `unknown` until its source
+uploads again or uses an explicit `--hostname`. Partial, older, or otherwise incompatible schemas
+fail before any transcript is uploaded.
+
+For a shared or large archive, stop uploads and run the schema upgrade explicitly before starting
+the web server:
+
+```console
+$ msync upgrade --database 'postgresql://msync:secret@localhost/msync'
+```
+
+The command reports each migration step and reindexing progress, and waits at most 10 seconds for
+concurrent database transactions by default. Use `--lock-timeout SECONDS` to change that limit. If
+another upload still holds a lock, the upgrade exits with recovery instructions instead of
+appearing to hang. Regular commands never perform a long migration during startup; they direct the
+operator to `msync upgrade` when the archive is behind. Upgrade every machine using a shared
+archive before resuming uploads.
 
 Uploads are idempotent. Each file is addressed by its source location and relative path, then
 compared by SHA-256. New files are inserted, changed files replace their normalized event records,
@@ -184,6 +199,9 @@ messages render common Markdown and fenced code blocks without accepting embedde
 **Activity**, **Chat**, **Tools**, and **Reasoning** filters (or keys 1–4), navigate messages with
 J/K and sessions with `[`/`]`, and select **Raw events** (or press Ctrl+O) to inspect every native
 record and its source JSON.
+
+If startup reports an old schema, stop other msync processes, run `msync upgrade` against the same
+database, and start the server again.
 
 Choose a different archive, login, address, or port with command options:
 

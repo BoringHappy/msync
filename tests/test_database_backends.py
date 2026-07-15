@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy.dialects import mysql, postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
-from msync.database import Archive, _normalize_database
+from msync.database import Archive, SchemaUpgradeRequiredError, _normalize_database
 from msync.providers import get_provider
 from msync.tables import Base
 
@@ -130,7 +130,8 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
         connection.execute("PRAGMA user_version = 5")
         connection.commit()
 
-    with Archive(database) as archive:
+    upgrade_steps: list[tuple[int, int]] = []
+    with Archive(database, upgrade_reporter=lambda *step: upgrade_steps.append(step)) as archive:
         summary = archive.browse_conversations()[0]
         detail = archive.browse_conversation(summary.id)
         stored = archive.conversations()[0].conversation.transcript
@@ -143,11 +144,29 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
     assert detail.events[1].event_subtype == "tool_result"
     assert [match.role for match in matches] == ["tool"]
     assert stored == source
+    assert upgrade_steps == [(5, 6)]
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (6,)
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
         ).fetchone() == ("6",)
+
+
+def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    with Archive(database):
+        pass
+
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+
+    with pytest.raises(SchemaUpgradeRequiredError, match="msync upgrade") as captured:
+        Archive(database, auto_upgrade=False)
+
+    assert captured.value.current_version == 5
+    assert captured.value.target_version == 6
 
 
 def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:

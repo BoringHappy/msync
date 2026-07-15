@@ -8,6 +8,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from msync.cli import app
+from msync.database import Archive
 
 
 def test_upload_command(tmp_path: Path) -> None:
@@ -117,6 +118,79 @@ def test_upload_accepts_explicit_claude_provider(tmp_path: Path) -> None:
     assert "claude" in result.output
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("SELECT provider FROM locations").fetchone() == ("claude",)
+
+
+def test_upgrade_command_migrates_archive_and_reports_steps(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    with Archive(database):
+        pass
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        ["upgrade", "--database", str(database), "--lock-timeout", "1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Upgrading database schema 5 → 6" in result.output
+    assert "Database schema upgrade complete: 5 → 6" in result.output
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_info WHERE key = 'schema_version'"
+        ).fetchone() == ("6",)
+
+
+def test_upgrade_command_reports_current_schema(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    with Archive(database):
+        pass
+
+    result = CliRunner().invoke(app, ["upgrade", "--database", str(database)])
+
+    assert result.exit_code == 0, result.output
+    assert "Database schema is current at version 6" in result.output
+
+
+def test_upgrade_command_reports_concurrent_transaction(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    with Archive(database):
+        pass
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+
+    with closing(sqlite3.connect(database)) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        result = CliRunner().invoke(
+            app,
+            ["upgrade", "--database", str(database), "--lock-timeout", "1"],
+        )
+        blocker.rollback()
+
+    assert result.exit_code == 1
+    assert "blocked by another" in result.output
+    assert "transaction." in result.output
+    assert "Stop or finish other msync uploads" in result.output
+
+
+def test_regular_command_requires_explicit_schema_upgrade(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    with Archive(database):
+        pass
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+
+    result = CliRunner().invoke(app, ["sample", "1", "--database", str(database)])
+
+    assert result.exit_code == 1
+    assert "must be upgraded to 6" in result.output
+    assert "msync upgrade --database <database>" in result.output
 
 
 def test_search_command_finds_text_with_like_query(tmp_path: Path) -> None:
