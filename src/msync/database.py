@@ -10,7 +10,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
-from sqlalchemy import URL, create_engine, delete, event, func, inspect, select, update
+from sqlalchemy import URL, case, create_engine, delete, event, func, inspect, or_, select, update
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -92,6 +92,77 @@ class ArchivedConversation:
     source_root: str
     source_mtime_ns: int
     conversation: Conversation
+
+
+@dataclass(slots=True, frozen=True)
+class ArchiveLocation:
+    """A source location available to the history browser."""
+
+    id: int
+    provider: str
+    root_path: str
+    display_name: str
+    last_scanned_at: datetime | None
+    conversation_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class ConversationSummary:
+    """Compact conversation metadata used by the history browser list."""
+
+    id: int
+    location_id: int
+    provider: str
+    external_id: str
+    title: str | None
+    conversation_kind: str
+    cwd: str | None
+    model: str | None
+    git_branch: str | None
+    started_at: str | None
+    ended_at: str | None
+    event_count: int
+    message_count: int
+    preview: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class ArchivedMessagePart:
+    """One structured content block displayed in expanded event details."""
+
+    sequence: int
+    content_type: str
+    text: str | None
+    raw_json: str
+
+
+@dataclass(slots=True, frozen=True)
+class ArchivedEvent:
+    """One normalized event plus its lossless source representation."""
+
+    sequence: int
+    external_id: str | None
+    parent_external_id: str | None
+    event_type: str
+    event_subtype: str | None
+    role: str | None
+    visibility: str
+    occurred_at: str | None
+    text: str
+    raw_json: str
+    parse_error: str | None
+    parts: tuple[ArchivedMessagePart, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ConversationDetail:
+    """A complete browser view of an archived conversation."""
+
+    summary: ConversationSummary
+    relative_path: str
+    parent_external_id: str | None
+    metadata: dict[str, Any]
+    events: tuple[ArchivedEvent, ...]
 
 
 class Archive:
@@ -208,6 +279,231 @@ class Archive:
         )
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
+
+    def browse_locations(self) -> list[ArchiveLocation]:
+        """Return source locations and their conversation counts for the web UI."""
+
+        statement = (
+            select(
+                LocationRow.id,
+                LocationRow.provider,
+                LocationRow.root_path,
+                LocationRow.display_name,
+                LocationRow.last_scanned_at,
+                func.count(ConversationRow.id),
+            )
+            .outerjoin(ConversationRow, ConversationRow.location_id == LocationRow.id)
+            .group_by(
+                LocationRow.id,
+                LocationRow.provider,
+                LocationRow.root_path,
+                LocationRow.display_name,
+                LocationRow.last_scanned_at,
+            )
+            .order_by(LocationRow.display_name, LocationRow.id)
+        )
+        with Session(self.engine) as session:
+            return [ArchiveLocation(*row) for row in session.execute(statement)]
+
+    def browse_conversations(
+        self,
+        *,
+        location_id: int | None = None,
+        search_text: str = "",
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[ConversationSummary]:
+        """Return recent conversations, optionally filtered by location and text."""
+
+        if limit < 1 or limit > 500:
+            raise ValueError("Conversation limit must be between 1 and 500.")
+        if offset < 0:
+            raise ValueError("Conversation offset must not be negative.")
+
+        event_stats = (
+            select(
+                EventRow.conversation_id.label("conversation_id"),
+                func.count(EventRow.id).label("event_count"),
+                func.sum(
+                    case(
+                        (
+                            EventRow.role.in_(("user", "assistant"))
+                            & (EventRow.searchable_text != ""),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("message_count"),
+            )
+            .group_by(EventRow.conversation_id)
+            .subquery()
+        )
+        preview = (
+            select(EventRow.searchable_text)
+            .where(
+                EventRow.conversation_id == ConversationRow.id,
+                EventRow.role == "user",
+                EventRow.searchable_text != "",
+            )
+            .order_by(EventRow.sequence)
+            .limit(1)
+            .correlate(ConversationRow)
+            .scalar_subquery()
+        )
+        statement = (
+            select(
+                ConversationRow.id,
+                ConversationRow.location_id,
+                LocationRow.provider,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.conversation_kind,
+                ConversationRow.cwd,
+                ConversationRow.model,
+                ConversationRow.git_branch,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+                func.coalesce(event_stats.c.event_count, 0),
+                func.coalesce(event_stats.c.message_count, 0),
+                preview,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .outerjoin(event_stats, event_stats.c.conversation_id == ConversationRow.id)
+        )
+        if location_id is not None:
+            statement = statement.where(ConversationRow.location_id == location_id)
+        if query := search_text.strip():
+            pattern = f"%{query}%"
+            matching_event = (
+                select(EventRow.id)
+                .where(
+                    EventRow.conversation_id == ConversationRow.id,
+                    EventRow.searchable_text.ilike(pattern),
+                )
+                .exists()
+            )
+            statement = statement.where(
+                or_(
+                    ConversationRow.title.ilike(pattern),
+                    ConversationRow.external_id.ilike(pattern),
+                    ConversationRow.cwd.ilike(pattern),
+                    matching_event,
+                )
+            )
+        statement = (
+            statement.order_by(
+                func.coalesce(ConversationRow.ended_at, ConversationRow.started_at).desc(),
+                ConversationRow.id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+        with Session(self.engine) as session:
+            return [ConversationSummary(*row) for row in session.execute(statement)]
+
+    def browse_conversation(self, conversation_id: int) -> ConversationDetail | None:
+        """Return a conversation and every event needed for normal and expanded views."""
+
+        statement = (
+            select(
+                ConversationRow.id,
+                ConversationRow.location_id,
+                LocationRow.provider,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.conversation_kind,
+                ConversationRow.cwd,
+                ConversationRow.model,
+                ConversationRow.git_branch,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+                ConversationRow.relative_path,
+                ConversationRow.parent_external_id,
+                ConversationRow.metadata_json,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .where(ConversationRow.id == conversation_id)
+        )
+        with Session(self.engine) as session:
+            row = session.execute(statement).one_or_none()
+            if row is None:
+                return None
+
+            event_rows = list(
+                session.execute(
+                    select(EventRow)
+                    .where(EventRow.conversation_id == conversation_id)
+                    .order_by(EventRow.sequence)
+                ).scalars()
+            )
+            part_rows = (
+                list(
+                    session.execute(
+                        select(MessagePartRow)
+                        .where(MessagePartRow.event_id.in_([event.id for event in event_rows]))
+                        .order_by(MessagePartRow.event_id, MessagePartRow.sequence)
+                    ).scalars()
+                )
+                if event_rows
+                else []
+            )
+
+        parts_by_event: dict[int, list[ArchivedMessagePart]] = {}
+        for part in part_rows:
+            parts_by_event.setdefault(part.event_id, []).append(
+                ArchivedMessagePart(
+                    sequence=part.sequence,
+                    content_type=part.content_type,
+                    text=part.text,
+                    raw_json=part.raw_json,
+                )
+            )
+        events = tuple(
+            ArchivedEvent(
+                sequence=event.sequence,
+                external_id=event.external_id,
+                parent_external_id=event.parent_external_id,
+                event_type=event.event_type,
+                event_subtype=event.event_subtype,
+                role=event.role,
+                visibility=event.visibility,
+                occurred_at=event.occurred_at,
+                text=event.searchable_text,
+                raw_json=event.raw_json,
+                parse_error=event.parse_error,
+                parts=tuple(parts_by_event.get(event.id, [])),
+            )
+            for event in event_rows
+        )
+        event_count = len(events)
+        message_count = sum(
+            event.role in {"user", "assistant"} and bool(event.text) for event in events
+        )
+        summary = ConversationSummary(
+            id=row.id,
+            location_id=row.location_id,
+            provider=row.provider,
+            external_id=row.external_id,
+            title=row.title,
+            conversation_kind=row.conversation_kind,
+            cwd=row.cwd,
+            model=row.model,
+            git_branch=row.git_branch,
+            started_at=row.started_at,
+            ended_at=row.ended_at,
+            event_count=event_count,
+            message_count=message_count,
+            preview=next(
+                (event.text for event in events if event.role == "user" and event.text), None
+            ),
+        )
+        return ConversationDetail(
+            summary=summary,
+            relative_path=row.relative_path,
+            parent_external_id=row.parent_external_id,
+            metadata=row.metadata_json,
+            events=events,
+        )
 
     def conversations(self) -> list[ArchivedConversation]:
         """Reconstruct every stored conversation from its lossless transcript blob."""

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>msync // history</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <div class="scanline" aria-hidden="true"></div>
+    <header class="topbar">
+      <button class="icon-button mobile-only" id="sessions-button" type="button" aria-label="Open sessions">☰</button>
+      <a class="brand" href="/" aria-label="msync history home">
+        <span class="brand-mark">◇</span>
+        <span>msync</span><span class="brand-dim">// history</span>
+      </a>
+      <div class="top-status"><span class="status-light"></span> archive online</div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar" id="sidebar" aria-label="Conversation navigation">
+        <div class="sidebar-heading">
+          <span>SESSIONS</span>
+          <span id="session-count" class="count">—</span>
+        </div>
+        <label class="field-label" for="location-select">HISTORY LOCATION</label>
+        <div class="select-wrap">
+          <select id="location-select" aria-label="History location">
+            <option value="">All locations</option>
+          </select>
+        </div>
+        <label class="search-box" for="search-input">
+          <span>/</span>
+          <input id="search-input" type="search" placeholder="search sessions" autocomplete="off">
+        </label>
+        <div class="session-list" id="session-list" aria-live="polite"></div>
+        <div class="sidebar-foot"><kbd>/</kbd> search <span>·</span> newest first</div>
+      </aside>
+
+      <main class="content" id="content">
+        <section class="empty-state" id="empty-state">
+          <div class="empty-glyph">◇</div>
+          <h1>Conversation archive</h1>
+          <p>Select a session to browse Claude and Codex history.</p>
+          <p class="empty-hint">Use the location picker to switch between imported history directories.</p>
+        </section>
+
+        <article class="conversation hidden" id="conversation">
+          <header class="conversation-header">
+            <div class="prompt-line"><span class="prompt">›</span> <span id="conversation-provider">archive</span> / session</div>
+            <div class="conversation-title-row">
+              <div>
+                <h1 id="conversation-title">Untitled conversation</h1>
+                <p id="conversation-subtitle"></p>
+              </div>
+              <button class="terminal-button" id="toggle-details" type="button" aria-pressed="false">
+                <span class="button-key">Ctrl O</span>
+                <span id="detail-button-label">Expand details</span>
+              </button>
+            </div>
+            <dl class="metadata-strip" id="metadata-strip"></dl>
+          </header>
+          <div class="transcript" id="transcript" aria-live="polite"></div>
+        </article>
+      </main>
+    </div>
+
+    <footer class="command-bar">
+      <button id="footer-sessions" type="button"><span>☰</span> Sessions</button>
+      <button id="footer-details" type="button"><span>⊕</span> Expand detail</button>
+      <button id="scroll-top" type="button"><span>↑</span> Top</button>
+      <span class="command-spacer"></span>
+      <span id="footer-status">Ready</span>
+    </footer>
+    <div class="toast hidden" id="toast" role="status"></div>
+  </body>
+</html>

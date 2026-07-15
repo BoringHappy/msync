@@ -15,10 +15,12 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
+    "fastapi>=0.116",
     "pydantic>=2.11",
     "rich>=13.9",
     "sqlalchemy>=2.0.41",
     "typer>=0.16",
+    "uvicorn>=0.35",
 ]
 
 [project.scripts]
@@ -38,6 +40,7 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "ruff>=0.11",

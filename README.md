@@ -160,6 +160,31 @@ $ msync sample 5
 $ msync sample 5 --database ./history.sqlite
 ```
 
+## Browse history on the web
+
+Start the authenticated FastAPI history browser against the default archive:
+
+```console
+$ MSYNC_SERVER_PASSWORD='choose-a-strong-password' msync server
+```
+
+Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a terminal-inspired
+Claude/Codex layout with a location picker, session search, chronological message rendering, and
+lossless event inspection. Select **Expand details** (or press Ctrl+O) to include metadata/model
+events and raw source JSON; each visible message also has its own **details** button.
+
+Choose a different archive, login, address, or port with command options:
+
+```console
+$ MSYNC_SERVER_PASSWORD='secret' msync server \
+    --database ./history.sqlite --username reader --host 127.0.0.1 --port 8765
+```
+
+`MSYNC_SERVER_USERNAME` can also set the username. If the password environment variable is absent,
+the command prompts without echoing the password. The default loopback address keeps the browser
+local. HTTP Basic credentials are not encrypted in transit, so put msync behind an HTTPS reverse
+proxy before binding it to a network-accessible address.
+
 ## Storage model
 
 The database is deliberately split into distinct storage and indexing layers:
