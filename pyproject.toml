@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "fastapi>=0.116",
     "pydantic>=2.11",
+    "psycopg[binary]>=3.2",
     "rich>=13.9",
     "sqlalchemy>=2.0.41",
     "typer>=0.16",
@@ -27,9 +28,6 @@ dependencies = [
 msync = "msync:main"
 
 [project.optional-dependencies]
-postgres = [
-    "psycopg[binary]>=3.2",
-]
 mysql = [
     "pymysql>=1.1",
 ]

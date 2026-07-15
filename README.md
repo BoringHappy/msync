@@ -26,10 +26,9 @@ To make the command available outside the checkout:
 $ uv tool install .
 ```
 
-SQLite support is included. Install the matching driver extra for a server database:
+SQLite and PostgreSQL support are included. Install the driver extra to use MySQL:
 
 ```console
-$ uv tool install '.[postgres]'
 $ uv tool install '.[mysql]'
 ```
 
@@ -58,7 +57,7 @@ $ msync upload --dir /mnt/history --provider codex --database ./history.sqlite
 ```
 
 `--database` also accepts a SQLAlchemy URL. Common PostgreSQL and MySQL URLs automatically select
-the bundled optional Psycopg and PyMySQL drivers:
+Psycopg (included by default) and the optional PyMySQL driver:
 
 ```console
 $ msync upload --dir ~/.codex --database 'postgresql://msync:secret@localhost/msync'

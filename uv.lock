@@ -238,6 +238,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
     { name = "rich" },
     { name = "sqlalchemy" },
@@ -248,9 +249,6 @@ dependencies = [
 [package.optional-dependencies]
 mysql = [
     { name = "pymysql" },
-]
-postgres = [
-    { name = "psycopg", extra = ["binary"] },
 ]
 
 [package.dev-dependencies]
@@ -264,7 +262,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.116" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.11" },
     { name = "pymysql", marker = "extra == 'mysql'", specifier = ">=1.1" },
     { name = "rich", specifier = ">=13.9" },
@@ -272,7 +270,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.16" },
     { name = "uvicorn", specifier = ">=0.35" },
 ]
-provides-extras = ["postgres", "mysql"]
+provides-extras = ["mysql"]
 
 [package.metadata.requires-dev]
 dev = [
