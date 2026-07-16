@@ -161,9 +161,12 @@ class HistoryProvider(ABC):
         for sequence, raw_line in enumerate(transcript.splitlines()):
             if not raw_line.strip():
                 continue
-            raw_json = raw_line.decode("utf-8", errors="replace")
+            # PostgreSQL rejects NUL characters in every text type. Preserve the
+            # source bytes on the conversation, but escape literal NULs in the
+            # retained JSON and replace decoded NUL values in normalized fields.
+            raw_json = raw_line.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
             try:
-                value = json.loads(raw_json)
+                value = _replace_nul_characters(json.loads(raw_json))
                 if not isinstance(value, dict):
                     raise ValueError("JSON record is not an object")
             except (json.JSONDecodeError, ValueError) as error:
@@ -244,10 +247,25 @@ def event_object(event: Event) -> dict[str, Any] | None:
     """Decode a retained event when extracting conversation-level metadata."""
 
     try:
-        value = json.loads(event.raw_json)
+        value = _replace_nul_characters(json.loads(event.raw_json))
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _replace_nul_characters(value: Any) -> Any:
+    """Make decoded JSON strings safe for portable database text columns."""
+
+    if isinstance(value, str):
+        return value.replace("\x00", "\ufffd")
+    if isinstance(value, list):
+        return [_replace_nul_characters(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _replace_nul_characters(key): _replace_nul_characters(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def first_user_title(events: tuple[Event, ...]) -> str | None:

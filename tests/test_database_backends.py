@@ -139,6 +139,48 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
         ).fetchone() == ("6",)
 
 
+def test_v5_archive_replaces_nul_characters_in_database_text(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    root = (tmp_path / ".claude").resolve()
+    transcript = root / "projects" / "-work" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    source = (
+        b'{"type":"user","uuid":"user-1","sessionId":"session-1",'
+        b'"message":{"role":"user","content":"escaped\\u0000nul"}}\n'
+        b'{"type":"assistant","uuid":"assistant-1","sessionId":"session-1",'
+        b'"message":{"role":"assistant","content":"literal\x00nul"}}\n'
+    )
+    transcript.write_bytes(source)
+    with Archive(database) as archive:
+        archive.upload(
+            root=root,
+            provider=get_provider("claude"),
+            transcripts=[transcript],
+        )
+
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+
+    with Archive(database) as archive:
+        stored = archive.conversations()[0].conversation.transcript
+
+    with closing(sqlite3.connect(database)) as connection:
+        event_text = connection.execute(
+            """SELECT external_id, searchable_text, raw_json, parse_error
+               FROM events ORDER BY sequence"""
+        ).fetchall()
+        part_text = connection.execute(
+            "SELECT text, raw_json FROM message_parts ORDER BY event_id, sequence"
+        ).fetchall()
+
+    assert stored == source
+    assert [row[1] for row in event_text] == ["escaped\ufffdnul", "literal\ufffdnul"]
+    assert all("\x00" not in value for row in event_text for value in row if value is not None)
+    assert all("\x00" not in value for row in part_text for value in row if value is not None)
+
+
 def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None:
     database = tmp_path / "archive.sqlite"
     with Archive(database):
