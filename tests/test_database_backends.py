@@ -93,7 +93,7 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
                     {
                         "type": "tool_result",
                         "tool_use_id": "tool-1",
-                        "content": "command output",
+                        "content": "command\x00output",
                     }
                 ],
             },
@@ -122,13 +122,14 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
         summary = archive.browse_conversations()[0]
         detail = archive.browse_conversation(summary.id)
         stored = archive.conversations()[0].conversation.transcript
-        matches = archive.search("command output")
+        matches = archive.search("command")
 
     assert detail is not None
     assert summary.title == "Inspect the log"
     assert summary.message_count == 1
     assert [event.role for event in detail.events] == ["user", "tool"]
     assert detail.events[1].event_subtype == "tool_result"
+    assert detail.events[1].text == "command\N{REPLACEMENT CHARACTER}output"
     assert [match.role for match in matches] == ["tool"]
     assert stored == source
     assert upgrade_steps == [(5, 6)]

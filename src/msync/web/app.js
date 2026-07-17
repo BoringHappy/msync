@@ -1,23 +1,37 @@
 "use strict";
 
+const SESSION_PAGE_SIZE = 50;
+
 const state = {
   locations: [],
   conversations: [],
   activeConversation: null,
   detailsExpanded: false,
+  hasMoreConversations: false,
+  listRequest: 0,
+  conversationRequest: 0,
   searchTimer: null,
   transcriptFilter: "all",
+  transcriptQuery: "",
 };
 
 const elements = {
   content: document.querySelector("#content"),
   conversation: document.querySelector("#conversation"),
+  copyLink: document.querySelector("#copy-link"),
+  clearSearch: document.querySelector("#clear-search"),
+  clearTranscriptSearch: document.querySelector("#clear-transcript-search"),
   empty: document.querySelector("#empty-state"),
+  archiveStatus: document.querySelector("#archive-status"),
   location: document.querySelector("#location-select"),
+  loadMore: document.querySelector("#load-more"),
+  reload: document.querySelector("#reload-button"),
   search: document.querySelector("#search-input"),
   sessionList: document.querySelector("#session-list"),
   sessionCount: document.querySelector("#session-count"),
+  sessionsButton: document.querySelector("#sessions-button"),
   sidebar: document.querySelector("#sidebar"),
+  sidebarScrim: document.querySelector("#sidebar-scrim"),
   title: document.querySelector("#conversation-title"),
   subtitle: document.querySelector("#conversation-subtitle"),
   provider: document.querySelector("#conversation-provider"),
@@ -27,6 +41,8 @@ const elements = {
   detailLabel: document.querySelector("#detail-button-label"),
   footerStatus: document.querySelector("#footer-status"),
   filterButtons: [...document.querySelectorAll("[data-transcript-filter]")],
+  transcriptSearch: document.querySelector("#transcript-search"),
+  transcriptMatchCount: document.querySelector("#transcript-match-count"),
   toast: document.querySelector("#toast"),
 };
 
@@ -91,7 +107,10 @@ function showToast(message) {
 async function loadLocations() {
   state.locations = await request("/api/locations");
   const params = new URLSearchParams(window.location.search);
-  const requested = params.get("location") || "";
+  const requested = elements.location.value || params.get("location") || "";
+  const allLocations = node("option", "", "All locations");
+  allLocations.value = "";
+  elements.location.replaceChildren(allLocations);
   for (const location of state.locations) {
     const option = node("option", "", `${location.display_name} · ${location.hostname} · ${location.provider} (${location.conversation_count})`);
     option.value = String(location.id);
@@ -101,20 +120,72 @@ async function loadLocations() {
   if ([...elements.location.options].some((option) => option.value === requested)) {
     elements.location.value = requested;
   }
-  elements.search.value = params.get("q") || "";
+  if (!elements.search.dataset.hydrated) {
+    elements.search.value = params.get("q") || "";
+    elements.search.dataset.hydrated = "true";
+  }
+  elements.clearSearch.classList.toggle("hidden", !elements.search.value);
+  const locationCount = state.locations.length;
+  const conversationCount = state.locations.reduce(
+    (total, location) => total + location.conversation_count,
+    0,
+  );
+  elements.archiveStatus.replaceChildren(
+    node("span", "status-light"),
+    document.createTextNode(
+      `${conversationCount.toLocaleString()} sessions · ${locationCount} ${locationCount === 1 ? "location" : "locations"}`,
+    ),
+  );
 }
 
-async function loadConversations({ keepSelection = false } = {}) {
-  elements.sessionList.replaceChildren(node("div", "loading", "Loading sessions…"));
-  const params = new URLSearchParams({ limit: "200" });
+async function loadConversations({ append = false, keepSelection = false } = {}) {
+  const requestId = ++state.listRequest;
+  if (!append) {
+    state.conversationRequest += 1;
+    elements.sessionList.replaceChildren(node("div", "loading", "Loading sessions…"));
+  }
+  elements.sessionList.setAttribute("aria-busy", "true");
+  elements.loadMore.disabled = true;
+  const offset = append ? state.conversations.length : 0;
+  const params = new URLSearchParams({
+    limit: String(SESSION_PAGE_SIZE + 1),
+    offset: String(offset),
+  });
   if (elements.location.value) params.set("location", elements.location.value);
   if (elements.search.value.trim()) params.set("search", elements.search.value.trim());
-  state.conversations = await request(`/api/conversations?${params}`);
-  elements.sessionCount.textContent = String(state.conversations.length);
+  let response;
+  try {
+    response = await request(`/api/conversations?${params}`);
+  } catch (error) {
+    if (requestId !== state.listRequest) return;
+    elements.sessionList.setAttribute("aria-busy", "false");
+    elements.loadMore.disabled = false;
+    throw error;
+  }
+  if (requestId !== state.listRequest) return;
+
+  state.hasMoreConversations = response.length > SESSION_PAGE_SIZE;
+  const page = response.slice(0, SESSION_PAGE_SIZE);
+  state.conversations = append ? [...state.conversations, ...page] : page;
+  elements.sessionList.setAttribute("aria-busy", "false");
+  elements.sessionCount.textContent = `${state.conversations.length}${state.hasMoreConversations ? "+" : ""}`;
+  elements.sessionCount.title = state.hasMoreConversations
+    ? `${state.conversations.length} sessions loaded; more are available`
+    : `${state.conversations.length} sessions`;
+  elements.loadMore.classList.toggle("hidden", !state.hasMoreConversations);
+  elements.loadMore.disabled = false;
   renderConversationList();
 
+  if (append) {
+    elements.footerStatus.textContent = `${state.conversations.length} sessions loaded`;
+    return;
+  }
   const requestedId = keepSelection ? state.activeConversation?.summary.id : selectedConversationId();
   const available = state.conversations.some((item) => item.id === requestedId);
+  if (requestedId && !available && !keepSelection) {
+    await openConversation(requestedId);
+    if (state.activeConversation?.summary.id === requestedId) return;
+  }
   const nextId = available ? requestedId : state.conversations[0]?.id;
   if (nextId) {
     await openConversation(nextId);
@@ -141,6 +212,9 @@ function renderConversationList() {
     const card = node("button", "session-card");
     card.type = "button";
     card.dataset.id = String(conversation.id);
+    const active = conversation.id === state.activeConversation?.summary.id;
+    card.classList.toggle("active", active);
+    if (active) card.setAttribute("aria-current", "true");
     card.addEventListener("click", () => openConversation(conversation.id));
 
     const top = node("div", "session-card-top");
@@ -161,19 +235,31 @@ function renderConversationList() {
 
 async function openConversation(id) {
   if (!id) return;
+  const requestId = ++state.conversationRequest;
   elements.footerStatus.textContent = "Loading transcript…";
+  elements.conversation.setAttribute("aria-busy", "true");
   try {
-    state.activeConversation = await request(`/api/conversations/${id}`);
+    const detail = await request(`/api/conversations/${id}`);
+    if (requestId !== state.conversationRequest) return;
+    state.activeConversation = detail;
     state.detailsExpanded = false;
+    state.transcriptQuery = "";
+    elements.transcriptSearch.value = "";
+    elements.clearTranscriptSearch.classList.add("hidden");
     renderConversation();
     updateUrl(id);
     document.querySelectorAll(".session-card").forEach((card) => {
-      card.classList.toggle("active", Number(card.dataset.id) === id);
+      const active = Number(card.dataset.id) === id;
+      card.classList.toggle("active", active);
+      card.toggleAttribute("aria-current", active);
     });
-    elements.sidebar.classList.remove("open");
+    setSidebar(false);
+    elements.conversation.setAttribute("aria-busy", "false");
   } catch (error) {
+    if (requestId !== state.conversationRequest) return;
     showToast(`Could not load session: ${error.message}`);
     elements.footerStatus.textContent = "Load failed";
+    elements.conversation.setAttribute("aria-busy", "false");
   }
 }
 
@@ -409,16 +495,38 @@ function conversationItems() {
   return items;
 }
 
-function filteredConversationItems() {
-  const items = conversationItems();
-  if (state.transcriptFilter === "chat") {
+function itemsForFilter(items, filter) {
+  if (filter === "chat") {
     return items.filter((item) => ["user", "assistant", "system"].includes(item.role));
   }
-  if (state.transcriptFilter === "tools") return items.filter((item) => item.role === "tool");
-  if (state.transcriptFilter === "reasoning") {
+  if (filter === "tools") return items.filter((item) => item.role === "tool");
+  if (filter === "reasoning") {
     return items.filter((item) => item.role === "reasoning");
   }
   return items.filter((item) => item.role !== "reasoning");
+}
+
+function itemSearchText(entry) {
+  const event = entry.event;
+  const values = [
+    entry.text,
+    entry.role,
+    entry.tool?.name,
+    entry.tool?.call?.body,
+    entry.tool?.call?.type,
+    entry.tool?.result?.body,
+    entry.tool?.result?.type,
+    event?.text,
+    event?.event_type,
+    event?.event_subtype,
+  ];
+  if (entry.raw) values.push(event?.raw_json);
+  return values.filter(Boolean).join("\n").toLocaleLowerCase();
+}
+
+function matchesTranscriptQuery(entry) {
+  const query = state.transcriptQuery.trim().toLocaleLowerCase();
+  return !query || itemSearchText(entry).includes(query);
 }
 
 function eventMarker(role) {
@@ -597,20 +705,38 @@ function renderToolActivity(entry) {
 function renderEvents() {
   elements.transcript.replaceChildren();
   elements.transcript.classList.toggle("raw-mode", state.detailsExpanded);
+  const conversationEntries = conversationItems();
   for (const button of elements.filterButtons) {
-    button.setAttribute("aria-pressed", String(button.dataset.transcriptFilter === state.transcriptFilter));
+    const filter = button.dataset.transcriptFilter;
+    button.setAttribute("aria-pressed", String(filter === state.transcriptFilter));
     button.disabled = state.detailsExpanded;
+    const count = itemsForFilter(conversationEntries, filter).length;
+    button.querySelector(".filter-count").textContent = String(count);
+    button.setAttribute("aria-label", `${button.firstElementChild.textContent}: ${count} events`);
   }
-  const entries = state.detailsExpanded
+  const visibleEntries = state.detailsExpanded
     ? state.activeConversation.events.map((event) => ({ event, events: [event], raw: true }))
-    : filteredConversationItems();
+    : itemsForFilter(conversationEntries, state.transcriptFilter);
+  const entries = visibleEntries.filter(matchesTranscriptQuery);
+  const hasQuery = Boolean(state.transcriptQuery.trim());
+  elements.clearTranscriptSearch.classList.toggle("hidden", !hasQuery);
+  elements.transcriptMatchCount.textContent = hasQuery ? String(entries.length) : "";
+  elements.transcriptSearch.setAttribute(
+    "aria-label",
+    hasQuery ? `Find in transcript; ${entries.length} matches` : "Find in transcript",
+  );
   if (!entries.length) {
-    elements.transcript.append(node("div", "no-results", "No events match this view."));
+    elements.transcript.append(node(
+      "div",
+      "no-results transcript-empty",
+      hasQuery ? `No events contain “${state.transcriptQuery.trim()}”.` : "No events match this view.",
+    ));
     elements.footerStatus.textContent = `0 visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}`;
     return;
   }
   for (const entry of entries) elements.transcript.append(renderEvent(entry));
-  elements.footerStatus.textContent = `${entries.length} visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}`;
+  const matchStatus = hasQuery ? ` · ${entries.length}/${visibleEntries.length} matches` : "";
+  elements.footerStatus.textContent = `${entries.length} visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}${matchStatus}`;
 }
 
 function renderEvent(entry) {
@@ -620,7 +746,8 @@ function renderEvent(entry) {
     ? (entry.tool.error ? "failed" : (entry.tool.complete ? "complete" : "pending"))
     : "";
   const toolClass = entry.tool ? ` tool-${toolState}` : "";
-  const wrapper = node("section", `event ${role}${toolClass}`);
+  const searchClass = state.transcriptQuery.trim() ? " search-match" : "";
+  const wrapper = node("section", `event ${role}${toolClass}${searchClass}`);
   wrapper.tabIndex = -1;
   wrapper.append(node("span", "event-marker", eventMarker(role)));
 
@@ -731,8 +858,15 @@ function toggleAllDetails() {
   renderEvents();
 }
 
+function setSidebar(open) {
+  elements.sidebar.classList.toggle("open", open);
+  elements.sidebarScrim.classList.toggle("hidden", !open);
+  elements.sessionsButton.setAttribute("aria-expanded", String(open));
+  elements.sessionsButton.setAttribute("aria-label", open ? "Close sessions" : "Open sessions");
+}
+
 function toggleSidebar() {
-  elements.sidebar.classList.toggle("open");
+  setSidebar(!elements.sidebar.classList.contains("open"));
 }
 
 function setTranscriptFilter(filter) {
@@ -771,18 +905,69 @@ function isTypingTarget(target) {
     || target?.isContentEditable;
 }
 
-elements.location.addEventListener("change", () => loadConversations().catch(handleError));
+async function copyConversationLink() {
+  if (!state.activeConversation) return;
+  updateUrl();
+  try {
+    await navigator.clipboard.writeText(window.location.href);
+    const label = elements.copyLink.lastElementChild;
+    label.textContent = "Copied";
+    window.setTimeout(() => { label.textContent = "Copy link"; }, 1400);
+  } catch (_) {
+    showToast("Clipboard access is unavailable in this browser.");
+  }
+}
+
+async function reloadArchive() {
+  elements.reload.disabled = true;
+  elements.reload.classList.add("spinning");
+  elements.footerStatus.textContent = "Refreshing archive…";
+  try {
+    await loadLocations();
+    await loadConversations({ keepSelection: true });
+  } finally {
+    elements.reload.disabled = false;
+    elements.reload.classList.remove("spinning");
+  }
+}
+
+elements.location.addEventListener("change", () => loadConversations({ keepSelection: true }).catch(handleError));
 elements.search.addEventListener("input", () => {
   window.clearTimeout(state.searchTimer);
-  state.searchTimer = window.setTimeout(() => loadConversations().catch(handleError), 250);
+  elements.clearSearch.classList.toggle("hidden", !elements.search.value);
+  state.searchTimer = window.setTimeout(
+    () => loadConversations({ keepSelection: true }).catch(handleError),
+    250,
+  );
+});
+elements.clearSearch.addEventListener("click", () => {
+  elements.search.value = "";
+  elements.clearSearch.classList.add("hidden");
+  window.clearTimeout(state.searchTimer);
+  loadConversations({ keepSelection: true }).catch(handleError);
+  elements.search.focus();
+});
+elements.loadMore.addEventListener("click", () => loadConversations({ append: true }).catch(handleError));
+elements.transcriptSearch.addEventListener("input", () => {
+  state.transcriptQuery = elements.transcriptSearch.value;
+  renderEvents();
+});
+elements.clearTranscriptSearch.addEventListener("click", () => {
+  state.transcriptQuery = "";
+  elements.transcriptSearch.value = "";
+  renderEvents();
+  elements.transcriptSearch.focus();
 });
 for (const button of elements.filterButtons) {
   button.addEventListener("click", () => setTranscriptFilter(button.dataset.transcriptFilter));
 }
 elements.toggleDetails.addEventListener("click", toggleAllDetails);
+elements.copyLink.addEventListener("click", copyConversationLink);
+elements.reload.addEventListener("click", () => reloadArchive().catch(handleError));
 document.querySelector("#footer-details").addEventListener("click", toggleAllDetails);
-document.querySelector("#sessions-button").addEventListener("click", toggleSidebar);
+elements.sessionsButton.addEventListener("click", toggleSidebar);
 document.querySelector("#footer-sessions").addEventListener("click", toggleSidebar);
+elements.sidebarScrim.addEventListener("click", () => setSidebar(false));
 document.querySelector("#scroll-top").addEventListener("click", () => elements.content.scrollTo({ top: 0 }));
 
 document.addEventListener("keydown", (event) => {
@@ -793,8 +978,9 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     elements.search.focus();
   } else if (event.key === "Escape") {
-    elements.sidebar.classList.remove("open");
+    setSidebar(false);
     elements.search.blur();
+    elements.transcriptSearch.blur();
   } else if (!isTypingTarget(event.target) && ["1", "2", "3", "4"].includes(event.key)) {
     event.preventDefault();
     setTranscriptFilter({ 1: "all", 2: "chat", 3: "tools", 4: "reasoning" }[event.key]);

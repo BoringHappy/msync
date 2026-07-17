@@ -169,6 +169,8 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
         search_results = client.get("/api/conversations", params={"search": "blue widget"})
         location_id = locations.json()[1]["id"]
         selected_location = client.get("/api/conversations", params={"location": location_id})
+        first_page = client.get("/api/conversations", params={"limit": 1, "offset": 0})
+        second_page = client.get("/api/conversations", params={"limit": 1, "offset": 1})
 
     assert locations.status_code == 200
     assert len(locations.json()) == 2
@@ -179,6 +181,9 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
     assert [item["external_id"] for item in search_results.json()] == ["first-session"]
     assert len(selected_location.json()) == 1
     assert selected_location.json()[0]["location_id"] == location_id
+    assert len(first_page.json()) == 1
+    assert len(second_page.json()) == 1
+    assert first_page.json()[0]["id"] != second_page.json()[0]["id"]
 
 
 def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) -> None:
@@ -216,10 +221,23 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "ctrlKey" in script.text
     assert "moveEventFocus" in script.text
     assert "location.hostname" in script.text
+    assert "SESSION_PAGE_SIZE" in script.text
+    assert "matchesTranscriptQuery" in script.text
+    assert "requestId !== state.listRequest" in script.text
+    assert "reloadArchive" in script.text
+    assert "copyConversationLink" in script.text
+    assert "setSidebar" in script.text
     assert 'data-transcript-filter="tools"' in page.text
+    assert 'id="load-more"' in page.text
+    assert 'id="copy-link"' in page.text
+    assert 'id="transcript-search"' in page.text
+    assert 'id="sidebar-scrim"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
+    assert ".filter-count" in styles.text
+    assert ".transcript-search" in styles.text
+    assert ".sidebar-scrim:not(.hidden)" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
 

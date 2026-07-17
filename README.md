@@ -197,8 +197,10 @@ Claude/Codex layout with a location picker, session search, chronological messag
 lossless event inspection. Tool calls and results share compact activity cards, while assistant
 messages render common Markdown and fenced code blocks without accepting embedded HTML. Use the
 **Activity**, **Chat**, **Tools**, and **Reasoning** filters (or keys 1–4), navigate messages with
-J/K and sessions with `[`/`]`, and select **Raw events** (or press Ctrl+O) to inspect every native
-record and its source JSON.
+J/K and sessions with `[`/`]`, or find text within the active transcript from its toolbar. Large
+archives load sessions incrementally. The header refreshes archive contents, **Copy link** creates
+a deep link to the active session, and the mobile session drawer closes by tapping outside it.
+Select **Raw events** (or press Ctrl+O) to inspect every native record and its source JSON.
 
 If startup detects an old schema, it asks whether to upgrade the database. Answer `y` to run the
 registered migrations with the same bounded lock wait and progress reporting as `msync upgrade`,

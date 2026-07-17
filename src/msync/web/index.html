@@ -11,12 +11,13 @@
   <body>
     <div class="scanline" aria-hidden="true"></div>
     <header class="topbar">
-      <button class="icon-button mobile-only" id="sessions-button" type="button" aria-label="Open sessions">☰</button>
+      <button class="icon-button mobile-only" id="sessions-button" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">☰</button>
       <a class="brand" href="/" aria-label="msync history home">
         <span class="brand-mark">◇</span>
         <span>msync</span><span class="brand-dim">// history</span>
       </a>
-      <div class="top-status"><span class="status-light"></span> archive online</div>
+      <div class="top-status" id="archive-status"><span class="status-light"></span> archive online</div>
+      <button class="top-action" id="reload-button" type="button" title="Refresh archive" aria-label="Refresh archive">↻</button>
     </header>
 
     <div class="workspace">
@@ -31,13 +32,16 @@
             <option value="">All locations</option>
           </select>
         </div>
-        <label class="search-box" for="search-input">
-          <span>/</span>
-          <input id="search-input" type="search" placeholder="search sessions" autocomplete="off">
-        </label>
+        <div class="search-box">
+          <span aria-hidden="true">/</span>
+          <input id="search-input" type="search" placeholder="search sessions" autocomplete="off" aria-label="Search sessions">
+          <button class="clear-button hidden" id="clear-search" type="button" aria-label="Clear session search">×</button>
+        </div>
         <div class="session-list" id="session-list" aria-live="polite"></div>
+        <button class="load-more hidden" id="load-more" type="button">Load more sessions</button>
         <div class="sidebar-foot"><kbd>/</kbd> search <span>·</span> <kbd>[ ]</kbd> switch session</div>
       </aside>
+      <button class="sidebar-scrim hidden" id="sidebar-scrim" type="button" aria-label="Close sessions"></button>
 
       <main class="content" id="content">
         <section class="empty-state" id="empty-state">
@@ -55,18 +59,30 @@
                 <h1 id="conversation-title">Untitled conversation</h1>
                 <p id="conversation-subtitle"></p>
               </div>
-              <button class="terminal-button" id="toggle-details" type="button" aria-pressed="false">
-                <span class="button-key">Ctrl O</span>
-                <span id="detail-button-label">Raw events</span>
-              </button>
+              <div class="conversation-actions">
+                <button class="terminal-button compact" id="copy-link" type="button" title="Copy a link to this session">
+                  <span aria-hidden="true">↗</span>
+                  <span>Copy link</span>
+                </button>
+                <button class="terminal-button" id="toggle-details" type="button" aria-pressed="false">
+                  <span class="button-key">Ctrl O</span>
+                  <span id="detail-button-label">Raw events</span>
+                </button>
+              </div>
             </div>
             <dl class="metadata-strip" id="metadata-strip"></dl>
             <div class="transcript-controls" id="transcript-controls" role="toolbar" aria-label="Transcript view">
               <span class="control-label">VIEW</span>
-              <button type="button" data-transcript-filter="all" aria-pressed="true">Activity</button>
-              <button type="button" data-transcript-filter="chat" aria-pressed="false">Chat</button>
-              <button type="button" data-transcript-filter="tools" aria-pressed="false">Tools</button>
-              <button type="button" data-transcript-filter="reasoning" aria-pressed="false">Reasoning</button>
+              <button type="button" data-transcript-filter="all" aria-pressed="true"><span>Activity</span><span class="filter-count">0</span></button>
+              <button type="button" data-transcript-filter="chat" aria-pressed="false"><span>Chat</span><span class="filter-count">0</span></button>
+              <button type="button" data-transcript-filter="tools" aria-pressed="false"><span>Tools</span><span class="filter-count">0</span></button>
+              <button type="button" data-transcript-filter="reasoning" aria-pressed="false"><span>Reasoning</span><span class="filter-count">0</span></button>
+              <div class="transcript-search">
+                <span aria-hidden="true">⌕</span>
+                <input id="transcript-search" type="search" placeholder="find in transcript" autocomplete="off" aria-label="Find in transcript">
+                <span class="transcript-match-count" id="transcript-match-count"></span>
+                <button class="clear-button hidden" id="clear-transcript-search" type="button" aria-label="Clear transcript search">×</button>
+              </div>
               <span class="control-hint"><kbd>1–4</kbd> filter <kbd>j k</kbd> move</span>
             </div>
           </header>
@@ -80,7 +96,7 @@
       <button id="footer-details" type="button"><span>⊕</span> Raw events</button>
       <button id="scroll-top" type="button"><span>↑</span> Top</button>
       <span class="command-spacer"></span>
-      <span id="footer-status">Ready</span>
+      <span id="footer-status" role="status" aria-live="polite">Ready</span>
     </footer>
     <div class="toast hidden" id="toast" role="status"></div>
   </body>

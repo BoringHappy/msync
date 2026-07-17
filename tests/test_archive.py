@@ -95,6 +95,46 @@ def test_codex_upload_is_lossless_searchable_and_idempotent(tmp_path: Path) -> N
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_normalized_text_replaces_database_incompatible_nul_bytes(tmp_path: Path) -> None:
+    root = tmp_path / ".codex"
+    transcript_path = root / "sessions/nul.jsonl"
+    records = _codex_records("nul-session")
+    records[2]["payload"] = {
+        "type": "user_message",
+        "message": "Before\x00after",
+    }
+    original = _write_jsonl(transcript_path, records)
+    database = tmp_path / "archive.sqlite"
+
+    with Archive(database) as archive:
+        archive.upload(
+            root=root,
+            provider=get_provider("codex"),
+            transcripts=[transcript_path],
+        )
+
+    with closing(sqlite3.connect(database)) as connection:
+        title, transcript = connection.execute(
+            "SELECT title, transcript FROM conversations"
+        ).fetchone()
+        event_text, raw_json = connection.execute(
+            "SELECT searchable_text, raw_json FROM events WHERE role = 'user'"
+        ).fetchone()
+        part_text = connection.execute(
+            """
+            SELECT message_parts.text
+            FROM message_parts JOIN events ON events.id = message_parts.event_id
+            WHERE events.role = 'user'
+            """
+        ).fetchone()[0]
+
+    assert title == "Before\N{REPLACEMENT CHARACTER}after"
+    assert event_text == "Before\N{REPLACEMENT CHARACTER}after"
+    assert part_text == "Before\N{REPLACEMENT CHARACTER}after"
+    assert "\\u0000" in raw_json
+    assert zlib.decompress(transcript) == original
+
+
 def test_changed_transcript_replaces_normalized_events(tmp_path: Path) -> None:
     root = tmp_path / ".codex"
     path = root / "sessions/rollout.jsonl"

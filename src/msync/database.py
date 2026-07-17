@@ -923,16 +923,16 @@ class Archive:
             EventRow(
                 conversation_id=conversation_id,
                 sequence=source.sequence,
-                external_id=source.external_id,
-                parent_external_id=source.parent_external_id,
-                event_type=source.event_type,
-                event_subtype=source.event_subtype,
-                role=source.role,
-                visibility=source.visibility,
-                occurred_at=source.occurred_at,
-                searchable_text=source.searchable_text,
-                raw_json=source.raw_json,
-                parse_error=source.parse_error,
+                external_id=_portable_text(source.external_id),
+                parent_external_id=_portable_text(source.parent_external_id),
+                event_type=_portable_text(source.event_type),
+                event_subtype=_portable_text(source.event_subtype),
+                role=_portable_text(source.role),
+                visibility=_portable_text(source.visibility),
+                occurred_at=_portable_text(source.occurred_at),
+                searchable_text=_portable_text(source.searchable_text),
+                raw_json=_portable_text(source.raw_json),
+                parse_error=_portable_text(source.parse_error),
             )
             for source in conversation.events
         ]
@@ -942,9 +942,9 @@ class Archive:
             MessagePartRow(
                 event_id=row.id,
                 sequence=part.sequence,
-                content_type=part.content_type,
-                text=part.text,
-                raw_json=part.raw_json,
+                content_type=_portable_text(part.content_type),
+                text=_portable_text(part.text),
+                raw_json=_portable_text(part.raw_json),
             )
             for row, source in zip(rows, conversation.events, strict=True)
             for part in source.parts
@@ -1030,17 +1030,17 @@ def _migrate_v5_to_v6(
             update(ConversationRow)
             .where(ConversationRow.id == row.id)
             .values(
-                external_id=conversation.external_id,
-                logical_session_id=conversation.logical_session_id,
+                external_id=_portable_text(conversation.external_id),
+                logical_session_id=_portable_text(conversation.logical_session_id),
                 chat_sha256=conversation.chat_sha256,
-                conversation_kind=conversation.kind,
-                parent_external_id=conversation.parent_external_id,
-                title=conversation.title,
-                cwd=conversation.cwd,
-                model=conversation.model,
-                git_branch=conversation.git_branch,
-                started_at=conversation.started_at,
-                ended_at=conversation.ended_at,
+                conversation_kind=_portable_text(conversation.kind),
+                parent_external_id=_portable_text(conversation.parent_external_id),
+                title=_portable_text(conversation.title),
+                cwd=_portable_text(conversation.cwd),
+                model=_portable_text(conversation.model),
+                git_branch=_portable_text(conversation.git_branch),
+                started_at=_portable_text(conversation.started_at),
+                ended_at=_portable_text(conversation.ended_at),
                 metadata_json=_metadata_with_identity(row.metadata_json, conversation),
             )
         )
@@ -1064,16 +1064,16 @@ def _insert_migrated_events(
             EventRow.__table__.insert().values(
                 conversation_id=conversation_id,
                 sequence=source.sequence,
-                external_id=source.external_id,
-                parent_external_id=source.parent_external_id,
-                event_type=source.event_type,
-                event_subtype=source.event_subtype,
-                role=source.role,
-                visibility=source.visibility,
-                occurred_at=source.occurred_at,
-                searchable_text=source.searchable_text,
-                raw_json=source.raw_json,
-                parse_error=source.parse_error,
+                external_id=_portable_text(source.external_id),
+                parent_external_id=_portable_text(source.parent_external_id),
+                event_type=_portable_text(source.event_type),
+                event_subtype=_portable_text(source.event_subtype),
+                role=_portable_text(source.role),
+                visibility=_portable_text(source.visibility),
+                occurred_at=_portable_text(source.occurred_at),
+                searchable_text=_portable_text(source.searchable_text),
+                raw_json=_portable_text(source.raw_json),
+                parse_error=_portable_text(source.parse_error),
             )
         )
         event_id = result.inserted_primary_key[0]
@@ -1084,9 +1084,9 @@ def _insert_migrated_events(
                     {
                         "event_id": event_id,
                         "sequence": part.sequence,
-                        "content_type": part.content_type,
-                        "text": part.text,
-                        "raw_json": part.raw_json,
+                        "content_type": _portable_text(part.content_type),
+                        "text": _portable_text(part.text),
+                        "raw_json": _portable_text(part.raw_json),
                     }
                     for part in source.parts
                 ],
@@ -1101,19 +1101,19 @@ SCHEMA_MIGRATIONS: dict[int, SchemaMigration] = {
 def _update_conversation(
     row: ConversationRow, conversation: Conversation, source_mtime_ns: int
 ) -> None:
-    row.external_id = conversation.external_id
-    row.conversation_kind = conversation.kind
-    row.parent_external_id = conversation.parent_external_id
-    row.title = conversation.title
-    row.cwd = conversation.cwd
-    row.model = conversation.model
-    row.git_branch = conversation.git_branch
-    row.started_at = conversation.started_at
-    row.ended_at = conversation.ended_at
+    row.external_id = _portable_text(conversation.external_id) or ""
+    row.conversation_kind = _portable_text(conversation.kind) or "main"
+    row.parent_external_id = _portable_text(conversation.parent_external_id)
+    row.title = _portable_text(conversation.title)
+    row.cwd = _portable_text(conversation.cwd)
+    row.model = _portable_text(conversation.model)
+    row.git_branch = _portable_text(conversation.git_branch)
+    row.started_at = _portable_text(conversation.started_at)
+    row.ended_at = _portable_text(conversation.ended_at)
     row.source_mtime_ns = source_mtime_ns
     row.source_size = len(conversation.transcript)
     row.content_sha256 = conversation.sha256
-    row.logical_session_id = conversation.logical_session_id
+    row.logical_session_id = _portable_text(conversation.logical_session_id)
     row.chat_sha256 = conversation.chat_sha256
     row.transcript_codec = "zlib"
     row.transcript = zlib.compress(conversation.transcript)
@@ -1156,12 +1156,30 @@ def _conversation_identity(conversation: Conversation) -> tuple[str, str | None]
 
 
 def _metadata_with_identity(metadata: dict[str, Any], conversation: Conversation) -> dict[str, Any]:
-    stored = dict(metadata)
+    stored = _portable_json_value(metadata)
     stored["_msync"] = {
         "chat_sha256": conversation.chat_sha256,
-        "logical_session_id": conversation.logical_session_id,
+        "logical_session_id": _portable_text(conversation.logical_session_id),
     }
     return stored
+
+
+def _portable_text(value: str | None) -> str | None:
+    """Replace NUL characters that SQL text types cannot portably store."""
+
+    return value.replace("\x00", "\N{REPLACEMENT CHARACTER}") if value is not None else None
+
+
+def _portable_json_value(value: Any) -> Any:
+    """Make nested metadata safe for PostgreSQL JSON while retaining its shape."""
+
+    if isinstance(value, str):
+        return _portable_text(value)
+    if isinstance(value, dict):
+        return {_portable_text(str(key)): _portable_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_portable_json_value(item) for item in value]
+    return value
 
 
 def _configure_schema_lock_timeout(
