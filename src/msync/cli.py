@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -43,6 +44,14 @@ app = typer.Typer(
 )
 console = Console()
 error_console = Console(stderr=True)
+
+
+@dataclass(slots=True, frozen=True)
+class SessionVerificationFailure:
+    """One transcript rejected before remote upload."""
+
+    relative_path: str
+    reason: str
 
 
 @app.callback()
@@ -100,6 +109,17 @@ def upload(
         transcripts = selected_provider.discover(root)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
+        verified_transcripts, verification_failures = _verify_transcripts(
+            root=root,
+            provider=selected_provider,
+            transcripts=transcripts,
+        )
+        _print_session_verification(
+            verified=len(verified_transcripts),
+            failures=verification_failures,
+        )
+        if not verified_transcripts:
+            raise HistoryFormatError("No sessions passed the pre-upload verification.")
         location_hostname = _upload_hostname(hostname)
         result, target_display = _remote_upload(
             url=url,
@@ -107,7 +127,7 @@ def upload(
             root=root,
             hostname=location_hostname,
             provider=selected_provider,
-            transcripts=transcripts,
+            transcripts=verified_transcripts,
         )
     except (
         HistoryFormatError,
@@ -120,20 +140,29 @@ def upload(
         error_console.print(f"[bold red]Upload failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
 
-    table = Table(title="Upload complete", show_header=False, box=None, pad_edge=False)
+    table = Table(
+        title="Upload incomplete" if verification_failures else "Upload complete",
+        show_header=False,
+        box=None,
+        pad_edge=False,
+    )
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Provider", selected_provider.name)
     table.add_row("Hostname", location_hostname)
     table.add_row("Location", str(root))
     table.add_row("Server", target_display)
-    table.add_row("Transcripts", str(result.scanned))
+    table.add_row("Transcripts", str(len(transcripts)))
+    table.add_row("Sessions verified", str(len(verified_transcripts)))
+    table.add_row("Sessions failed", str(len(verification_failures)))
     table.add_row("Imported", str(result.imported))
     table.add_row("Updated", str(result.updated))
     table.add_row("Unchanged", str(result.unchanged))
     table.add_row("Duplicates skipped", str(result.duplicates))
     table.add_row("Events indexed", str(result.events))
     console.print(table)
+    if verification_failures:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -517,6 +546,77 @@ def _upload_hostname(hostname: str | None) -> str:
     return normalized
 
 
+def _verify_transcripts(
+    *,
+    root: Path,
+    provider: HistoryProvider,
+    transcripts: list[Path],
+) -> tuple[list[Path], tuple[SessionVerificationFailure, ...]]:
+    """Parse every session locally and collect failures before opening the network."""
+
+    verified: list[Path] = []
+    failures: list[SessionVerificationFailure] = []
+    for path in transcripts:
+        relative_path = path.relative_to(root).as_posix()
+        try:
+            if path.stat().st_size > UPLOAD_TRANSCRIPT_MAX_BYTES:
+                raise ValueError("Transcript exceeds the 256 MiB remote upload limit")
+            conversation = provider.read(path, root)
+        except (OSError, ValueError) as error:
+            failures.append(
+                SessionVerificationFailure(
+                    relative_path=relative_path,
+                    reason=_single_line_error(error),
+                )
+            )
+            continue
+
+        invalid_events = [event for event in conversation.events if event.parse_error]
+        if not conversation.events:
+            reason = "transcript contains no JSON records"
+        elif invalid_events:
+            first_invalid = invalid_events[0]
+            reason = (
+                f"line {first_invalid.sequence + 1}: "
+                f"{_single_line_error(first_invalid.parse_error or 'invalid record')}"
+            )
+            if len(invalid_events) > 1:
+                reason += f" ({len(invalid_events) - 1} more invalid records)"
+        elif conversation.started_at is None:
+            reason = "session contains no event timestamps"
+        else:
+            verified.append(path)
+            continue
+
+        failures.append(SessionVerificationFailure(relative_path=relative_path, reason=reason))
+    return verified, tuple(failures)
+
+
+def _single_line_error(error: object) -> str:
+    """Keep provider validation details readable in a one-line CLI report."""
+
+    return " ".join(str(error).split())
+
+
+def _print_session_verification(
+    *,
+    verified: int,
+    failures: tuple[SessionVerificationFailure, ...],
+) -> None:
+    """Report the pre-upload result and a reason for every rejected session."""
+
+    failed = len(failures)
+    console.print(f"Session pre-check: {verified} passed, {failed} failed.")
+    for failure in failures:
+        error_console.print(
+            Text.assemble(
+                ("Session not uploaded: ", "bold red"),
+                (failure.relative_path, "bold"),
+            )
+        )
+        error_console.print(Text.assemble(("  Reason: ", "dim"), failure.reason))
+
+
 def _remote_upload(
     *,
     url: str,
@@ -543,9 +643,7 @@ def _remote_upload(
     for path in transcripts:
         stat = path.stat()
         if stat.st_size > UPLOAD_TRANSCRIPT_MAX_BYTES:
-            raise ValueError(
-                f"Transcript exceeds the 256 MiB remote upload limit: {path}"
-            )
+            raise ValueError(f"Transcript exceeds the 256 MiB remote upload limit: {path}")
         metadata = RemoteUploadMetadata(
             provider=provider.name,
             hostname=hostname,
@@ -603,7 +701,7 @@ def _remote_upload_response(response: httpx.Response) -> UploadResult:
     if response.is_error:
         try:
             detail = response.json().get("detail")
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             detail = None
         message = detail if isinstance(detail, str) and detail else response.reason_phrase
         raise RuntimeError(f"msync server returned HTTP {response.status_code}: {message}")

@@ -93,9 +93,12 @@ $ msync upload --dir /mnt/history --provider codex --url https://history.example
 ```
 
 `upload` requires `--url`; direct `--database` uploads are no longer supported. The client detects
-and reads native transcripts locally, streams their byte-exact contents one file at a time over the
-authenticated API, and records the authenticated account, client hostname, source path, result
-counts, and upload time. A history directory has no aggregate upload limit; each individual
+and verifies every native transcript locally before opening a network connection. Empty, malformed,
+oversized, and timestamp-less sessions are skipped with their relative paths and failure reasons;
+verified sessions are still uploaded, while the command reports the failed count and exits non-zero
+for an incomplete upload. The client streams verified transcripts byte-for-byte, one file at a time,
+over the authenticated API, and records the authenticated account, client hostname, source path,
+result counts, and upload time. A history directory has no aggregate upload limit; each individual
 transcript is capped at 256 MiB. The server rejects oversized request bodies before parsing them and
 spools accepted network bodies to disk before archive processing. Uploads retain the same hash-based
 update, duplicate, and schema checks. Treat an upload token like a password and use HTTPS whenever

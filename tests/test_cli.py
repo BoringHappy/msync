@@ -245,6 +245,7 @@ def test_upload_sends_native_transcripts_to_remote_server(
     )
 
     assert result.exit_code == 0, result.output
+    assert "Session pre-check: 2 passed, 0 failed." in result.output
     assert "Upload complete" in result.output
     assert "Server" in result.output
     assert "https://history.example/msync" in result.output
@@ -274,6 +275,117 @@ def test_upload_sends_native_transcripts_to_remote_server(
         assert metadata.root_path == str(root.resolve())
         assert metadata.relative_path == relative_path
         assert request["body"][4 + metadata_length :] == transcript_content
+
+
+def test_upload_reports_failed_session_prechecks_and_uploads_verified_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    valid = _write_codex_transcript(root)
+    malformed = root / "sessions/malformed.jsonl"
+    malformed.write_text('{"type": "session_meta"\n')
+    empty = root / "sessions/empty.jsonl"
+    empty.touch()
+    missing_timestamp = root / "sessions/missing-timestamp.jsonl"
+    missing_timestamp.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "missing-timestamp", "cwd": "/tmp"},
+            }
+        )
+        + "\n"
+    )
+    uploaded_paths: list[str] = []
+
+    def fake_post(
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: Iterator[bytes],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del headers, timeout
+        body = b"".join(content)
+        metadata_length = int.from_bytes(body[:4], byteorder="big")
+        metadata = RemoteUploadMetadata.model_validate_json(body[4 : 4 + metadata_length])
+        uploaded_paths.append(metadata.relative_path)
+        return httpx.Response(
+            200,
+            json={
+                "location_id": 1,
+                "scanned": 1,
+                "imported": 1,
+                "updated": 0,
+                "unchanged": 0,
+                "duplicates": 0,
+                "events": 1,
+                "message_parts": 0,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("msync.cli.httpx.post", fake_post)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Session pre-check: 1 passed, 3 failed." in result.output
+    assert "sessions/empty.jsonl" in result.output
+    assert "transcript contains no JSON records" in result.output
+    assert "sessions/malformed.jsonl" in result.output
+    assert "line 1:" in result.output
+    assert "sessions/missing-timestamp.jsonl" in result.output
+    assert "session contains no event timestamps" in result.output
+    assert "Upload incomplete" in result.output
+    assert re.search(r"Sessions failed\s+3", result.output)
+    assert uploaded_paths == [valid.relative_to(root).as_posix()]
+
+
+def test_upload_does_not_contact_server_when_no_session_passes_precheck(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    transcript = root / "sessions/empty.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+
+    def unexpected_post(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("failed pre-check reached the network")
+
+    monkeypatch.setattr("msync.cli.httpx.post", unexpected_post)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Session pre-check: 0 passed, 1 failed." in result.output
+    assert "Session not uploaded: sessions/empty.jsonl" in result.output
+    assert "No sessions passed the pre-upload verification" in result.output
 
 
 def test_upload_requires_token(tmp_path: Path) -> None:
