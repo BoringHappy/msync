@@ -1,6 +1,18 @@
 {
-  "description": "Queue the completed session transcript for upload to msync.",
+  "description": "Install msync when a session starts and queue completed transcripts for upload.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv tool install --upgrade git+https://github.com/BoringHappy/msync.git",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
