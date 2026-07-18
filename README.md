@@ -128,10 +128,11 @@ should be protected like the original Claude Code and Codex history directories.
 
 ## Automatic uploads
 
-The included plugin queues the completed session for upload after every Claude Code or Codex turn.
-It returns immediately and safely ignores repeated events.
+The included plugin installs or upgrades `msync` when a Claude Code or Codex session starts, then
+queues the completed session for upload after every turn. Upload hooks return immediately and safely
+ignore repeated events.
 
-First install `msync` and set these variables in the environment that launches your client:
+Set these variables in the environment that launches your client:
 
 ```console
 $ export MSYNC_UPLOAD_URL='https://history.example.com'
