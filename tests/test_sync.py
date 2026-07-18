@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from msync.cli import app
-from msync.database import Archive, UploadResult
+from msync.database import Archive, RemoteTranscript, UploadResult
 from msync.providers import get_provider
 from msync.schemas.claude import ClaudeRecord
 from msync.schemas.codex import CodexRolloutLine
@@ -267,6 +268,50 @@ def test_sync_can_generate_an_explicit_provider_location_from_archive(
     assert get_provider("claude").read(generated[0], destination).title == "Question from Codex"
 
 
+def test_sync_writes_same_path_history_from_another_host(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
+    destination = (tmp_path / ".codex").resolve()
+    destination.mkdir()
+    transcript = ("".join(json.dumps(record) + "\n" for record in _codex_records())).encode()
+    with Archive(remote_archive) as archive:
+        uploaded = archive.upload_remote(
+            root_path=str(destination),
+            display_name=destination.name,
+            provider=get_provider("codex"),
+            hostname="remote-host",
+            account_username=REMOTE_ACCOUNT,
+            transcripts=[
+                RemoteTranscript(
+                    relative_path="sessions/remote-host.jsonl",
+                    content=transcript,
+                )
+            ],
+        )
+    assert uploaded.imported == 1
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(destination),
+            "--provider",
+            "codex",
+            "--hostname",
+            "local-host",
+            *_remote_options(),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"Native histories written\s+1", result.output)
+    generated = _generated_paths(destination)
+    assert len(generated) == 1
+    assert get_provider("codex").read(generated[0], destination).title == "Question from Codex"
+
+
 def test_sync_does_not_overwrite_a_continued_export(
     tmp_path: Path,
     remote_archive: Path,
@@ -290,6 +335,18 @@ def test_sync_does_not_overwrite_a_continued_export(
     first = CliRunner().invoke(app, arguments)
     assert first.exit_code == 0, first.output
     generated = _generated_paths(destination)[0]
+    manifest_path = destination / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    generated_key = generated.relative_to(destination).as_posix()
+    legacy_identity = json.dumps(
+        ["codex", str(codex_root.resolve()), codex_path.relative_to(codex_root).as_posix()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    manifest["files"][generated_key]["sources"] = [
+        hashlib.sha256(legacy_identity.encode()).hexdigest()
+    ]
+    manifest_path.write_text(json.dumps(manifest))
     records = [json.loads(line) for line in generated.read_text().splitlines()]
     continued_record = {
         "type": "user",

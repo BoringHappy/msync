@@ -152,6 +152,7 @@ class ArchivedConversation:
     """One stored transcript together with its source-location identity."""
 
     location_id: int
+    source_hostname: str
     source_root: str
     source_mtime_ns: int
     conversation: Conversation
@@ -820,7 +821,13 @@ class Archive:
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
 
-    def sample(self, limit: int) -> list[SearchResult]:
+    def sample(
+        self,
+        limit: int,
+        *,
+        account_username: str | None = None,
+        include_legacy: bool = False,
+    ) -> list[SearchResult]:
         """Return a random selection of non-empty archived message events."""
 
         if limit < 1:
@@ -839,9 +846,11 @@ class Archive:
             .join(ConversationRow, EventRow.conversation_id == ConversationRow.id)
             .join(LocationRow, ConversationRow.location_id == LocationRow.id)
             .where(EventRow.searchable_text != "")
-            .order_by(random_order)
-            .limit(limit)
         )
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(LocationRow.account_username.in_(owners))
+        statement = statement.order_by(random_order).limit(limit)
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
 
@@ -1441,6 +1450,7 @@ class Archive:
         statement = (
             select(
                 LocationRow.id,
+                LocationRow.hostname,
                 LocationRow.root_path,
                 LocationRow.provider,
                 ConversationRow.relative_path,
@@ -1477,6 +1487,7 @@ class Archive:
             conversations.append(
                 ArchivedConversation(
                     location_id=row.id,
+                    source_hostname=row.hostname,
                     source_root=row.root_path,
                     source_mtime_ns=row.source_mtime_ns,
                     conversation=conversation,

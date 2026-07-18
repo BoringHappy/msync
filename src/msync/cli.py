@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import random
 import socket
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -339,6 +338,7 @@ def sync(
                 conversations,
                 destination=root,
                 provider=selected_provider,
+                current_hostname=location_hostname,
             )
             for root, selected_provider in zip(roots, selected_providers, strict=True)
         ]
@@ -540,7 +540,7 @@ def search(
 def sample(
     limit: Annotated[
         int,
-        typer.Argument(min=1, help="Maximum number of archived messages to inspect."),
+        typer.Argument(min=1, max=500, help="Maximum number of archived messages to inspect."),
     ],
     url: Annotated[
         str,
@@ -562,8 +562,7 @@ def sample(
     try:
         if not token:
             raise ValueError("--url requires --token or MSYNC_TOKEN.")
-        available = _conversation_results(_remote_conversations(url, token))
-        results = random.SystemRandom().sample(available, min(limit, len(available)))
+        results = _remote_sample(url, token, limit)
     except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
         error_console.print(f"[bold red]Sample failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
@@ -769,15 +768,22 @@ def _remote_conversations(
     locations_payload = _remote_json(url, token, "/api/locations")
     if not isinstance(locations_payload, list):
         raise RuntimeError("msync server returned an invalid location list.")
-    location_roots: dict[int, str] = {}
+    location_details: dict[int, tuple[str, str]] = {}
     for item in locations_payload:
         if not isinstance(item, dict):
             raise RuntimeError("msync server returned an invalid location.")
         location_id = item.get("id")
+        hostname = item.get("hostname")
         root_path = item.get("root_path")
-        if not isinstance(location_id, int) or not isinstance(root_path, str) or not root_path:
+        if (
+            not isinstance(location_id, int)
+            or not isinstance(hostname, str)
+            or not hostname
+            or not isinstance(root_path, str)
+            or not root_path
+        ):
             raise RuntimeError("msync server returned an invalid location.")
-        location_roots[location_id] = root_path
+        location_details[location_id] = (hostname, root_path)
 
     summaries: list[dict[str, object]] = []
     offset = 0
@@ -809,7 +815,7 @@ def _remote_conversations(
             not isinstance(conversation_id, int)
             or not isinstance(location_id, int)
             or not isinstance(provider_name, str)
-            or location_id not in location_roots
+            or location_id not in location_details
         ):
             raise RuntimeError("msync server returned an invalid conversation summary.")
         detail = _remote_json(url, token, f"/api/conversations/{conversation_id}")
@@ -829,19 +835,61 @@ def _remote_conversations(
                 raise RuntimeError("msync server returned an invalid conversation event.")
             raw_records.append(raw_json)
         transcript = ("\n".join(raw_records) + "\n").encode()
-        source_root = location_roots[location_id]
+        source_hostname, source_root = location_details[location_id]
         root = Path(source_root)
         provider = get_provider(provider_name)
         conversation = provider.read(root / relative, root, transcript=transcript)
         conversations.append(
             ArchivedConversation(
                 location_id=location_id,
+                source_hostname=source_hostname,
                 source_root=source_root,
                 source_mtime_ns=0,
                 conversation=conversation,
             )
         )
     return conversations
+
+
+def _remote_sample(url: str, token: str, limit: int) -> list[SearchResult]:
+    """Request a bounded random message sample from the authenticated archive."""
+
+    payload = _remote_json(url, token, "/api/sample", params={"limit": limit})
+    if not isinstance(payload, list):
+        raise RuntimeError("msync server returned an invalid message sample.")
+    results: list[SearchResult] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise RuntimeError("msync server returned an invalid sampled message.")
+        provider = item.get("provider")
+        conversation_id = item.get("conversation_id")
+        title = item.get("title")
+        relative_path = item.get("relative_path")
+        role = item.get("role")
+        occurred_at = item.get("occurred_at")
+        event_text = item.get("text")
+        if (
+            not isinstance(provider, str)
+            or not isinstance(conversation_id, str)
+            or (title is not None and not isinstance(title, str))
+            or not isinstance(relative_path, str)
+            or (role is not None and not isinstance(role, str))
+            or (occurred_at is not None and not isinstance(occurred_at, str))
+            or not isinstance(event_text, str)
+        ):
+            raise RuntimeError("msync server returned an invalid sampled message.")
+        results.append(
+            SearchResult(
+                provider=provider,
+                conversation_id=conversation_id,
+                title=title,
+                relative_path=relative_path,
+                role=role,
+                occurred_at=occurred_at,
+                text=event_text,
+            )
+        )
+    return results
 
 
 def _conversation_results(

@@ -797,6 +797,47 @@ def test_sample_command_limits_random_remote_messages(
     assert result.output.count("Role         user") == 2
 
 
+def test_sample_requests_only_the_bounded_remote_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[str, dict[str, str | int] | None]] = []
+
+    def fake_get(
+        url: str,
+        *,
+        params: dict[str, str | int] | None,
+        headers: dict[str, str],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del headers, timeout
+        requests.append((url, params))
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "provider": "codex",
+                    "conversation_id": "sample-session",
+                    "title": "Sample message",
+                    "relative_path": "sessions/sample.jsonl",
+                    "role": "user",
+                    "occurred_at": "2026-07-14T12:00:01Z",
+                    "text": "One bounded sample",
+                }
+            ],
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("msync.cli.httpx.get", fake_get)
+    result = CliRunner().invoke(
+        app,
+        ["sample", "1", "--url", REMOTE_URL, "--token", REMOTE_TOKEN],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "One bounded sample" in result.output
+    assert requests == [(f"{REMOTE_URL}/api/sample", {"limit": 1})]
+
+
 def test_sample_command_reports_empty_archive(remote_cli_archive: Path) -> None:
     result = CliRunner().invoke(
         app,

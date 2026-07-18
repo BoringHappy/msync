@@ -52,6 +52,7 @@ def sync_conversations(
     *,
     destination: Path,
     provider: HistoryProvider,
+    current_hostname: str,
 ) -> SyncResult:
     """Write all archived histories into one provider-native destination."""
 
@@ -64,18 +65,24 @@ def sync_conversations(
         conversations,
         destination=destination,
         provider=provider,
+        current_hostname=current_hostname,
     )
     written = unchanged = protected = skipped = 0
     conflicts: list[str] = []
 
     for archived in selected:
         conversation = archived.conversation
-        source_root = Path(archived.source_root).expanduser().resolve()
-        if source_root == destination and conversation.provider == provider.name:
+        if _is_current_location(
+            archived,
+            destination=destination,
+            provider=provider,
+            current_hostname=current_hostname,
+        ):
             current += 1
             continue
 
         source_key = _source_key(archived)
+        recognized_source_keys = {source_key, _legacy_source_key(archived)}
         revision_hash = conversation.chat_sha256 or conversation.sha256
         revision_identity = (conversation.logical_session_id, conversation.chat_sha256)
         legacy_path = existing_revisions.get(revision_identity)
@@ -139,7 +146,7 @@ def sync_conversations(
             actual_hash = _file_hash(output_path)
             if actual_hash == expected_hash:
                 unchanged += 1
-            elif source_key in sources:
+            elif recognized_source_keys.intersection(sources):
                 protected += 1
                 continue
             else:
@@ -198,6 +205,7 @@ def _collapse_equivalent_chats(
     *,
     destination: Path,
     provider: HistoryProvider,
+    current_hostname: str,
 ) -> tuple[list[ArchivedConversation], int, int]:
     groups: dict[str, list[ArchivedConversation]] = {}
     selected = []
@@ -216,8 +224,12 @@ def _collapse_equivalent_chats(
         local = [
             archived
             for archived in group
-            if Path(archived.source_root).expanduser().resolve() == destination
-            and archived.conversation.provider == provider.name
+            if _is_current_location(
+                archived,
+                destination=destination,
+                provider=provider,
+                current_hostname=current_hostname,
+            )
         ]
         equivalent += len(group) - 1
         if local:
@@ -239,11 +251,44 @@ def _collapse_equivalent_chats(
 def _source_key(archived: ArchivedConversation) -> str:
     conversation = archived.conversation
     identity = json.dumps(
+        [
+            conversation.provider,
+            archived.source_hostname.casefold(),
+            archived.source_root,
+            conversation.relative_path,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _legacy_source_key(archived: ArchivedConversation) -> str:
+    """Return the pre-hostname key so existing manifests still protect continued sessions."""
+
+    conversation = archived.conversation
+    identity = json.dumps(
         [conversation.provider, archived.source_root, conversation.relative_path],
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _is_current_location(
+    archived: ArchivedConversation,
+    *,
+    destination: Path,
+    provider: HistoryProvider,
+    current_hostname: str,
+) -> bool:
+    """Match a native source only when both its host and path identify this destination."""
+
+    return (
+        archived.source_hostname.casefold() == current_hostname.casefold()
+        and Path(archived.source_root).expanduser().resolve() == destination
+        and archived.conversation.provider == provider.name
+    )
 
 
 def _started_at(archived: ArchivedConversation) -> datetime:
