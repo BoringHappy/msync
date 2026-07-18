@@ -2,6 +2,7 @@
 
 const SESSION_PAGE_SIZE = 50;
 const EVENT_PAGE_SIZE = 100;
+const LAYOUT_STORAGE_KEY = "msync:fit-width";
 
 const state = {
   locations: [],
@@ -14,10 +15,12 @@ const state = {
   eventLoading: false,
   eventRequest: 0,
   hasMoreConversations: false,
+  humanCursorSequence: null,
   listController: null,
   listRequest: 0,
   conversationRequest: 0,
   searchTimer: null,
+  fitWidth: false,
   transcriptFilter: "all",
   transcriptQuery: "",
 };
@@ -32,6 +35,8 @@ const elements = {
   archiveStatus: document.querySelector("#archive-status"),
   location: document.querySelector("#location-select"),
   loadMore: document.querySelector("#load-more"),
+  nextHuman: document.querySelector("#next-human"),
+  order: document.querySelector("#order-select"),
   reload: document.querySelector("#reload-button"),
   search: document.querySelector("#search-input"),
   sessionList: document.querySelector("#session-list"),
@@ -40,17 +45,22 @@ const elements = {
   sidebar: document.querySelector("#sidebar"),
   sidebarScrim: document.querySelector("#sidebar-scrim"),
   title: document.querySelector("#conversation-title"),
+  titleTooltip: document.querySelector("#conversation-title-tooltip"),
+  titleWrap: document.querySelector("#conversation-title-wrap"),
   subtitle: document.querySelector("#conversation-subtitle"),
   provider: document.querySelector("#conversation-provider"),
+  previousHuman: document.querySelector("#previous-human"),
   metadata: document.querySelector("#metadata-strip"),
   transcript: document.querySelector("#transcript"),
   toggleDetails: document.querySelector("#toggle-details"),
+  toggleWidth: document.querySelector("#toggle-width"),
   detailLabel: document.querySelector("#detail-button-label"),
   footerStatus: document.querySelector("#footer-status"),
   filterButtons: [...document.querySelectorAll("[data-transcript-filter]")],
   transcriptSearch: document.querySelector("#transcript-search"),
   transcriptMatchCount: document.querySelector("#transcript-match-count"),
   toast: document.querySelector("#toast"),
+  widthLabel: document.querySelector("#width-button-label"),
 };
 
 function node(tag, className, text) {
@@ -93,6 +103,45 @@ function oneLine(value, fallback = "Untitled session") {
   return normalized || fallback;
 }
 
+function updateTitleOverflow() {
+  const truncated = elements.title.scrollWidth > elements.title.clientWidth + 1;
+  elements.titleWrap.classList.toggle("is-truncated", truncated);
+  elements.titleTooltip.setAttribute("aria-hidden", String(!truncated));
+  if (truncated) {
+    elements.title.tabIndex = 0;
+    elements.title.setAttribute("aria-describedby", "conversation-title-tooltip");
+  } else {
+    elements.title.removeAttribute("tabindex");
+    elements.title.removeAttribute("aria-describedby");
+  }
+}
+
+function setFitWidth(enabled, { persist = false } = {}) {
+  state.fitWidth = enabled;
+  elements.conversation.classList.toggle("fit-width", enabled);
+  elements.toggleWidth.setAttribute("aria-pressed", String(enabled));
+  elements.toggleWidth.title = enabled ? "Use reading width" : "Use full window width";
+  elements.widthLabel.textContent = enabled ? "Reading width" : "Fit width";
+  if (persist) {
+    try {
+      window.localStorage.setItem(LAYOUT_STORAGE_KEY, enabled ? "true" : "false");
+    } catch (_) {
+      // The layout still changes when storage is disabled by the browser.
+    }
+  }
+  window.requestAnimationFrame(updateTitleOverflow);
+}
+
+function loadWidthPreference() {
+  let enabled = false;
+  try {
+    enabled = window.localStorage.getItem(LAYOUT_STORAGE_KEY) === "true";
+  } catch (_) {
+    // Use the reading width when storage is disabled by the browser.
+  }
+  setFitWidth(enabled);
+}
+
 function selectedConversationId() {
   const value = new URLSearchParams(window.location.search).get("conversation");
   return value && /^\d+$/.test(value) ? Number(value) : null;
@@ -102,6 +151,7 @@ function updateUrl(conversationId = state.activeConversation?.summary.id || null
   const params = new URLSearchParams();
   if (elements.location.value) params.set("location", elements.location.value);
   if (elements.search.value.trim()) params.set("q", elements.search.value.trim());
+  if (elements.order.value !== "newest") params.set("order", elements.order.value);
   if (conversationId) params.set("conversation", String(conversationId));
   const query = params.toString();
   history.replaceState(null, "", query ? `?${query}` : window.location.pathname);
@@ -133,6 +183,13 @@ async function loadLocations() {
   if (!elements.search.dataset.hydrated) {
     elements.search.value = params.get("q") || "";
     elements.search.dataset.hydrated = "true";
+  }
+  if (!elements.order.dataset.hydrated) {
+    const requestedOrder = params.get("order") || "newest";
+    if ([...elements.order.options].some((option) => option.value === requestedOrder)) {
+      elements.order.value = requestedOrder;
+    }
+    elements.order.dataset.hydrated = "true";
   }
   elements.clearSearch.classList.toggle("hidden", !elements.search.value);
   const locationCount = state.locations.length;
@@ -170,6 +227,7 @@ async function loadConversations({ append = false, keepSelection = false } = {})
   });
   if (elements.location.value) params.set("location", elements.location.value);
   if (elements.search.value.trim()) params.set("search", elements.search.value.trim());
+  params.set("order", elements.order.value);
   let response;
   try {
     response = await request(`/api/conversations?${params}`, { signal: controller.signal });
@@ -203,6 +261,11 @@ async function loadConversations({ append = false, keepSelection = false } = {})
   if (requestedId && !available && !keepSelection) {
     await openConversation(requestedId);
     if (state.activeConversation?.summary.id === requestedId) return;
+  }
+  if (keepSelection && available && state.activeConversation?.summary.id === requestedId) {
+    elements.footerStatus.textContent = `${state.conversations.length} sessions loaded`;
+    updateUrl(requestedId);
+    return;
   }
   const nextId = available ? requestedId : state.conversations[0]?.id;
   if (nextId) {
@@ -241,9 +304,11 @@ function renderConversationList() {
       node("span", "session-time", formatDate(conversation.ended_at || conversation.started_at)),
     );
     const title = oneLine(conversation.title || conversation.preview || conversation.external_id);
+    const titleNode = node("div", "session-title", title);
+    titleNode.title = title;
     card.append(
       top,
-      node("div", "session-title", title),
+      titleNode,
       node("div", "session-preview", oneLine(conversation.preview, "No visible user message")),
       node("div", "session-meta", `${conversation.hostname} · ${conversation.message_count} messages · ${conversation.event_count} events`),
     );
@@ -270,6 +335,7 @@ async function openConversation(id) {
     if (requestId !== state.conversationRequest) return;
     state.activeConversation = detail;
     state.detailsExpanded = false;
+    state.humanCursorSequence = null;
     state.transcriptQuery = "";
     elements.transcriptSearch.value = "";
     elements.clearTranscriptSearch.classList.add("hidden");
@@ -307,7 +373,9 @@ function renderConversation() {
   elements.empty.classList.add("hidden");
   elements.conversation.classList.remove("hidden");
   elements.provider.textContent = summary.provider;
-  elements.title.textContent = oneLine(summary.title || summary.preview || summary.external_id);
+  const title = oneLine(summary.title || summary.preview || summary.external_id);
+  elements.title.textContent = title;
+  elements.titleTooltip.textContent = title;
   elements.subtitle.textContent = detail.relative_path;
   elements.subtitle.title = detail.relative_path;
   elements.metadata.replaceChildren();
@@ -322,6 +390,7 @@ function renderConversation() {
   updateDetailsButton();
   renderEvents();
   elements.content.scrollTo({ top: 0 });
+  window.requestAnimationFrame(updateTitleOverflow);
 }
 
 function updateDetailsButton() {
@@ -605,6 +674,79 @@ function startsMarkdownBlock(line) {
   return /^(```|#{1,6}\s|>\s?|[-*+]\s+|\d+\.\s+| {0,3}([-*_])(?:\s*\2){2,}\s*$)/.test(line);
 }
 
+function markdownTableCells(line) {
+  let value = line.trim();
+  if (value.startsWith("|")) value = value.slice(1);
+  if (value.endsWith("|")) value = value.slice(0, -1);
+  const cells = [];
+  let cell = "";
+  let code = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "`" && value[index - 1] !== "\\") code = !code;
+    if (character === "|" && value[index - 1] !== "\\" && !code) {
+      cells.push(cell.trim());
+      cell = "";
+    } else if (character === "|" && value[index - 1] === "\\") {
+      cell = `${cell.slice(0, -1)}|`;
+    } else {
+      cell += character;
+    }
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function markdownTableAlignment(value) {
+  const cell = value.trim();
+  if (!/^:?-{3,}:?$/.test(cell)) return null;
+  if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+  if (cell.endsWith(":")) return "right";
+  return "left";
+}
+
+function markdownTableStart(lines, index) {
+  if (index + 1 >= lines.length || !lines[index].includes("|")) return false;
+  const headings = markdownTableCells(lines[index]);
+  const dividers = markdownTableCells(lines[index + 1]);
+  return headings.length > 1
+    && headings.length === dividers.length
+    && dividers.every((cell) => markdownTableAlignment(cell));
+}
+
+function renderMarkdownTable(lines, start) {
+  const headings = markdownTableCells(lines[start]);
+  const alignments = markdownTableCells(lines[start + 1]).map(markdownTableAlignment);
+  const wrapper = node("div", "markdown-table-wrap");
+  const table = node("table", "markdown-table");
+  const head = node("thead");
+  const headingRow = node("tr");
+  for (const [index, value] of headings.entries()) {
+    const heading = node("th", `align-${alignments[index]}`);
+    appendInlineMarkdown(heading, value);
+    headingRow.append(heading);
+  }
+  head.append(headingRow);
+  table.append(head);
+
+  const body = node("tbody");
+  let index = start + 2;
+  while (index < lines.length && lines[index].trim() && lines[index].includes("|")) {
+    const values = markdownTableCells(lines[index]);
+    const row = node("tr");
+    for (let cellIndex = 0; cellIndex < headings.length; cellIndex += 1) {
+      const cell = node("td", `align-${alignments[cellIndex]}`);
+      appendInlineMarkdown(cell, values[cellIndex] || "");
+      row.append(cell);
+    }
+    body.append(row);
+    index += 1;
+  }
+  table.append(body);
+  wrapper.append(table);
+  return { element: wrapper, nextIndex: index };
+}
+
 function renderMarkdown(value) {
   const root = node("div", "message-text markdown");
   const lines = value.replace(/\r\n?/g, "\n").split("\n");
@@ -612,6 +754,13 @@ function renderMarkdown(value) {
     const line = lines[index];
     if (!line.trim()) {
       index += 1;
+      continue;
+    }
+
+    if (markdownTableStart(lines, index)) {
+      const table = renderMarkdownTable(lines, index);
+      root.append(table.element);
+      index = table.nextIndex;
       continue;
     }
 
@@ -678,12 +827,20 @@ function renderMarkdown(value) {
 
     const paragraphLines = [line];
     index += 1;
-    while (index < lines.length && lines[index].trim() && !startsMarkdownBlock(lines[index])) {
+    while (
+      index < lines.length
+      && lines[index].trim()
+      && !startsMarkdownBlock(lines[index])
+      && !markdownTableStart(lines, index)
+    ) {
       paragraphLines.push(lines[index]);
       index += 1;
     }
     const paragraph = node("p");
-    appendInlineMarkdown(paragraph, paragraphLines.join("\n"));
+    for (const [lineIndex, paragraphLine] of paragraphLines.entries()) {
+      appendInlineMarkdown(paragraph, paragraphLine);
+      if (lineIndex < paragraphLines.length - 1) paragraph.append(node("br"));
+    }
     root.append(paragraph);
   }
   return root;
@@ -816,6 +973,7 @@ function renderEvent(entry) {
   const searchClass = state.transcriptQuery.trim() ? " search-match" : "";
   const wrapper = node("section", `event ${role}${toolClass}${searchClass}`);
   wrapper.tabIndex = -1;
+  wrapper.dataset.sequence = String(event.sequence);
   wrapper.append(node("span", "event-marker", eventMarker(role)));
 
   const heading = node("div", "event-heading");
@@ -974,6 +1132,81 @@ function moveSession(delta) {
   if (next !== current) openConversation(state.conversations[next].id);
 }
 
+function humanMessageElements() {
+  const seen = new Set();
+  return [...elements.transcript.querySelectorAll(".event.user")].filter((event) => {
+    if (seen.has(event.dataset.sequence)) return false;
+    seen.add(event.dataset.sequence);
+    return true;
+  });
+}
+
+function humanTargetIndex(messages, delta) {
+  const cursorIndex = messages.findIndex(
+    (message) => Number(message.dataset.sequence) === state.humanCursorSequence,
+  );
+  const navigationTop = document.querySelector(".conversation-header").getBoundingClientRect().bottom;
+  const navigationBottom = elements.content.getBoundingClientRect().bottom;
+  if (cursorIndex >= 0) {
+    const cursorBounds = messages[cursorIndex].getBoundingClientRect();
+    if (cursorBounds.bottom > navigationTop && cursorBounds.top < navigationBottom) {
+      return cursorIndex + delta;
+    }
+  }
+  state.humanCursorSequence = null;
+  if (delta > 0) {
+    const next = messages.findIndex(
+      (message) => message.getBoundingClientRect().top >= navigationTop - 1,
+    );
+    return next >= 0 ? next : messages.length;
+  }
+  return messages.findLastIndex(
+    (message) => message.getBoundingClientRect().top < navigationTop - 1,
+  );
+}
+
+async function moveHumanMessage(delta) {
+  if (!state.activeConversation) return;
+  let viewChanged = false;
+  if (!["all", "chat"].includes(state.transcriptFilter) || state.detailsExpanded) {
+    state.transcriptFilter = "chat";
+    state.detailsExpanded = false;
+    updateDetailsButton();
+    viewChanged = true;
+  }
+  if (state.transcriptQuery) {
+    state.transcriptQuery = "";
+    elements.transcriptSearch.value = "";
+    viewChanged = true;
+  }
+  if (viewChanged) renderEvents();
+
+  let messages = humanMessageElements();
+  let targetIndex = humanTargetIndex(messages, delta);
+  while (
+    delta > 0
+    && targetIndex >= messages.length
+    && state.activeConversation.events.length < state.activeConversation.summary.event_count
+  ) {
+    const loaded = state.activeConversation.events.length;
+    await loadMoreEvents();
+    if (state.activeConversation.events.length === loaded) break;
+    messages = humanMessageElements();
+    targetIndex = humanTargetIndex(messages, delta);
+  }
+
+  const target = messages[targetIndex];
+  if (!target) {
+    elements.footerStatus.textContent = delta > 0
+      ? "Last loaded human message"
+      : "First human message";
+    return;
+  }
+  state.humanCursorSequence = Number(target.dataset.sequence);
+  target.focus({ preventScroll: true });
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
 function isTypingTarget(target) {
   return target instanceof HTMLInputElement
     || target instanceof HTMLSelectElement
@@ -1057,6 +1290,7 @@ async function reloadArchive() {
 }
 
 elements.location.addEventListener("change", () => loadConversations({ keepSelection: true }).catch(handleError));
+elements.order.addEventListener("change", () => loadConversations({ keepSelection: true }).catch(handleError));
 elements.search.addEventListener("input", () => {
   window.clearTimeout(state.searchTimer);
   elements.clearSearch.classList.toggle("hidden", !elements.search.value);
@@ -1073,6 +1307,8 @@ elements.clearSearch.addEventListener("click", () => {
   elements.search.focus();
 });
 elements.loadMore.addEventListener("click", () => loadConversations({ append: true }).catch(handleError));
+elements.previousHuman.addEventListener("click", () => moveHumanMessage(-1));
+elements.nextHuman.addEventListener("click", () => moveHumanMessage(1));
 elements.transcriptSearch.addEventListener("input", () => {
   state.transcriptQuery = elements.transcriptSearch.value;
   renderEvents();
@@ -1087,6 +1323,7 @@ for (const button of elements.filterButtons) {
   button.addEventListener("click", () => setTranscriptFilter(button.dataset.transcriptFilter));
 }
 elements.toggleDetails.addEventListener("click", toggleAllDetails);
+elements.toggleWidth.addEventListener("click", () => setFitWidth(!state.fitWidth, { persist: true }));
 elements.copyLink.addEventListener("click", copyConversationLink);
 elements.reload.addEventListener("click", () => reloadArchive().catch(handleError));
 document.querySelector("#footer-details").addEventListener("click", toggleAllDetails);
@@ -1094,6 +1331,10 @@ elements.sessionsButton.addEventListener("click", toggleSidebar);
 document.querySelector("#footer-sessions").addEventListener("click", toggleSidebar);
 elements.sidebarScrim.addEventListener("click", () => setSidebar(false));
 document.querySelector("#scroll-top").addEventListener("click", () => elements.content.scrollTo({ top: 0 }));
+window.addEventListener("resize", updateTitleOverflow);
+if (typeof ResizeObserver !== "undefined") {
+  new ResizeObserver(updateTitleOverflow).observe(elements.titleWrap);
+}
 
 document.addEventListener("keydown", (event) => {
   if (event.ctrlKey && event.key.toLowerCase() === "o") {
@@ -1106,6 +1347,12 @@ document.addEventListener("keydown", (event) => {
     setSidebar(false);
     elements.search.blur();
     elements.transcriptSearch.blur();
+  } else if (!isTypingTarget(event.target) && event.altKey && event.key === "ArrowUp") {
+    event.preventDefault();
+    moveHumanMessage(-1);
+  } else if (!isTypingTarget(event.target) && event.altKey && event.key === "ArrowDown") {
+    event.preventDefault();
+    moveHumanMessage(1);
   } else if (!isTypingTarget(event.target) && ["1", "2", "3", "4"].includes(event.key)) {
     event.preventDefault();
     setTranscriptFilter({ 1: "all", 2: "chat", 3: "tools", 4: "reasoning" }[event.key]);
@@ -1133,6 +1380,7 @@ function handleError(error) {
 }
 
 async function start() {
+  loadWidthPreference();
   try {
     await loadLocations();
     await loadConversations();

@@ -222,11 +222,38 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 .hidden { display: none !important; }
 
 .conversation { width: min(980px, calc(100% - 48px)); margin: 0 auto; padding-bottom: 100px; }
+.conversation.fit-width { width: calc(100% - 48px); }
 .conversation-header { position: sticky; top: 0; z-index: 5; padding: 23px 0 14px; border-bottom: 1px solid var(--line); background: linear-gradient(#090b0df7 88%, #090b0dcc); backdrop-filter: blur(10px); }
 .prompt-line { margin-bottom: 7px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .11em; }
 .prompt { color: var(--accent); font-weight: 700; }
 .conversation-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
-.conversation-title-row h1 { margin: 0; font-size: 20px; line-height: 1.35; letter-spacing: -.02em; }
+.conversation-title-copy { position: relative; min-width: 0; flex: 1; }
+.conversation-title-row h1 { overflow: hidden; width: 100%; margin: 0; font-size: 20px; line-height: 1.35; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-title-copy.is-truncated h1 { cursor: help; }
+.conversation-title-copy.is-truncated h1:focus-visible { outline: 1px solid var(--accent); outline-offset: 3px; }
+.title-tooltip {
+  position: absolute;
+  z-index: 20;
+  top: 31px;
+  left: 0;
+  visibility: hidden;
+  width: max-content;
+  max-width: min(640px, calc(100vw - 48px));
+  padding: 6px 9px;
+  border: 1px solid #3b4247;
+  border-radius: 4px;
+  opacity: 0;
+  color: var(--text);
+  background: #171b1ef7;
+  box-shadow: 0 8px 24px #000a;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  transition: opacity .12s ease, visibility .12s ease;
+}
+.conversation-title-copy.is-truncated:hover .title-tooltip,
+.conversation-title-copy.is-truncated:focus-within .title-tooltip { visibility: visible; opacity: 1; }
 .conversation-title-row p { overflow: hidden; max-width: 660px; margin: 5px 0 0; color: var(--dim); font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
 .conversation-actions { display: flex; flex: none; align-items: center; gap: 7px; }
 
@@ -301,6 +328,31 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
   letter-spacing: .06em;
 }
 .transcript-load-more:hover { border-color: #865b3b; background: var(--accent-soft); }
+.human-nav {
+  position: fixed;
+  z-index: 8;
+  top: 50%;
+  right: 13px;
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #0e1114e8;
+  box-shadow: 0 6px 18px #0008;
+  transform: translateY(-50%);
+  backdrop-filter: blur(6px);
+}
+.human-nav button {
+  width: 31px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 15px;
+}
+.human-nav button + button { border-top: 1px solid var(--line); }
+.human-nav button:hover { color: var(--accent); background: var(--accent-soft); }
 .event { position: relative; margin: 0 0 22px; padding-left: 30px; }
 .event::before { content: ""; position: absolute; left: 7px; top: 24px; bottom: -25px; width: 1px; background: var(--line-soft); }
 .event:last-child::before { display: none; }
@@ -359,7 +411,7 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
-.markdown p { margin: 0 0 12px; white-space: pre-wrap; }
+.markdown p { margin: 0 0 12px; white-space: normal; overflow-wrap: anywhere; }
 .markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin: 20px 0 8px; color: #eee9f4; line-height: 1.3; }
 .markdown h1 { font-size: 18px; }
 .markdown h2 { font-size: 16px; }
@@ -372,6 +424,14 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 .markdown strong { color: #f1ede5; }
 .markdown .inline-code { padding: 1px 4px; border: 1px solid #34393d; border-radius: 3px; color: #e2c391; background: #15191c; }
 .markdown hr { height: 1px; margin: 18px 0; border: 0; background: var(--line); }
+.markdown-table-wrap { overflow-x: auto; max-width: 100%; margin: 10px 0 14px; border: 1px solid #30363b; border-radius: 4px; }
+.markdown-table { width: 100%; min-width: 440px; border-collapse: collapse; background: #0d1012; font-size: 11px; white-space: normal; }
+.markdown-table th, .markdown-table td { padding: 7px 10px; border-right: 1px solid #282e34; border-bottom: 1px solid #282e34; overflow-wrap: anywhere; vertical-align: top; }
+.markdown-table th:last-child, .markdown-table td:last-child { border-right: 0; }
+.markdown-table tbody tr:last-child td { border-bottom: 0; }
+.markdown-table th { color: #eee9f4; background: #15191d; font-weight: 700; }
+.markdown-table .align-center { text-align: center; }
+.markdown-table .align-right { text-align: right; }
 .code-block { overflow: hidden; margin: 12px 0; border: 1px solid #30363b; border-radius: 4px; background: #0a0d0f; }
 .code-heading { display: flex; align-items: center; min-height: 29px; padding: 4px 9px; border-bottom: 1px solid #252b30; color: var(--muted); background: #111519; font-size: 8px; text-transform: uppercase; letter-spacing: .08em; }
 .code-heading .copy-button { margin-left: auto; }
@@ -427,13 +487,15 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
   .sidebar.open { transform: translateX(0); }
   .sidebar-scrim:not(.hidden) { position: fixed; z-index: 14; inset: 48px 0 36px; display: block; border: 0; background: #0009; backdrop-filter: blur(2px); }
   .conversation { width: calc(100% - 26px); }
+  .conversation.fit-width { width: calc(100% - 26px); }
   .conversation-title-row { display: block; }
-  .conversation-actions { margin-top: 13px; }
+  .conversation-actions { flex-wrap: wrap; margin-top: 13px; }
   .metadata-strip { gap: 7px 14px; }
   .transcript-search { order: 2; width: 100%; margin: 5px 0 0; }
   .control-hint { order: 3; width: 100%; margin: 3px 0 0; }
   .command-bar { padding-right: 6px; }
   .top-status { display: none; }
+  .human-nav { right: 5px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

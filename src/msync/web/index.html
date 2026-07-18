@@ -32,6 +32,16 @@
             <option value="">All locations</option>
           </select>
         </div>
+        <label class="field-label" for="order-select">ORDER BY</label>
+        <div class="select-wrap">
+          <select id="order-select" aria-label="Order sessions">
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+            <option value="messages">Most messages</option>
+            <option value="events">Most events</option>
+            <option value="title">Title A–Z</option>
+          </select>
+        </div>
         <div class="search-box">
           <span aria-hidden="true">/</span>
           <input id="search-input" type="search" placeholder="search sessions" autocomplete="off" aria-label="Search sessions">
@@ -55,11 +65,16 @@
           <header class="conversation-header">
             <div class="prompt-line"><span class="prompt">›</span> <span id="conversation-provider">archive</span> / session</div>
             <div class="conversation-title-row">
-              <div>
+              <div class="conversation-title-copy" id="conversation-title-wrap">
                 <h1 id="conversation-title">Untitled conversation</h1>
+                <span class="title-tooltip" id="conversation-title-tooltip" role="tooltip"></span>
                 <p id="conversation-subtitle"></p>
               </div>
               <div class="conversation-actions">
+                <button class="terminal-button compact" id="toggle-width" type="button" title="Use full window width" aria-pressed="false">
+                  <span aria-hidden="true">↔</span>
+                  <span id="width-button-label">Fit width</span>
+                </button>
                 <button class="terminal-button compact" id="copy-link" type="button" title="Copy a link to this session">
                   <span aria-hidden="true">↗</span>
                   <span>Copy link</span>
@@ -87,6 +102,10 @@
             </div>
           </header>
           <div class="transcript" id="transcript" aria-live="polite"></div>
+          <nav class="human-nav" aria-label="Human message navigation">
+            <button id="previous-human" type="button" title="Previous human message (Alt+↑)" aria-label="Previous human message">↑</button>
+            <button id="next-human" type="button" title="Next human message (Alt+↓)" aria-label="Next human message">↓</button>
+          </nav>
         </article>
       </main>
     </div>

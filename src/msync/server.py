@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import HTMLResponse
@@ -178,12 +178,14 @@ def create_app(
     def conversations(
         location: Annotated[int | None, Query(ge=1)] = None,
         search: Annotated[str, Query(max_length=200)] = "",
+        order: Literal["newest", "oldest", "messages", "events", "title"] = "newest",
         limit: Annotated[int, Query(ge=1, le=500)] = 200,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> list[Any]:
         return archive.browse_conversations(
             location_id=location,
             search_text=search,
+            order_by=order,
             limit=limit,
             offset=offset,
         )

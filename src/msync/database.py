@@ -376,15 +376,18 @@ class Archive:
         *,
         location_id: int | None = None,
         search_text: str = "",
+        order_by: str = "newest",
         limit: int = 200,
         offset: int = 0,
     ) -> list[ConversationSummary]:
-        """Return recent conversations, optionally filtered by location and text."""
+        """Return ordered conversations, optionally filtered by location and text."""
 
         if limit < 1 or limit > 500:
             raise ValueError("Conversation limit must be between 1 and 500.")
         if offset < 0:
             raise ValueError("Conversation offset must not be negative.")
+        if order_by not in {"newest", "oldest", "messages", "events", "title"}:
+            raise ValueError(f"Unsupported conversation order: {order_by}.")
 
         event_stats = (
             select(
@@ -457,14 +460,30 @@ class Archive:
                     matching_event,
                 )
             )
-        statement = (
-            statement.order_by(
-                func.coalesce(ConversationRow.ended_at, ConversationRow.started_at).desc(),
+        activity_time = func.coalesce(ConversationRow.ended_at, ConversationRow.started_at)
+        order_columns = {
+            "newest": (activity_time.desc(), ConversationRow.id.desc()),
+            "oldest": (
+                case((activity_time.is_(None), 1), else_=0),
+                activity_time.asc(),
+                ConversationRow.id.asc(),
+            ),
+            "messages": (
+                func.coalesce(event_stats.c.message_count, 0).desc(),
+                activity_time.desc(),
                 ConversationRow.id.desc(),
-            )
-            .limit(limit)
-            .offset(offset)
-        )
+            ),
+            "events": (
+                func.coalesce(event_stats.c.event_count, 0).desc(),
+                activity_time.desc(),
+                ConversationRow.id.desc(),
+            ),
+            "title": (
+                func.lower(func.coalesce(ConversationRow.title, ConversationRow.external_id)).asc(),
+                ConversationRow.id.desc(),
+            ),
+        }
+        statement = statement.order_by(*order_columns[order_by]).limit(limit).offset(offset)
         with Session(self.engine) as session:
             return [ConversationSummary(*row) for row in session.execute(statement)]
 

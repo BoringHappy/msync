@@ -195,12 +195,15 @@ $ MSYNC_SERVER_PASSWORD='choose-a-strong-password' msync server
 Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a terminal-inspired
 Claude/Codex layout with a location picker, session search, chronological message rendering, and
 lossless event inspection. Tool calls and results share compact activity cards, while assistant
-messages render common Markdown and fenced code blocks without accepting embedded HTML. Use the
+messages render common Markdown, GitHub-style tables, and fenced code blocks without accepting
+embedded HTML. Order the session list by time, activity, or title. Long conversation titles stay
+on one line and expose their full value on hover or keyboard focus. Use the
 **Activity**, **Chat**, **Tools**, and **Reasoning** filters (or keys 1–4), navigate messages with
-J/K and sessions with `[`/`]`, or find text within the currently loaded events from its toolbar.
-Large session lists and long transcripts load incrementally. The header refreshes archive contents,
-**Copy link** creates a deep link to the active session, and the mobile session drawer closes by
-tapping outside it.
+J/K and sessions with `[`/`]`, or jump between human messages with the floating arrows (Alt+↑/↓).
+Find text within the currently loaded events from the toolbar. **Fit width** switches between the
+focused reading column and the full window and remembers the selection. Large session lists and
+long transcripts load incrementally. The header refreshes archive contents, **Copy link** creates a
+deep link to the active session, and the mobile session drawer closes by tapping outside it.
 Select **Raw events** (or press Ctrl+O) to inspect every native record and its source JSON.
 
 If startup detects an old schema, it asks whether to upgrade the database. Answer `y` to run the

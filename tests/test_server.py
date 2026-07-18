@@ -171,6 +171,9 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
         selected_location = client.get("/api/conversations", params={"location": location_id})
         first_page = client.get("/api/conversations", params={"limit": 1, "offset": 0})
         second_page = client.get("/api/conversations", params={"limit": 1, "offset": 1})
+        oldest = client.get("/api/conversations", params={"order": "oldest"})
+        by_title = client.get("/api/conversations", params={"order": "title"})
+        invalid_order = client.get("/api/conversations", params={"order": "random"})
 
     assert locations.status_code == 200
     assert len(locations.json()) == 2
@@ -184,6 +187,19 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
     assert len(first_page.json()) == 1
     assert len(second_page.json()) == 1
     assert first_page.json()[0]["id"] != second_page.json()[0]["id"]
+    assert [item["external_id"] for item in all_conversations.json()] == [
+        "second-session",
+        "first-session",
+    ]
+    assert [item["external_id"] for item in oldest.json()] == [
+        "first-session",
+        "second-session",
+    ]
+    assert [item["external_id"] for item in by_title.json()] == [
+        "first-session",
+        "second-session",
+    ]
+    assert invalid_order.status_code == 422
 
 
 def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) -> None:
@@ -238,11 +254,20 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "reloadArchive" in script.text
     assert "copyConversationLink" in script.text
     assert "setSidebar" in script.text
+    assert "updateTitleOverflow" in script.text
+    assert "setFitWidth" in script.text
+    assert "moveHumanMessage" in script.text
+    assert "renderMarkdownTable" in script.text
     assert 'data-transcript-filter="tools"' in page.text
     assert 'id="load-more"' in page.text
     assert 'id="copy-link"' in page.text
     assert 'id="transcript-search"' in page.text
     assert 'id="sidebar-scrim"' in page.text
+    assert 'id="order-select"' in page.text
+    assert 'id="toggle-width"' in page.text
+    assert 'id="conversation-title-tooltip"' in page.text
+    assert 'id="previous-human"' in page.text
+    assert 'id="next-human"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
@@ -250,6 +275,10 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert ".transcript-search" in styles.text
     assert ".transcript-load-more" in styles.text
     assert ".sidebar-scrim:not(.hidden)" in styles.text
+    assert ".conversation.fit-width" in styles.text
+    assert ".title-tooltip" in styles.text
+    assert ".human-nav" in styles.text
+    assert ".markdown-table" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
 
