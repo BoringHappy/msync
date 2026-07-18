@@ -59,7 +59,7 @@ def test_upload_requires_url(tmp_path: Path) -> None:
         app,
         ["upload", "--dir", str(root)],
         env={
-            "MSYNC_UPLOAD_URL": "",
+            "MSYNC_ENDPOINT": "",
             "MSYNC_TOKEN": "",
         },
     )
@@ -332,7 +332,7 @@ def test_upload_sends_only_selected_transcript_with_environment_credentials(
             "codex",
         ],
         env={
-            "MSYNC_UPLOAD_URL": "https://history.example",
+            "MSYNC_ENDPOINT": "https://history.example",
             "MSYNC_TOKEN": "env-token",
         },
     )

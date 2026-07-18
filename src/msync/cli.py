@@ -78,9 +78,9 @@ def upload(
     url: Annotated[
         str,
         typer.Option(
-            envvar="MSYNC_UPLOAD_URL",
+            envvar="MSYNC_ENDPOINT",
             help=(
-                "Base URL of an msync server that accepts remote uploads (or set MSYNC_UPLOAD_URL)."
+                "Base URL of an msync server that accepts remote uploads (or set MSYNC_ENDPOINT)."
             ),
         ),
     ],

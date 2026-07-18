@@ -110,7 +110,7 @@ PostgreSQL runs on the Docker host, use `host.docker.internal` as its hostname.
 ### 2. Upload history from a client
 
 ```console
-$ export MSYNC_UPLOAD_URL='https://history.example.com'
+$ export MSYNC_ENDPOINT='https://history.example.com'
 $ export MSYNC_TOKEN='alice-token'
 $ msync upload --dir ~/.claude
 $ msync upload --dir ~/.codex
@@ -136,7 +136,7 @@ ignore repeated events.
 Set these variables in the environment that launches your client:
 
 ```console
-$ export MSYNC_UPLOAD_URL='https://history.example.com'
+$ export MSYNC_ENDPOINT='https://history.example.com'
 $ export MSYNC_TOKEN='alice-token'
 ```
 
