@@ -828,7 +828,8 @@ def test_sync_rejects_an_explicit_provider_that_conflicts_with_the_destination(
     )
 
     assert result.exit_code == 1
-    assert "contains claude history, not the requested codex provider" in result.output
+    normalized_output = " ".join(result.output.split())
+    assert "contains claude history, not the requested codex provider" in normalized_output
     assert not (root / "sessions").exists()
 
 
