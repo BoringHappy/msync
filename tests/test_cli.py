@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -12,11 +14,17 @@ from typer.testing import CliRunner
 
 from msync.cli import app
 from msync.database import Archive
+from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata
 
 
-def _write_codex_transcript(root: Path, *, session_id: str = "cli-session") -> Path:
-    transcript = root / "sessions/rollout.jsonl"
-    transcript.parent.mkdir(parents=True)
+def _write_codex_transcript(
+    root: Path,
+    *,
+    session_id: str = "cli-session",
+    filename: str = "rollout.jsonl",
+) -> Path:
+    transcript = root / "sessions" / filename
+    transcript.parent.mkdir(parents=True, exist_ok=True)
     transcript.write_text(
         json.dumps(
             {
@@ -145,16 +153,28 @@ def test_upload_sends_native_transcripts_to_remote_server(
 ) -> None:
     root = tmp_path / ".codex-remote"
     transcript = _write_codex_transcript(root, session_id="remote-session")
-    captured: dict[str, Any] = {}
+    second_transcript = _write_codex_transcript(
+        root,
+        session_id="second-remote-session",
+        filename="second.jsonl",
+    )
+    captured: list[dict[str, Any]] = []
 
     def fake_post(
         url: str,
         *,
         headers: dict[str, str],
-        json: dict[str, Any],
-        timeout: int,
+        content: Iterator[bytes],
+        timeout: httpx.Timeout,
     ) -> httpx.Response:
-        captured.update(url=url, headers=headers, json=json, timeout=timeout)
+        captured.append(
+            {
+                "url": url,
+                "headers": headers,
+                "body": b"".join(content),
+                "timeout": timeout,
+            }
+        )
         return httpx.Response(
             200,
             json={
@@ -191,16 +211,31 @@ def test_upload_sends_native_transcripts_to_remote_server(
     assert "Server" in result.output
     assert "https://history.example/msync" in result.output
     assert "alice-token" not in result.output
-    assert captured["url"] == "https://history.example/msync/api/upload"
-    assert captured["headers"] == {"Authorization": "Bearer alice-token"}
-    assert captured["timeout"] == 120
-    payload = captured["json"]
-    assert payload["provider"] == "codex"
-    assert payload["hostname"] == "alice-laptop"
-    assert payload["root_path"] == str(root.resolve())
-    assert payload["transcripts"][0]["relative_path"] == "sessions/rollout.jsonl"
-    assert payload["transcripts"][0]["content_base64"]
-    assert transcript.read_bytes()
+    assert re.search(r"Transcripts\s+2", result.output)
+    assert len(captured) == 2
+    expected_paths = ["sessions/rollout.jsonl", "sessions/second.jsonl"]
+    expected_content = [transcript.read_bytes(), second_transcript.read_bytes()]
+    for request, relative_path, transcript_content in zip(
+        captured,
+        expected_paths,
+        expected_content,
+        strict=True,
+    ):
+        assert request["url"] == "https://history.example/msync/api/upload"
+        assert request["headers"]["Authorization"] == "Bearer alice-token"
+        assert request["headers"]["Content-Type"] == UPLOAD_CONTENT_TYPE
+        assert int(request["headers"]["Content-Length"]) == len(request["body"])
+        assert request["timeout"].read is None
+        assert request["timeout"].write is None
+        metadata_length = int.from_bytes(request["body"][:4], byteorder="big")
+        metadata = RemoteUploadMetadata.model_validate_json(
+            request["body"][4 : 4 + metadata_length]
+        )
+        assert metadata.provider == "codex"
+        assert metadata.hostname == "alice-laptop"
+        assert metadata.root_path == str(root.resolve())
+        assert metadata.relative_path == relative_path
+        assert request["body"][4 + metadata_length :] == transcript_content
 
 
 @pytest.mark.parametrize(
@@ -233,6 +268,36 @@ def test_upload_rejects_conflicting_remote_options(
 
     assert result.exit_code == 1
     assert message in result.output
+
+
+def test_upload_rejects_oversized_transcript_before_network_access(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    transcript = _write_codex_transcript(root)
+    monkeypatch.setattr("msync.cli.UPLOAD_TRANSCRIPT_MAX_BYTES", transcript.stat().st_size - 1)
+
+    def unexpected_post(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("oversized transcript reached the network")
+
+    monkeypatch.setattr("msync.cli.httpx.post", unexpected_post)
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Transcript exceeds the 256 MiB remote upload limit" in result.output
 
 
 def test_upgrade_command_migrates_archive_and_reports_steps(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@
 Keep your AI conversations, context, and decisions in sync. `msync` archives local
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex JSONL transcripts in one
 database, then can generate native histories that both clients recognize and resume. SQLAlchemy
-provides SQLite, PostgreSQL, and MySQL persistence through the same schema and sync flow.
+provides SQLite and PostgreSQL persistence through the same schema and sync flow.
 
 ## Install
 
@@ -24,12 +24,6 @@ To make the command available outside the checkout:
 
 ```console
 $ uv tool install .
-```
-
-SQLite and PostgreSQL support are included. Install the driver extra to use MySQL:
-
-```console
-$ uv tool install '.[mysql]'
 ```
 
 Python 3.14 or newer is required.
@@ -65,17 +59,16 @@ custom layout is ambiguous, and the database can be overridden for testing or ba
 $ msync upload --dir /mnt/history --provider codex --database ./history.sqlite
 ```
 
-`--database` also accepts a SQLAlchemy URL. Common PostgreSQL and MySQL URLs automatically select
-Psycopg (included by default) and the optional PyMySQL driver:
+`--database` also accepts a SQLAlchemy URL. PostgreSQL URLs automatically select Psycopg, which is
+included by default:
 
 ```console
 $ msync upload --dir ~/.codex --database 'postgresql://msync:secret@localhost/msync'
-$ msync upload --dir ~/.claude --database 'mysql://msync:secret@localhost/msync'
 ```
 
-An explicitly selected SQLAlchemy driver works too, such as `postgresql+psycopg://...` or
-`mysql+pymysql://...`. Passwords are masked in command output. The target database must already
-exist; `msync` creates and versions its tables automatically.
+An explicitly selected SQLAlchemy driver works too, such as `postgresql+psycopg://...`. Passwords
+are masked in command output. The target database must already exist; `msync` creates and versions
+its tables automatically. Other database backends, including MySQL, are rejected.
 
 To upload through a running msync server instead of connecting directly to its database, pass the
 server's base URL and an account upload token:
@@ -86,10 +79,12 @@ $ msync upload --dir ~/.codex --url https://history.example.com --token "$MSYNC_
 
 `MSYNC_UPLOAD_TOKEN` can supply the token without putting it in shell history. `--url` and
 `--database` are mutually exclusive. The client detects and reads native transcripts locally,
-sends their byte-exact contents over the authenticated API, and records the client's hostname and
-source path on the server. Remote uploads have the same hash-based update, duplicate, and schema
-checks as direct database uploads. Treat an upload token like a password and use HTTPS whenever the
-server is reached over a network.
+streams their byte-exact contents one file at a time over the authenticated API, and records the
+client's hostname and source path on the server. A history directory has no aggregate upload limit;
+each individual transcript is capped at 256 MiB. The server rejects oversized request bodies before
+parsing them and spools accepted network bodies to disk before archive processing. Remote uploads
+have the same hash-based update, duplicate, and schema checks as direct database uploads. Treat an
+upload token like a password and use HTTPS whenever the server is reached over a network.
 
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
@@ -153,9 +148,9 @@ $ msync sync --dir /mnt/merged-claude --provider claude
 $ msync sync --dir /mnt/a --dir /mnt/b --provider claude --provider codex
 ```
 
-`sync` uses the same `--database` option as the other commands, including PostgreSQL and MySQL
-URLs. This also makes it possible to generate a new native history location from conversations
-that were uploaded earlier:
+`sync` uses the same `--database` option as the other commands, including PostgreSQL URLs. This also
+makes it possible to generate a new native history location from conversations that were uploaded
+earlier:
 
 ```console
 $ msync sync --dir /mnt/merged-codex --provider codex --database ./history.sqlite
@@ -280,11 +275,9 @@ source. Schema upgrades can therefore rebuild normalized events from the byte-ex
 schema v6 does this once to distinguish human messages from tool content in existing archives.
 Foreign keys record the location of the retained copy. Identical logical revisions found in
 another provider or location are skipped; different revisions remain distinct when they exist as
-separate source transcripts. Full-length text and binary column variants keep large events and
-transcripts safe on MySQL, while SHA-256 hostname/path identities avoid backend-specific
-index-length limits.
-PostgreSQL/MySQL full-text indexes can be added as search adapters without changing the portable
-archive records.
+separate source transcripts. SHA-256 hostname/path identities keep portable indexes compact.
+PostgreSQL full-text indexes can be added as a search adapter without changing the portable archive
+records.
 
 ## Provider architecture
 

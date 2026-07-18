@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import base64
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,19 @@ from typer.testing import CliRunner
 from msync.cli import app
 from msync.database import Archive
 from msync.providers import get_provider
+from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata, encode_upload_prefix
 from msync.server import ServerAccount, create_app, parse_server_accounts
+
+
+def _remote_upload_body(metadata: dict[str, Any], content: bytes) -> bytes:
+    return encode_upload_prefix(RemoteUploadMetadata.model_validate(metadata)) + content
+
+
+def _upload_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": UPLOAD_CONTENT_TYPE,
+    }
 
 
 def _archive_codex_conversation(
@@ -209,42 +221,42 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
         )
         + "\n"
     ).encode()
-    payload = {
+    metadata = {
         "version": 1,
         "provider": "codex",
         "hostname": "shared-hostname",
         "root_path": "/home/client/.codex",
         "display_name": ".codex",
-        "transcripts": [
-            {
-                "relative_path": "sessions/shared.jsonl",
-                "content_base64": base64.b64encode(content).decode(),
-                "source_mtime_ns": 123,
-            }
-        ],
+        "relative_path": "sessions/shared.jsonl",
+        "source_mtime_ns": 123,
     }
+    body = _remote_upload_body(metadata, content)
 
     with TestClient(web_app) as client:
-        no_token = client.post("/api/upload", json=payload)
+        no_token = client.post(
+            "/api/upload",
+            content=body,
+            headers={"Content-Type": UPLOAD_CONTENT_TYPE},
+        )
         bob_upload = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer bob-token"},
+            content=body,
+            headers=_upload_headers("bob-token"),
         )
         alice_upload = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer alice-token"},
+            content=body,
+            headers=_upload_headers("alice-token"),
         )
         carol_upload = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer carol-token"},
+            content=body,
+            headers=_upload_headers("carol-token"),
         )
         repeated_alice_upload = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer alice-token"},
+            content=body,
+            headers=_upload_headers("alice-token"),
         )
 
         alice_locations = client.get("/api/locations", auth=("alice", "alice-password"))
@@ -294,28 +306,54 @@ def test_remote_upload_rejects_paths_outside_the_source_root(tmp_path: Path) -> 
         tmp_path / "archive.sqlite",
         accounts=(ServerAccount("alice", "password", "token"),),
     )
-    payload = {
+    metadata = {
         "provider": "codex",
         "hostname": "laptop",
         "root_path": "/home/alice/.codex",
         "display_name": ".codex",
-        "transcripts": [
-            {
-                "relative_path": "../escape.jsonl",
-                "content_base64": base64.b64encode(b"{}\n").decode(),
-            }
-        ],
+        "relative_path": "../escape.jsonl",
     }
 
     with TestClient(web_app) as client:
         response = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer token"},
+            content=_remote_upload_body(metadata, b"{}\n"),
+            headers=_upload_headers("token"),
         )
 
     assert response.status_code == 400
     assert "relative and contained" in response.json()["detail"]
+
+
+def test_remote_upload_rejects_oversized_bodies_before_parsing(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("msync.server.UPLOAD_BODY_MAX_BYTES", 32)
+    web_app = create_app(
+        tmp_path / "archive.sqlite",
+        accounts=(ServerAccount("alice", "password", "token"),),
+    )
+
+    def oversized_chunks() -> Iterator[bytes]:
+        yield b"x" * 20
+        yield b"x" * 20
+
+    with TestClient(web_app) as client:
+        declared_size = client.post(
+            "/api/upload",
+            content=b"x" * 33,
+            headers={"Content-Type": UPLOAD_CONTENT_TYPE},
+        )
+        streamed_size = client.post(
+            "/api/upload",
+            content=oversized_chunks(),
+            headers=_upload_headers("token"),
+        )
+
+    assert declared_size.status_code == 413
+    assert streamed_size.status_code == 413
+    assert "256 MiB" in declared_size.json()["detail"]
 
 
 def test_server_browses_and_filters_locations(tmp_path: Path) -> None:

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import secrets
+import tempfile
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -13,18 +12,28 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import (
     HTTPAuthorizationCredentials,
     HTTPBasic,
     HTTPBasicCredentials,
     HTTPBearer,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from msync.database import Archive, RemoteTranscript
 from msync.providers import get_provider
+from msync.remote import (
+    UPLOAD_BODY_MAX_BYTES,
+    UPLOAD_CONTENT_TYPE,
+    UPLOAD_METADATA_MAX_BYTES,
+    UPLOAD_STREAM_CHUNK_BYTES,
+    UPLOAD_TRANSCRIPT_MAX_BYTES,
+    RemoteUploadMetadata,
+)
 
 _BASIC_SECURITY = HTTPBasic(auto_error=False)
 _BasicCredentials = Annotated[HTTPBasicCredentials | None, Depends(_BASIC_SECURITY)]
@@ -44,23 +53,64 @@ class ServerAccount:
     token: str | None = None
 
 
-class TranscriptUploadRequest(BaseModel):
-    """One native transcript included in a remote upload."""
-
-    relative_path: str = Field(min_length=1, max_length=4096)
-    content_base64: str = Field(max_length=140_000_000)
-    source_mtime_ns: int = Field(default=0, ge=0)
+class _UploadBodyTooLarge(Exception):
+    """Stop reading an upload as soon as it crosses the request limit."""
 
 
-class UploadRequest(BaseModel):
-    """A provider location uploaded by one authenticated account."""
+class UploadBodyLimitMiddleware:
+    """Reject oversized upload bodies before FastAPI buffers or parses them."""
 
-    version: Literal[1] = 1
-    provider: str = Field(min_length=1, max_length=64)
-    hostname: str = Field(min_length=1, max_length=255)
-    root_path: str = Field(min_length=1, max_length=16_384)
-    display_name: str = Field(min_length=1, max_length=255)
-    transcripts: list[TranscriptUploadRequest] = Field(min_length=1, max_length=10_000)
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") != "/api/upload":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", ()))
+        raw_content_length = headers.get(b"content-length")
+        if raw_content_length is not None:
+            try:
+                content_length = int(raw_content_length)
+            except ValueError:
+                content_length = 0
+            if content_length > self.max_body_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received = 0
+        response_started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    raise _UploadBodyTooLarge
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _UploadBodyTooLarge:
+            if response_started:
+                raise
+            await self._reject(scope, receive, send)
+
+    async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {"detail": "Upload request body exceeds the 256 MiB transcript limit."},
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        )
+        await response(scope, receive, send)
 
 
 class UploadResponse(BaseModel):
@@ -231,6 +281,7 @@ def create_app(
         openapi_url=None,
     )
     app.state.archive = archive
+    app.add_middleware(UploadBodyLimitMiddleware, max_body_bytes=UPLOAD_BODY_MAX_BYTES)
 
     @app.middleware("http")
     async def security_headers(request: Any, call_next: Any) -> Response:
@@ -288,41 +339,26 @@ def create_app(
         )
 
     @app.post("/api/upload", response_model=UploadResponse)
-    def upload(
-        request: UploadRequest,
+    async def upload(
+        request: Request,
         account: ServerAccount = Depends(require_upload_token),  # noqa: B008
     ) -> Any:
-        transcripts: list[RemoteTranscript] = []
-        total_bytes = 0
-        for item in request.transcripts:
-            try:
-                content = base64.b64decode(item.content_base64, validate=True)
-            except (binascii.Error, ValueError) as error:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid base64 transcript content for {item.relative_path!r}.",
-                ) from error
-            total_bytes += len(content)
-            if total_bytes > 256 * 1024 * 1024:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail="Upload payload exceeds the 256 MiB decoded transcript limit.",
-                )
-            transcripts.append(
-                RemoteTranscript(
-                    relative_path=item.relative_path,
-                    content=content,
-                    source_mtime_ns=item.source_mtime_ns,
-                )
-            )
+        metadata, content = await _read_upload_request(request)
         try:
-            return archive.upload_remote(
-                root_path=request.root_path,
-                display_name=request.display_name,
-                provider=get_provider(request.provider),
-                hostname=request.hostname,
+            return await run_in_threadpool(
+                archive.upload_remote,
+                root_path=metadata.root_path,
+                display_name=metadata.display_name,
+                provider=get_provider(metadata.provider),
+                hostname=metadata.hostname,
                 account_username=account.username,
-                transcripts=transcripts,
+                transcripts=[
+                    RemoteTranscript(
+                        relative_path=metadata.relative_path,
+                        content=content,
+                        source_mtime_ns=metadata.source_mtime_ns,
+                    )
+                ],
             )
         except ValueError as error:
             raise HTTPException(
@@ -349,6 +385,58 @@ def create_app(
         return result
 
     return app
+
+
+async def _read_upload_request(request: Request) -> tuple[RemoteUploadMetadata, bytes]:
+    content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+    if content_type.casefold() != UPLOAD_CONTENT_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Remote uploads require Content-Type: {UPLOAD_CONTENT_TYPE}.",
+        )
+
+    with tempfile.SpooledTemporaryFile(max_size=UPLOAD_STREAM_CHUNK_BYTES, mode="w+b") as body:
+        buffered = bytearray()
+        async for chunk in request.stream():
+            buffered.extend(chunk)
+            if len(buffered) >= UPLOAD_STREAM_CHUNK_BYTES:
+                await run_in_threadpool(body.write, bytes(buffered))
+                buffered.clear()
+        if buffered:
+            await run_in_threadpool(body.write, bytes(buffered))
+        body.seek(0)
+        prefix = body.read(4)
+        if len(prefix) != 4:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote upload body is missing its metadata length prefix.",
+            )
+        metadata_length = int.from_bytes(prefix, byteorder="big")
+        if metadata_length < 1 or metadata_length > UPLOAD_METADATA_MAX_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote upload metadata length is invalid.",
+            )
+        metadata_payload = body.read(metadata_length)
+        if len(metadata_payload) != metadata_length:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote upload metadata is truncated.",
+            )
+        try:
+            metadata = RemoteUploadMetadata.model_validate_json(metadata_payload)
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Remote upload metadata is invalid: {error}",
+            ) from error
+        content = await run_in_threadpool(body.read, UPLOAD_TRANSCRIPT_MAX_BYTES + 1)
+        if len(content) > UPLOAD_TRANSCRIPT_MAX_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Transcript exceeds the 256 MiB upload limit.",
+            )
+    return metadata, content
 
 
 def parse_server_accounts(value: str) -> tuple[ServerAccount, ...]:

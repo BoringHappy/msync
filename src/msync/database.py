@@ -221,7 +221,7 @@ class ConversationDetail:
 
 
 class Archive:
-    """A durable archive that supports SQLite, PostgreSQL, and MySQL."""
+    """A durable archive that supports SQLite and PostgreSQL."""
 
     def __init__(
         self,
@@ -418,7 +418,7 @@ class Archive:
 
         if limit < 1:
             raise ValueError("Sample limit must be greater than zero.")
-        random_order = func.rand() if self.engine.dialect.name == "mysql" else func.random()
+        random_order = func.random()
         statement = (
             select(
                 LocationRow.provider,
@@ -1328,12 +1328,7 @@ def _migrate_v6_to_v7(
     )
     actual_columns = tuple(actual_index.get("column_names") or ()) if actual_index else ()
     if actual_index is not None and actual_columns != desired_columns:
-        if connection.dialect.name == "mysql":
-            connection.exec_driver_sql(
-                "DROP INDEX conversations_logical_revision_uq ON conversations"
-            )
-        else:
-            connection.exec_driver_sql("DROP INDEX conversations_logical_revision_uq")
+        connection.exec_driver_sql("DROP INDEX conversations_logical_revision_uq")
         actual_index = None
     if actual_index is None:
         revision_index.create(connection)
@@ -1446,9 +1441,6 @@ def _configure_schema_lock_timeout(
 
     if dialect_name == "postgresql":
         connection.exec_driver_sql(f"SET LOCAL lock_timeout = '{timeout_seconds * 1000}ms'")
-    elif dialect_name == "mysql":
-        connection.exec_driver_sql(f"SET SESSION innodb_lock_wait_timeout = {timeout_seconds}")
-        connection.exec_driver_sql(f"SET SESSION lock_wait_timeout = {timeout_seconds}")
     elif dialect_name == "sqlite":
         connection.exec_driver_sql(f"PRAGMA busy_timeout = {timeout_seconds * 1000}")
 
@@ -1461,7 +1453,6 @@ def _is_lock_timeout(error: DBAPIError) -> bool:
             "database is locked",
             "database table is locked",
             "lock timeout",
-            "lock wait timeout",
         )
     )
 
@@ -1475,10 +1466,13 @@ def _normalize_database(database: str | Path) -> tuple[URL, Path | None]:
     url = make_url(raw)
     if url.drivername in {"postgres", "postgresql"}:
         url = url.set(drivername="postgresql+psycopg")
-    elif url.drivername == "mysql":
-        url = url.set(drivername="mysql+pymysql")
+    backend = url.get_backend_name()
+    if backend not in {"postgresql", "sqlite"}:
+        raise ValueError(
+            f"Unsupported database backend {backend!r}; use SQLite or PostgreSQL."
+        )
 
-    if url.get_backend_name() != "sqlite" or url.database in {None, "", ":memory:"}:
+    if backend != "sqlite" or url.database in {None, "", ":memory:"}:
         return url, None
     path = Path(url.database).expanduser().resolve()
     return url.set(database=str(path)), path

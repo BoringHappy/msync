@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 import socket
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -23,6 +22,13 @@ from msync.providers import (
     detect_provider,
     get_provider,
     provider_names,
+)
+from msync.remote import (
+    UPLOAD_CONTENT_TYPE,
+    UPLOAD_STREAM_CHUNK_BYTES,
+    UPLOAD_TRANSCRIPT_MAX_BYTES,
+    RemoteUploadMetadata,
+    encode_upload_prefix,
 )
 from msync.synchronization import SyncResult, sync_conversations, unmanaged_transcripts
 
@@ -561,30 +567,68 @@ def _remote_upload(
         )
 
     endpoint = f"{str(server_url).rstrip('/')}/api/upload"
-    request = {
-        "version": 1,
-        "provider": provider.name,
-        "hostname": hostname,
-        "root_path": str(root),
-        "display_name": root.name or str(root),
-        "transcripts": [
-            {
-                "relative_path": path.relative_to(root).as_posix(),
-                "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
-                "source_mtime_ns": path.stat().st_mtime_ns,
-            }
-            for path in transcripts
-        ],
-    }
-    try:
-        response = httpx.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {token}"},
-            json=request,
-            timeout=120,
+    aggregate: UploadResult | None = None
+    timeout = httpx.Timeout(connect=10, read=None, write=None, pool=10)
+    for path in transcripts:
+        stat = path.stat()
+        if stat.st_size > UPLOAD_TRANSCRIPT_MAX_BYTES:
+            raise ValueError(
+                f"Transcript exceeds the 256 MiB remote upload limit: {path}"
+            )
+        metadata = RemoteUploadMetadata(
+            provider=provider.name,
+            hostname=hostname,
+            root_path=str(root),
+            display_name=root.name or str(root),
+            relative_path=path.relative_to(root).as_posix(),
+            source_mtime_ns=stat.st_mtime_ns,
         )
-    except httpx.HTTPError as error:
-        raise RuntimeError(f"Could not reach msync server {server_url}: {error}") from error
+        prefix = encode_upload_prefix(metadata)
+        try:
+            response = httpx.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": UPLOAD_CONTENT_TYPE,
+                    "Content-Length": str(len(prefix) + stat.st_size),
+                },
+                content=_stream_remote_transcript(prefix, path),
+                timeout=timeout,
+            )
+        except httpx.HTTPError as error:
+            raise RuntimeError(f"Could not reach msync server {server_url}: {error}") from error
+        file_result = _remote_upload_response(response)
+        if aggregate is None:
+            aggregate = UploadResult(location_id=file_result.location_id)
+        elif aggregate.location_id != file_result.location_id:
+            raise RuntimeError("msync server changed location IDs during the upload.")
+        for field_name in (
+            "scanned",
+            "imported",
+            "updated",
+            "unchanged",
+            "duplicates",
+            "events",
+            "message_parts",
+        ):
+            setattr(
+                aggregate,
+                field_name,
+                getattr(aggregate, field_name) + getattr(file_result, field_name),
+            )
+    if aggregate is None:
+        raise RuntimeError("Remote upload requires at least one transcript.")
+    return aggregate, str(server_url).rstrip("/")
+
+
+def _stream_remote_transcript(prefix: bytes, path: Path) -> Iterator[bytes]:
+    yield prefix
+    with path.open("rb") as stream:
+        while chunk := stream.read(UPLOAD_STREAM_CHUNK_BYTES):
+            yield chunk
+
+
+def _remote_upload_response(response: httpx.Response) -> UploadResult:
     if response.is_error:
         try:
             detail = response.json().get("detail")
@@ -594,7 +638,7 @@ def _remote_upload(
         raise RuntimeError(f"msync server returned HTTP {response.status_code}: {message}")
     try:
         values = response.json()
-        result = UploadResult(
+        return UploadResult(
             location_id=int(values["location_id"]),
             scanned=int(values["scanned"]),
             imported=int(values["imported"]),
@@ -606,7 +650,6 @@ def _remote_upload(
         )
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError("msync server returned an invalid upload response.") from error
-    return result, str(server_url).rstrip("/")
 
 
 def _print_sync_result(

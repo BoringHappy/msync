@@ -17,12 +17,11 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 ID_TYPE = BigInteger().with_variant(Integer, "sqlite")
-LONG_TEXT = Text().with_variant(LONGTEXT(), "mysql")
-LONG_BINARY = LargeBinary().with_variant(LONGBLOB(), "mysql")
+LONG_TEXT = Text()
+LONG_BINARY = LargeBinary()
 
 
 class Base(DeclarativeBase):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -20,6 +19,7 @@ from msync import database as database_module
 from msync.cli import app
 from msync.database import Archive
 from msync.providers import get_provider
+from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata, encode_upload_prefix
 from msync.server import ServerAccount, create_app
 from msync.synchronization import MANIFEST_NAME
 from msync.tables import ConversationRow, LocationRow
@@ -266,29 +266,31 @@ def test_postgres_remote_uploads_are_isolated_by_account(postgres_url: str) -> N
         )
         + "\n"
     ).encode()
-    payload = {
-        "provider": "codex",
-        "hostname": "postgres-client",
-        "root_path": "/home/client/.codex",
-        "display_name": ".codex",
-        "transcripts": [
-            {
-                "relative_path": "sessions/tenant.jsonl",
-                "content_base64": base64.b64encode(content).decode(),
-            }
-        ],
-    }
+    metadata = RemoteUploadMetadata(
+        provider="codex",
+        hostname="postgres-client",
+        root_path="/home/client/.codex",
+        display_name=".codex",
+        relative_path="sessions/tenant.jsonl",
+    )
+    body = encode_upload_prefix(metadata) + content
 
     with TestClient(web_app) as client:
         alice_upload = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer alice-token"},
+            content=body,
+            headers={
+                "Authorization": "Bearer alice-token",
+                "Content-Type": UPLOAD_CONTENT_TYPE,
+            },
         )
         bob_upload = client.post(
             "/api/upload",
-            json=payload,
-            headers={"Authorization": "Bearer bob-token"},
+            content=body,
+            headers={
+                "Authorization": "Bearer bob-token",
+                "Content-Type": UPLOAD_CONTENT_TYPE,
+            },
         )
         alice_conversations = client.get(
             "/api/conversations",

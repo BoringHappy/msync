@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
-from sqlalchemy.dialects import mysql, postgresql
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from msync.database import Archive, SchemaUpgradeRequiredError, _normalize_database
@@ -231,30 +231,26 @@ def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:
         Archive(database)
 
 
-def test_schema_compiles_for_postgresql_and_mysql() -> None:
+def test_schema_compiles_for_postgresql() -> None:
     postgresql_ddl = _compiled_schema(postgresql.dialect())
-    mysql_ddl = _compiled_schema(mysql.dialect())
 
     assert "BYTEA" in postgresql_ddl
     assert "JSON" in postgresql_ddl
-    assert "LONGBLOB" in mysql_ddl
-    assert "LONGTEXT" in mysql_ddl
-    assert "conversations_location_path_hash_uq" in mysql_ddl
     assert "conversations_logical_revision_uq" in postgresql_ddl
-    assert "conversations_logical_revision_uq" in mysql_ddl
 
 
 def test_common_database_urls_select_supported_drivers() -> None:
     postgres_url, postgres_path = _normalize_database(
         "postgresql://alice:secret@database.example/msync"
     )
-    mysql_url, mysql_path = _normalize_database("mysql://alice:secret@database.example/msync")
-
     assert postgres_url.drivername == "postgresql+psycopg"
-    assert mysql_url.drivername == "mysql+pymysql"
     assert postgres_path is None
-    assert mysql_path is None
     assert "secret" not in postgres_url.render_as_string(hide_password=True)
+
+
+def test_mysql_database_urls_are_rejected() -> None:
+    with pytest.raises(ValueError, match="use SQLite or PostgreSQL"):
+        _normalize_database("mysql://alice:secret@database.example/msync")
 
 
 def test_old_schema_version_is_rejected_without_migration(tmp_path: Path) -> None:

@@ -28,11 +28,6 @@ dependencies = [
 [project.scripts]
 msync = "msync:main"
 
-[project.optional-dependencies]
-mysql = [
-    "pymysql>=1.1",
-]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
