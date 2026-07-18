@@ -10,6 +10,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from msync.cli import app
+from msync.database import Archive, UploadResult
 from msync.providers import get_provider
 from msync.schemas.claude import ClaudeRecord
 from msync.schemas.codex import CodexRolloutLine
@@ -19,6 +20,17 @@ from msync.synchronization import MANIFEST_NAME
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+def _archive_transcripts(database: Path, root: Path, provider_name: str = "codex") -> UploadResult:
+    provider = get_provider(provider_name)
+    resolved_root = root.resolve()
+    with Archive(database) as archive:
+        return archive.upload(
+            root=resolved_root,
+            provider=provider,
+            transcripts=provider.discover(resolved_root),
+        )
 
 
 def _claude_records() -> list[dict[str, object]]:
@@ -176,11 +188,7 @@ def test_sync_can_generate_an_explicit_provider_location_from_archive(tmp_path: 
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
     database = tmp_path / "sync.sqlite"
-    upload = CliRunner().invoke(
-        app,
-        ["upload", "--dir", str(codex_root), "--database", str(database)],
-    )
-    assert upload.exit_code == 0, upload.output
+    _archive_transcripts(database, codex_root)
     destination = tmp_path / "neutral-output"
 
     result = CliRunner().invoke(
@@ -374,11 +382,7 @@ def test_sync_rejects_symlinked_destination_components(tmp_path: Path) -> None:
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
     database = tmp_path / "archive.sqlite"
-    upload = CliRunner().invoke(
-        app,
-        ["upload", "--dir", str(codex_root), "--database", str(database)],
-    )
-    assert upload.exit_code == 0, upload.output
+    _archive_transcripts(database, codex_root)
     destination = tmp_path / ".claude"
     outside = tmp_path / "outside"
     destination.mkdir()
@@ -426,20 +430,8 @@ def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_pa
         ],
     )
     assert first.exit_code == 0, first.output
-    upload_copy = CliRunner().invoke(
-        app,
-        [
-            "upload",
-            "--dir",
-            str(claude_root),
-            "--provider",
-            "claude",
-            "--database",
-            str(database),
-        ],
-    )
-    assert upload_copy.exit_code == 0, upload_copy.output
-    assert re.search(r"Duplicates skipped\s+1", upload_copy.output)
+    upload_copy = _archive_transcripts(database, claude_root, "claude")
+    assert upload_copy.duplicates == 1
 
     cycle_arguments = [
         "sync",
@@ -455,20 +447,8 @@ def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_pa
         str(database),
     ]
     for _ in range(3):
-        repeated_upload = CliRunner().invoke(
-            app,
-            [
-                "upload",
-                "--dir",
-                str(claude_root),
-                "--provider",
-                "claude",
-                "--database",
-                str(database),
-            ],
-        )
-        assert repeated_upload.exit_code == 0, repeated_upload.output
-        assert re.search(r"Duplicates skipped\s+1", repeated_upload.output)
+        repeated_upload = _archive_transcripts(database, claude_root, "claude")
+        assert repeated_upload.duplicates == 1
         repeated_sync = CliRunner().invoke(app, cycle_arguments)
         assert repeated_sync.exit_code == 0, repeated_sync.output
         assert len(_generated_paths(claude_root)) == 1

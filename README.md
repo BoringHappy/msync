@@ -63,61 +63,43 @@ pinned image tag is needed.
 
 ## Upload history
 
-Archive Codex history into the default `~/.msync/msync.sqlite` database:
-
-```console
-$ msync upload --dir ~/.codex
-```
-
-Claude Code and additional installations work the same way:
-
-```console
-$ msync upload --dir ~/.claude
-$ msync upload --dir ~/.codex_another
-```
-
-Locations are identified by account, hostname, and directory path, so users or machines that use
-the same path remain distinct in a shared archive. Direct database uploads use the legacy local
-account. Both `upload` and `sync` default to the local machine name; override it with `--hostname`
-or `MSYNC_HOSTNAME` when a stable alias is preferable:
-
-```console
-$ msync upload --dir ~/.codex --hostname workstation-a
-```
-
-The provider is detected from the directory layout and JSONL records. It can be specified when a
-custom layout is ambiguous, and the database can be overridden for testing or backups:
-
-```console
-$ msync upload --dir /mnt/history --provider codex --database ./history.sqlite
-```
-
-`--database` also accepts a SQLAlchemy URL. PostgreSQL URLs automatically select Psycopg, which is
-included by default:
-
-```console
-$ msync upload --dir ~/.codex --database 'postgresql://msync:secret@localhost/msync'
-```
-
-An explicitly selected SQLAlchemy driver works too, such as `postgresql+psycopg://...`. Passwords
-are masked in command output. The target database must already exist; `msync` creates and versions
-its tables automatically. Other database backends, including MySQL, are rejected.
-
-To upload through a running msync server instead of connecting directly to its database, pass the
-server's base URL and an account upload token:
+Upload Codex history to a running msync server:
 
 ```console
 $ msync upload --dir ~/.codex --url https://history.example.com --token "$MSYNC_UPLOAD_TOKEN"
 ```
 
-`MSYNC_UPLOAD_TOKEN` can supply the token without putting it in shell history. `--url` and
-`--database` are mutually exclusive. The client detects and reads native transcripts locally,
-streams their byte-exact contents one file at a time over the authenticated API, and records the
-client's hostname and source path on the server. A history directory has no aggregate upload limit;
-each individual transcript is capped at 256 MiB. The server rejects oversized request bodies before
-parsing them and spools accepted network bodies to disk before archive processing. Remote uploads
-have the same hash-based update, duplicate, and schema checks as direct database uploads. Treat an
-upload token like a password and use HTTPS whenever the server is reached over a network.
+Claude Code and additional installations work the same way. `MSYNC_UPLOAD_TOKEN` can supply the
+token without putting it in shell history:
+
+```console
+$ MSYNC_UPLOAD_TOKEN=alice-token msync upload --dir ~/.claude --url https://history.example.com
+$ MSYNC_UPLOAD_TOKEN=alice-token msync upload --dir ~/.codex_another --url https://history.example.com
+```
+
+Locations are identified by account, hostname, and directory path, so users or machines that use
+the same path remain distinct in a shared archive. Both `upload` and `sync` default to the local
+machine name; override it with `--hostname` or `MSYNC_HOSTNAME` when a stable alias is preferable:
+
+```console
+$ msync upload --dir ~/.codex --url https://history.example.com --hostname workstation-a
+```
+
+The provider is detected from the directory layout and JSONL records. It can be specified when a
+custom layout is ambiguous:
+
+```console
+$ msync upload --dir /mnt/history --provider codex --url https://history.example.com
+```
+
+`upload` requires `--url`; direct `--database` uploads are no longer supported. The client detects
+and reads native transcripts locally, streams their byte-exact contents one file at a time over the
+authenticated API, and records the authenticated account, client hostname, source path, result
+counts, and upload time. A history directory has no aggregate upload limit; each individual
+transcript is capped at 256 MiB. The server rejects oversized request bodies before parsing them and
+spools accepted network bodies to disk before archive processing. Uploads retain the same hash-based
+update, duplicate, and schema checks. Treat an upload token like a password and use HTTPS whenever
+the server is reached over a network.
 
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
@@ -127,9 +109,10 @@ During the development phase, version 5 is the oldest supported upgrade baseline
 development schemas should be recreated or exported with their compatible msync release. Known
 migrations are registered as sequential steps. Schema v7 adds account ownership and tenant-local
 revision uniqueness. Schema v8 adds upload-time conversation metrics and owner revisions so the
-dashboard does not rescan native events on every request. Future migrations can extend the same
-chain without changing the CLI workflow. Partial or otherwise incompatible schemas fail before
-any transcript is uploaded.
+dashboard does not rescan native events on every request. Schema v9 adds account-owned upload
+history and normalized input, output, and cached token counts. Future migrations can extend the
+same chain without changing the CLI workflow. Partial or otherwise incompatible schemas fail
+before any transcript is uploaded.
 
 For a shared or large archive, stop uploads and run the schema upgrade explicitly before starting
 the web server:
@@ -307,8 +290,9 @@ The database is deliberately split into distinct storage and indexing layers:
 | `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
 | `locations` | One account, hostname, and Claude/Codex data-directory tuple, allowing isolated users, machines, and installations. |
 | `conversations` | Account-owned session metadata, tenant-local logical revision identity, and a zlib-compressed byte-exact source JSONL. |
-| `conversation_metrics` | Upload-time message, event, tool, timing, and preview facts used by the dashboard. |
+| `conversation_metrics` | Upload-time message, event, tool, token, timing, and preview facts used by the dashboard. |
 | `archive_revisions` | Per-owner change tokens used for aggregate cache invalidation and browser refresh. |
+| `upload_history` | Successful remote uploads with an account owner, source identity, result counts, and timestamp. |
 | `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
 | `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |
@@ -317,6 +301,9 @@ The retained transcript blob and per-event raw JSON preserve all data needed for
 conversation reconstruction. Normalized columns are an index, not a replacement for the retained
 source. Schema upgrades can therefore rebuild normalized events from the byte-exact transcript;
 schema v6 does this once to distinguish human messages from tool content in existing archives.
+When Claude or Codex records include usage data, schema v9 also derives per-conversation token
+totals for the overview; records without provider usage data contribute zero rather than an
+estimate.
 Foreign keys record the location of the retained copy. Identical logical revisions found in
 another provider or location are skipped; different revisions remain distinct when they exist as
 separate source transcripts. SHA-256 hostname/path identities keep portable indexes compact.

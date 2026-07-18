@@ -81,6 +81,7 @@ const elements = {
   insightsActivity: document.querySelector("#insights-activity"),
   overviewSignal: document.querySelector("#overview-signal"),
   recentSessions: document.querySelector("#recent-sessions"),
+  recentUploads: document.querySelector("#recent-uploads"),
   providerOverview: document.querySelector("#provider-overview"),
   weekdayChart: document.querySelector("#weekday-chart"),
   hourChart: document.querySelector("#hour-chart"),
@@ -367,6 +368,32 @@ function renderRecentSessions(sessions) {
   }
 }
 
+function renderRecentUploads(uploads) {
+  elements.recentUploads.replaceChildren();
+  if (!uploads.length) {
+    elements.recentUploads.append(node("div", "empty-metric", "Your latest remote uploads will appear here."));
+    return;
+  }
+  for (const upload of uploads) {
+    const row = node("div", "upload-history-row");
+    const path = oneLine(upload.relative_path, upload.root_path);
+    const pathNode = node("span", "upload-path", path);
+    pathNode.title = `${upload.root_path}/${upload.relative_path}`;
+    let outcome = "No changes";
+    if (upload.imported) outcome = `${formatCount(upload.imported)} imported`;
+    else if (upload.updated) outcome = `${formatCount(upload.updated)} updated`;
+    else if (upload.duplicates) outcome = `${formatCount(upload.duplicates)} duplicate`;
+    else if (upload.unchanged) outcome = `${formatCount(upload.unchanged)} unchanged`;
+    row.append(
+      pathNode,
+      node("span", "upload-time", relativeDate(upload.uploaded_at)),
+      node("span", "upload-meta", `${upload.provider} · ${upload.hostname} · ${outcome}`),
+      node("span", "upload-events", `${formatCount(upload.events)} events indexed`),
+    );
+    elements.recentUploads.append(row);
+  }
+}
+
 function renderProviderOverview(providers, totalSessions) {
   elements.providerOverview.classList.remove("dashboard-skeleton");
   elements.providerOverview.replaceChildren();
@@ -529,7 +556,7 @@ function renderDashboard(metrics) {
     metricCard({ label: "Sessions", value: formatCount(totals.sessions), icon: "◇", accent: true, note: `${formatCount(totals.active_days)} active archive days` }),
     metricCard({ label: "Messages", value: formatCount(totals.messages), icon: "↕", note: `${totals.average_messages_per_session.toFixed(1)} average per session` }),
     metricCard({ label: "Tool calls", value: formatCount(totals.tool_calls), icon: "⌘", note: `${formatCount(totals.reasoning_events)} reasoning events` }),
-    metricCard({ label: "Latest streak", value: `${formatCount(totals.latest_streak_days)}d`, icon: "↗", note: `${formatCount(totals.longest_streak_days)} days at your best` }),
+    metricCard({ label: "Tokens", value: formatCount(totals.tokens), icon: "◈", note: `${formatCount(totals.input_tokens)} input · ${formatCount(totals.output_tokens)} output · ${formatCount(totals.cached_input_tokens)} cached` }),
   );
   elements.insightMetrics.replaceChildren(
     metricCard({ label: "Average session", value: formatDuration(totals.average_session_minutes), icon: "◷", accent: true, note: "elapsed time where available" }),
@@ -542,6 +569,7 @@ function renderDashboard(metrics) {
   const recentActivity = metrics.activity.reduce((sum, point) => sum + point.sessions, 0);
   elements.activityTotal.textContent = `${formatCount(recentActivity)} sessions in range`;
   renderRecentSessions(metrics.recent_sessions);
+  renderRecentUploads(metrics.recent_uploads);
   renderProviderOverview(metrics.providers, totals.sessions);
   renderSignal(metrics);
   renderWeekdayChart(metrics.weekdays);

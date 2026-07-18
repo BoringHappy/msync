@@ -128,6 +128,9 @@ class ConversationMetricRow(Base):
     message_count: Mapped[int] = mapped_column(Integer, nullable=False)
     tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False)
     reasoning_event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_token_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    output_token_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    cached_input_token_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     preview: Mapped[str | None] = mapped_column(LONG_TEXT)
     activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     activity_day: Mapped[date | None] = mapped_column(Date)
@@ -145,6 +148,32 @@ class ArchiveRevisionRow(Base):
     account_username: Mapped[str] = mapped_column(String(255), primary_key=True)
     revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class UploadHistoryRow(Base):
+    """One successful transcript upload owned by an authenticated account."""
+
+    __tablename__ = "upload_history"
+    __table_args__ = (
+        Index("upload_history_account_uploaded_idx", "account_username", "uploaded_at"),
+    )
+
+    id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    account_username: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    root_path: Mapped[str] = mapped_column(LONG_TEXT, nullable=False)
+    relative_path: Mapped[str] = mapped_column(LONG_TEXT, nullable=False)
+    scanned: Mapped[int] = mapped_column(Integer, nullable=False)
+    imported: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated: Mapped[int] = mapped_column(Integer, nullable=False)
+    unchanged: Mapped[int] = mapped_column(Integer, nullable=False)
+    duplicates: Mapped[int] = mapped_column(Integer, nullable=False)
+    events: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_parts: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 

@@ -33,9 +33,10 @@ from msync.tables import (
     LocationRow,
     MessagePartRow,
     SchemaInfoRow,
+    UploadHistoryRow,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 LEGACY_HOSTNAME = "unknown"
 
 SchemaUpgradeReporter = Callable[[int, int], None]
@@ -189,6 +190,25 @@ class ConversationSummary:
 
 
 @dataclass(slots=True, frozen=True)
+class UploadHistoryEntry:
+    """One successful remote upload shown in the account overview."""
+
+    id: int
+    provider: str
+    hostname: str
+    root_path: str
+    relative_path: str
+    scanned: int
+    imported: int
+    updated: int
+    unchanged: int
+    duplicates: int
+    events: int
+    message_parts: int
+    uploaded_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
 class SummaryTotals:
     """Headline archive counts and averages shown on the overview."""
 
@@ -197,6 +217,10 @@ class SummaryTotals:
     events: int
     tool_calls: int
     reasoning_events: int
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    tokens: int
     locations: int
     active_days: int
     latest_streak_days: int
@@ -246,6 +270,7 @@ class ArchiveMetrics:
     hours: tuple[CountMetric, ...]
     session_depth: tuple[CountMetric, ...]
     recent_sessions: tuple[ConversationSummary, ...]
+    recent_uploads: tuple[UploadHistoryEntry, ...]
     latest_activity_at: str | None
     revision: int
 
@@ -353,6 +378,56 @@ def _tool_metric_name(content_type: str, raw_json: str) -> str:
     return normalized.replace("_", " ").strip() or "tool"
 
 
+def _token_value(values: dict[str, Any], key: str) -> int:
+    value = values.get(key, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _token_counts(events: list[tuple[int, str | None, str, str]]) -> tuple[int, int, int]:
+    """Normalize token usage retained in Claude and Codex native records."""
+
+    claude_input = 0
+    claude_output = 0
+    claude_cached = 0
+    codex_latest = (0, 0, 0)
+    for _, _, _, raw_json in events:
+        try:
+            value = json.loads(raw_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        message = value.get("message")
+        usage = message.get("usage") if isinstance(message, dict) else None
+        if isinstance(usage, dict):
+            cached = _token_value(usage, "cache_creation_input_tokens") + _token_value(
+                usage, "cache_read_input_tokens"
+            )
+            claude_input += _token_value(usage, "input_tokens") + cached
+            claude_output += _token_value(usage, "output_tokens")
+            claude_cached += cached
+
+        payload = value.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+            continue
+        info = payload.get("info")
+        total_usage = info.get("total_token_usage") if isinstance(info, dict) else None
+        if not isinstance(total_usage, dict):
+            continue
+        codex_latest = (
+            _token_value(total_usage, "input_tokens"),
+            _token_value(total_usage, "output_tokens"),
+            _token_value(total_usage, "cached_input_tokens"),
+        )
+
+    return (
+        claude_input + codex_latest[0],
+        claude_output + codex_latest[1],
+        claude_cached + codex_latest[2],
+    )
+
+
 def _activity_streaks(activity_dates: set[date]) -> tuple[int, int]:
     if not activity_dates:
         return 0, 0
@@ -389,19 +464,18 @@ def _metric_values(
     *,
     started_at: str | None,
     ended_at: str | None,
-    events: list[tuple[int, str | None, str]],
+    events: list[tuple[int, str | None, str, str]],
     parts: list[tuple[int, str | None, str, str]],
 ) -> dict[str, Any]:
     """Build the persisted dashboard facts for one conversation."""
 
-    message_count = sum(
-        role in {"user", "assistant"} and bool(text) for _, role, text in events
-    )
+    message_count = sum(role in {"user", "assistant"} and bool(text) for _, role, text, _ in events)
     preview = next(
-        (_portable_text(text) for _, role, text in events if role == "user" and text),
+        (_portable_text(text) for _, role, text, _ in events if role == "user" and text),
         None,
     )
-    reasoning_event_count = sum(role == "reasoning" for _, role, _ in events)
+    reasoning_event_count = sum(role == "reasoning" for _, role, _, _ in events)
+    input_tokens, output_tokens, cached_input_tokens = _token_counts(events)
     mixed_reasoning_events: set[int] = set()
     tool_counts: Counter[str] = Counter()
     for event_id, event_role, content_type, raw_json in parts:
@@ -426,6 +500,9 @@ def _metric_values(
         "message_count": message_count,
         "tool_call_count": sum(tool_counts.values()),
         "reasoning_event_count": reasoning_event_count,
+        "input_token_count": input_tokens,
+        "output_token_count": output_tokens,
+        "cached_input_token_count": cached_input_tokens,
         "preview": preview,
         "activity_at": activity_at,
         "activity_day": activity_start.date() if activity_start is not None else None,
@@ -438,7 +515,8 @@ def _metric_values(
 
 def _conversation_metric_values(conversation: Conversation) -> dict[str, Any]:
     events = [
-        (event.sequence, event.role, event.searchable_text) for event in conversation.events
+        (event.sequence, event.role, event.searchable_text, event.raw_json)
+        for event in conversation.events
     ]
     parts = [
         (event.sequence, event.role, part.content_type, part.raw_json)
@@ -655,6 +733,7 @@ class Archive:
             normalized.append((virtual_root.joinpath(*relative_path.parts), transcript))
 
         changed = False
+        history_recorded = bool(normalized)
         with Session(self.engine) as session, session.begin():
             location = self._upsert_location(
                 session,
@@ -685,12 +764,29 @@ class Archive:
                             raise
                         continue
                     _accumulate_upload_result(result, file_result)
+                    session.add(
+                        UploadHistoryRow(
+                            account_username=account_username,
+                            provider=provider.name,
+                            hostname=normalized_hostname,
+                            root_path=root_path,
+                            relative_path=transcript.relative_path,
+                            scanned=1,
+                            imported=file_result.imported,
+                            updated=file_result.updated,
+                            unchanged=file_result.unchanged,
+                            duplicates=file_result.duplicates,
+                            events=file_result.events,
+                            message_parts=file_result.message_parts,
+                            uploaded_at=datetime.now(UTC),
+                        )
+                    )
                     break
             location.last_scanned_at = datetime.now(UTC)
             changed = bool(session.info.get("archive_changed"))
-            if changed:
+            if changed or history_recorded:
                 self._bump_archive_revision(session, account_username)
-        if changed:
+        if changed or history_recorded:
             self._invalidate_metrics_cache(account_username)
         return result
 
@@ -933,6 +1029,9 @@ class Archive:
                 ConversationMetricRow.preview,
                 ConversationMetricRow.reasoning_event_count,
                 ConversationMetricRow.tool_call_count,
+                ConversationMetricRow.input_token_count,
+                ConversationMetricRow.output_token_count,
+                ConversationMetricRow.cached_input_token_count,
                 ConversationMetricRow.tool_counts_json,
                 ConversationMetricRow.activity_at,
                 ConversationMetricRow.activity_day,
@@ -950,8 +1049,53 @@ class Archive:
             owners = (account_username, "") if include_legacy else (account_username,)
             statement = statement.where(LocationRow.account_username.in_(owners))
 
+        upload_statement = select(
+            UploadHistoryRow.id,
+            UploadHistoryRow.provider,
+            UploadHistoryRow.hostname,
+            UploadHistoryRow.root_path,
+            UploadHistoryRow.relative_path,
+            UploadHistoryRow.scanned,
+            UploadHistoryRow.imported,
+            UploadHistoryRow.updated,
+            UploadHistoryRow.unchanged,
+            UploadHistoryRow.duplicates,
+            UploadHistoryRow.events,
+            UploadHistoryRow.message_parts,
+            UploadHistoryRow.uploaded_at,
+        )
+        if account_username is not None:
+            upload_statement = upload_statement.where(UploadHistoryRow.account_username.in_(owners))
+        upload_statement = upload_statement.order_by(
+            UploadHistoryRow.uploaded_at.desc(), UploadHistoryRow.id.desc()
+        ).limit(5)
+
         with Session(self.engine) as session:
             rows = list(session.execute(statement))
+            upload_rows = list(session.execute(upload_statement))
+
+        recent_uploads = tuple(
+            UploadHistoryEntry(
+                id=row.id,
+                provider=row.provider,
+                hostname=row.hostname,
+                root_path=row.root_path,
+                relative_path=row.relative_path,
+                scanned=row.scanned,
+                imported=row.imported,
+                updated=row.updated,
+                unchanged=row.unchanged,
+                duplicates=row.duplicates,
+                events=row.events,
+                message_parts=row.message_parts,
+                uploaded_at=(
+                    row.uploaded_at.replace(tzinfo=UTC)
+                    if row.uploaded_at.tzinfo is None
+                    else row.uploaded_at.astimezone(UTC)
+                ),
+            )
+            for row in upload_rows
+        )
 
         provider_counts: Counter[str] = Counter()
         provider_messages: Counter[str] = Counter()
@@ -970,6 +1114,9 @@ class Archive:
         total_events = 0
         tool_calls = 0
         reasoning_events = 0
+        input_tokens = 0
+        output_tokens = 0
+        cached_input_tokens = 0
         tool_counts: Counter[str] = Counter()
 
         recent: list[tuple[datetime | None, ConversationSummary]] = []
@@ -980,6 +1127,9 @@ class Archive:
             total_events += events
             tool_calls += int(row.tool_call_count or 0)
             reasoning_events += int(row.reasoning_event_count or 0)
+            input_tokens += int(row.input_token_count or 0)
+            output_tokens += int(row.output_token_count or 0)
+            cached_input_tokens += int(row.cached_input_token_count or 0)
             tool_counts.update(row.tool_counts_json or {})
             provider_counts[row.provider] += 1
             provider_messages[row.provider] += messages
@@ -1061,6 +1211,10 @@ class Archive:
                 events=total_events,
                 tool_calls=tool_calls,
                 reasoning_events=reasoning_events,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                tokens=input_tokens + output_tokens,
                 locations=len({row.location_id for row in rows}),
                 active_days=len(activity_dates),
                 latest_streak_days=streaks[0],
@@ -1090,6 +1244,7 @@ class Archive:
                 for label in ("0–4", "5–9", "10–24", "25+")
             ),
             recent_sessions=tuple(summary for _, summary in recent[:5]),
+            recent_uploads=recent_uploads,
             latest_activity_at=latest_activity[1] if latest_activity else None,
             revision=revision,
         )
@@ -1891,12 +2046,13 @@ def _migrate_v7_to_v8(
     for completed, conversation in enumerate(conversations, start=1):
         owners.add(conversation.account_username)
         events = [
-            (row.id, row.role, row.searchable_text)
+            (row.id, row.role, row.searchable_text, row.raw_json)
             for row in connection.execute(
                 select(
                     EventRow.id,
                     EventRow.role,
                     EventRow.searchable_text,
+                    EventRow.raw_json,
                 )
                 .where(EventRow.conversation_id == conversation.id)
                 .order_by(EventRow.sequence)
@@ -1948,10 +2104,70 @@ def _migrate_v7_to_v8(
     )
 
 
+def _migrate_v8_to_v9(
+    connection: Connection,
+    progress_reporter: SchemaUpgradeProgressReporter | None = None,
+) -> None:
+    """Add tenant upload history and backfill token metrics from native records."""
+
+    UploadHistoryRow.__table__.create(connection, checkfirst=True)
+    metric_columns = {
+        column["name"] for column in inspect(connection).get_columns("conversation_metrics")
+    }
+    for column_name in (
+        "input_token_count",
+        "output_token_count",
+        "cached_input_token_count",
+    ):
+        if column_name not in metric_columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE conversation_metrics ADD COLUMN {column_name} "
+                "BIGINT NOT NULL DEFAULT 0"
+            )
+
+    conversation_ids = list(
+        connection.scalars(select(ConversationRow.id).order_by(ConversationRow.id))
+    )
+    total = len(conversation_ids)
+    if progress_reporter is not None:
+        progress_reporter(0, total)
+    for completed, conversation_id in enumerate(conversation_ids, start=1):
+        events = [
+            (row.id, row.role, row.searchable_text, row.raw_json)
+            for row in connection.execute(
+                select(
+                    EventRow.id,
+                    EventRow.role,
+                    EventRow.searchable_text,
+                    EventRow.raw_json,
+                )
+                .where(EventRow.conversation_id == conversation_id)
+                .order_by(EventRow.sequence)
+            )
+        ]
+        input_tokens, output_tokens, cached_input_tokens = _token_counts(events)
+        connection.execute(
+            update(ConversationMetricRow)
+            .where(ConversationMetricRow.conversation_id == conversation_id)
+            .values(
+                input_token_count=input_tokens,
+                output_token_count=output_tokens,
+                cached_input_token_count=cached_input_tokens,
+            )
+        )
+        if progress_reporter is not None:
+            progress_reporter(completed, total)
+
+    connection.execute(
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="9")
+    )
+
+
 SCHEMA_MIGRATIONS: dict[int, SchemaMigration] = {
     5: SchemaMigration(target_version=6, upgrade=_migrate_v5_to_v6),
     6: SchemaMigration(target_version=7, upgrade=_migrate_v6_to_v7),
     7: SchemaMigration(target_version=8, upgrade=_migrate_v7_to_v8),
+    8: SchemaMigration(target_version=9, upgrade=_migrate_v8_to_v9),
 }
 
 

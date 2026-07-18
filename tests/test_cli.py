@@ -10,10 +10,12 @@ from typing import Any
 
 import httpx
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from msync.cli import app
 from msync.database import Archive
+from msync.providers import get_provider
 from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata
 
 
@@ -38,21 +40,30 @@ def _write_codex_transcript(
     return transcript
 
 
-def test_upload_command(tmp_path: Path) -> None:
-    root = tmp_path / ".codex_custom"
-    transcript = root / "sessions/rollout.jsonl"
-    transcript.parent.mkdir(parents=True)
-    transcript.write_text(
-        json.dumps(
-            {
-                "timestamp": "2026-07-14T12:00:00Z",
-                "type": "session_meta",
-                "payload": {"id": "cli-session", "cwd": "/tmp"},
-            }
+def _archive_transcripts(root: Path, database: Path, provider_name: str = "codex") -> None:
+    provider = get_provider(provider_name)
+    resolved_root = root.resolve()
+    with Archive(database) as archive:
+        archive.upload(
+            root=resolved_root,
+            provider=provider,
+            transcripts=provider.discover(resolved_root),
         )
-        + "\n"
-    )
-    database = tmp_path / "data/msync.sqlite"
+
+
+def test_upload_requires_url(tmp_path: Path) -> None:
+    root = tmp_path / ".codex_custom"
+    _write_codex_transcript(root)
+
+    result = CliRunner().invoke(app, ["upload", "--dir", str(root)])
+
+    assert result.exit_code == 2
+    assert "Missing option '--url'" in unstyle(result.output)
+
+
+def test_upload_rejects_empty_directory(tmp_path: Path) -> None:
+    root = tmp_path / ".codex_empty"
+    root.mkdir()
 
     result = CliRunner().invoke(
         app,
@@ -60,30 +71,12 @@ def test_upload_command(tmp_path: Path) -> None:
             "upload",
             "--dir",
             str(root),
-            "--database",
-            str(database),
-            "--hostname",
-            "cli-workstation",
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
         ],
     )
-
-    assert result.exit_code == 0, result.output
-    assert "Upload complete" in result.output
-    assert "codex" in result.output
-    assert "cli-workstation" in result.output
-    assert database.is_file()
-    with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
-        assert connection.execute("SELECT hostname FROM locations").fetchone() == (
-            "cli-workstation",
-        )
-
-
-def test_upload_rejects_empty_directory(tmp_path: Path) -> None:
-    root = tmp_path / ".codex_empty"
-    root.mkdir()
-
-    result = CliRunner().invoke(app, ["upload", "--dir", str(root)])
 
     assert result.exit_code == 1
     assert "No conversation transcripts found" in result.output
@@ -104,13 +97,28 @@ def test_upload_rejects_empty_hostname(tmp_path: Path) -> None:
         + "\n"
     )
 
-    result = CliRunner().invoke(app, ["upload", "--dir", str(root), "--hostname", " "])
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+            "--hostname",
+            " ",
+        ],
+    )
 
     assert result.exit_code == 1
     assert "Location hostname must not be empty" in result.output
 
 
-def test_upload_accepts_explicit_claude_provider(tmp_path: Path) -> None:
+def test_upload_accepts_explicit_claude_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     root = tmp_path / "custom-history"
     transcript = root / "projects/-work/session.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -126,7 +134,36 @@ def test_upload_accepts_explicit_claude_provider(tmp_path: Path) -> None:
         )
         + "\n"
     )
-    database = tmp_path / "claude.sqlite"
+    captured_provider: list[str] = []
+
+    def fake_post(
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: Iterator[bytes],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del headers, timeout
+        body = b"".join(content)
+        metadata_length = int.from_bytes(body[:4], byteorder="big")
+        metadata = RemoteUploadMetadata.model_validate_json(body[4 : 4 + metadata_length])
+        captured_provider.append(metadata.provider)
+        return httpx.Response(
+            200,
+            json={
+                "location_id": 1,
+                "scanned": 1,
+                "imported": 1,
+                "updated": 0,
+                "unchanged": 0,
+                "duplicates": 0,
+                "events": 1,
+                "message_parts": 0,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("msync.cli.httpx.post", fake_post)
 
     result = CliRunner().invoke(
         app,
@@ -136,15 +173,16 @@ def test_upload_accepts_explicit_claude_provider(tmp_path: Path) -> None:
             str(root),
             "--provider",
             "claude",
-            "--database",
-            str(database),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert "claude" in result.output
-    with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("SELECT provider FROM locations").fetchone() == ("claude",)
+    assert captured_provider == ["claude"]
 
 
 def test_upload_sends_native_transcripts_to_remote_server(
@@ -238,36 +276,40 @@ def test_upload_sends_native_transcripts_to_remote_server(
         assert request["body"][4 + metadata_length :] == transcript_content
 
 
-@pytest.mark.parametrize(
-    ("arguments", "message"),
-    [
-        (["--url", "https://history.example"], "--url requires --token"),
-        (["--token", "secret"], "--token requires --url"),
-        (
-            [
-                "--url",
-                "https://history.example",
-                "--token",
-                "secret",
-                "--database",
-                "archive.sqlite",
-            ],
-            "--url and --database cannot be used together",
-        ),
-    ],
-)
-def test_upload_rejects_conflicting_remote_options(
-    tmp_path: Path,
-    arguments: list[str],
-    message: str,
-) -> None:
+def test_upload_requires_token(tmp_path: Path) -> None:
     root = tmp_path / ".codex"
     _write_codex_transcript(root)
 
-    result = CliRunner().invoke(app, ["upload", "--dir", str(root), *arguments])
+    result = CliRunner().invoke(
+        app,
+        ["upload", "--dir", str(root), "--url", "https://history.example"],
+    )
 
     assert result.exit_code == 1
-    assert message in result.output
+    assert "--url requires --token" in result.output
+
+
+def test_upload_no_longer_accepts_database(tmp_path: Path) -> None:
+    root = tmp_path / ".codex"
+    _write_codex_transcript(root)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+            "--database",
+            "archive.sqlite",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "No such option: --database" in unstyle(result.output)
 
 
 def test_upload_rejects_oversized_transcript_before_network_access(
@@ -318,11 +360,12 @@ def test_upgrade_command_migrates_archive_and_reports_steps(tmp_path: Path) -> N
     assert "Upgrading database schema 5 → 6" in result.output
     assert "Upgrading database schema 6 → 7" in result.output
     assert "Upgrading database schema 7 → 8" in result.output
-    assert "Database schema upgrade complete: 5 → 8" in result.output
+    assert "Upgrading database schema 8 → 9" in result.output
+    assert "Database schema upgrade complete: 5 → 9" in result.output
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("8",)
+        ).fetchone() == ("9",)
 
 
 def test_upgrade_command_reports_current_schema(tmp_path: Path) -> None:
@@ -333,7 +376,7 @@ def test_upgrade_command_reports_current_schema(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["upgrade", "--database", str(database)])
 
     assert result.exit_code == 0, result.output
-    assert "Database schema is current at version 8" in result.output
+    assert "Database schema is current at version 9" in result.output
 
 
 def test_upgrade_command_reports_concurrent_transaction(tmp_path: Path) -> None:
@@ -371,7 +414,7 @@ def test_regular_command_requires_explicit_schema_upgrade(tmp_path: Path) -> Non
     result = CliRunner().invoke(app, ["sample", "1", "--database", str(database)])
 
     assert result.exit_code == 1
-    assert "must be upgraded to 8" in result.output
+    assert "must be upgraded to 9" in result.output
     assert "msync upgrade --database <database>" in result.output
 
 
@@ -404,11 +447,7 @@ def test_search_command_finds_text_with_like_query(tmp_path: Path) -> None:
         + "\n"
     )
     database = tmp_path / "search.sqlite"
-    upload_result = CliRunner().invoke(
-        app,
-        ["upload", "--dir", str(root), "--database", str(database)],
-    )
-    assert upload_result.exit_code == 0, upload_result.output
+    _archive_transcripts(root, database)
 
     result = CliRunner().invoke(
         app,
@@ -465,11 +504,7 @@ def test_sample_command_limits_random_messages(tmp_path: Path) -> None:
         + "\n"
     )
     database = tmp_path / "sample.sqlite"
-    upload_result = CliRunner().invoke(
-        app,
-        ["upload", "--dir", str(root), "--database", str(database)],
-    )
-    assert upload_result.exit_code == 0, upload_result.output
+    _archive_transcripts(root, database)
 
     result = CliRunner().invoke(
         app,
