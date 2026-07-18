@@ -41,6 +41,26 @@ def _is_tool_block(content_type: str) -> bool:
     return content_type.endswith(("tool_use", "tool_result"))
 
 
+def _injected_context_subtype(record: ClaudeRecord, text: str) -> str | None:
+    """Classify Claude's synthetic user records without hiding genuine prompts."""
+
+    stripped = text.lstrip()
+    if stripped.startswith("Base directory for this skill:"):
+        marker_subtype = "skill_context"
+    elif stripped.startswith("[SYSTEM NOTIFICATION - NOT USER INPUT]"):
+        marker_subtype = "system_notification"
+    else:
+        marker_subtype = "injected_context"
+
+    if record.is_meta is True:
+        return marker_subtype
+    if (record.is_sidechain is True or record.source_tool_use_id) and marker_subtype != (
+        "injected_context"
+    ):
+        return marker_subtype
+    return None
+
+
 class ClaudeProvider(HistoryProvider):
     """Read Claude Code project and subagent JSONL files."""
 
@@ -92,6 +112,21 @@ class ClaudeProvider(HistoryProvider):
                 # Claude can put prose and tool blocks in one native message. Keep the
                 # tool blocks as parts, but do not fold their payload into the prose.
                 normalized_text = text
+                injected_subtype = (
+                    _injected_context_subtype(record, text)
+                    if event_type == "user"
+                    and block_types
+                    and block_types <= _CLAUDE_TEXT_BLOCK_TYPES
+                    else None
+                )
+                if injected_subtype is not None:
+                    # Skill expansions and notifications are model context, not human
+                    # turns. Keep their parts and raw JSON for lossless inspection while
+                    # removing the potentially huge payload from human-message indexes.
+                    role = "metadata"
+                    visibility = "metadata"
+                    event_subtype = record.subtype or injected_subtype
+                    normalized_text = ""
             elif any(_is_tool_block(content_type) for content_type in block_types):
                 role = "tool"
                 visibility = "display"

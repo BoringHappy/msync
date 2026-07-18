@@ -376,15 +376,18 @@ class Archive:
         *,
         location_id: int | None = None,
         search_text: str = "",
+        order_by: str = "newest",
         limit: int = 200,
         offset: int = 0,
     ) -> list[ConversationSummary]:
-        """Return recent conversations, optionally filtered by location and text."""
+        """Return ordered conversations, optionally filtered by location and text."""
 
         if limit < 1 or limit > 500:
             raise ValueError("Conversation limit must be between 1 and 500.")
         if offset < 0:
             raise ValueError("Conversation offset must not be negative.")
+        if order_by not in {"newest", "oldest", "messages", "events", "title"}:
+            raise ValueError(f"Unsupported conversation order: {order_by}.")
 
         event_stats = (
             select(
@@ -457,19 +460,46 @@ class Archive:
                     matching_event,
                 )
             )
-        statement = (
-            statement.order_by(
-                func.coalesce(ConversationRow.ended_at, ConversationRow.started_at).desc(),
+        activity_time = func.coalesce(ConversationRow.ended_at, ConversationRow.started_at)
+        order_columns = {
+            "newest": (activity_time.desc(), ConversationRow.id.desc()),
+            "oldest": (
+                case((activity_time.is_(None), 1), else_=0),
+                activity_time.asc(),
+                ConversationRow.id.asc(),
+            ),
+            "messages": (
+                func.coalesce(event_stats.c.message_count, 0).desc(),
+                activity_time.desc(),
                 ConversationRow.id.desc(),
-            )
-            .limit(limit)
-            .offset(offset)
-        )
+            ),
+            "events": (
+                func.coalesce(event_stats.c.event_count, 0).desc(),
+                activity_time.desc(),
+                ConversationRow.id.desc(),
+            ),
+            "title": (
+                func.lower(func.coalesce(ConversationRow.title, ConversationRow.external_id)).asc(),
+                ConversationRow.id.desc(),
+            ),
+        }
+        statement = statement.order_by(*order_columns[order_by]).limit(limit).offset(offset)
         with Session(self.engine) as session:
             return [ConversationSummary(*row) for row in session.execute(statement)]
 
-    def browse_conversation(self, conversation_id: int) -> ConversationDetail | None:
-        """Return a conversation and every event needed for normal and expanded views."""
+    def browse_conversation(
+        self,
+        conversation_id: int,
+        *,
+        event_limit: int | None = None,
+        event_offset: int = 0,
+    ) -> ConversationDetail | None:
+        """Return conversation metadata and an optionally bounded event page."""
+
+        if event_limit is not None and (event_limit < 1 or event_limit > 500):
+            raise ValueError("Event limit must be between 1 and 500.")
+        if event_offset < 0:
+            raise ValueError("Event offset must not be negative.")
 
         statement = (
             select(
@@ -497,13 +527,43 @@ class Archive:
             if row is None:
                 return None
 
-            event_rows = list(
-                session.execute(
-                    select(EventRow)
-                    .where(EventRow.conversation_id == conversation_id)
-                    .order_by(EventRow.sequence)
-                ).scalars()
+            event_count, message_count = session.execute(
+                select(
+                    func.count(EventRow.id),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    EventRow.role.in_(("user", "assistant"))
+                                    & (EventRow.searchable_text != ""),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                ).where(EventRow.conversation_id == conversation_id)
+            ).one()
+            preview = session.scalar(
+                select(EventRow.searchable_text)
+                .where(
+                    EventRow.conversation_id == conversation_id,
+                    EventRow.role == "user",
+                    EventRow.searchable_text != "",
+                )
+                .order_by(EventRow.sequence)
+                .limit(1)
             )
+            event_statement = (
+                select(EventRow)
+                .where(EventRow.conversation_id == conversation_id)
+                .order_by(EventRow.sequence)
+                .offset(event_offset)
+            )
+            if event_limit is not None:
+                event_statement = event_statement.limit(event_limit)
+            event_rows = list(session.execute(event_statement).scalars())
             part_rows = (
                 list(
                     session.execute(
@@ -543,10 +603,6 @@ class Archive:
             )
             for event in event_rows
         )
-        event_count = len(events)
-        message_count = sum(
-            event.role in {"user", "assistant"} and bool(event.text) for event in events
-        )
         summary = ConversationSummary(
             id=row.id,
             location_id=row.location_id,
@@ -562,9 +618,7 @@ class Archive:
             ended_at=row.ended_at,
             event_count=event_count,
             message_count=message_count,
-            preview=next(
-                (event.text for event in events if event.role == "user" and event.text), None
-            ),
+            preview=preview,
         )
         return ConversationDetail(
             summary=summary,
@@ -923,16 +977,16 @@ class Archive:
             EventRow(
                 conversation_id=conversation_id,
                 sequence=source.sequence,
-                external_id=source.external_id,
-                parent_external_id=source.parent_external_id,
-                event_type=source.event_type,
-                event_subtype=source.event_subtype,
-                role=source.role,
-                visibility=source.visibility,
-                occurred_at=source.occurred_at,
-                searchable_text=source.searchable_text,
-                raw_json=source.raw_json,
-                parse_error=source.parse_error,
+                external_id=_portable_text(source.external_id),
+                parent_external_id=_portable_text(source.parent_external_id),
+                event_type=_portable_text(source.event_type),
+                event_subtype=_portable_text(source.event_subtype),
+                role=_portable_text(source.role),
+                visibility=_portable_text(source.visibility),
+                occurred_at=_portable_text(source.occurred_at),
+                searchable_text=_portable_text(source.searchable_text),
+                raw_json=_portable_text(source.raw_json),
+                parse_error=_portable_text(source.parse_error),
             )
             for source in conversation.events
         ]
@@ -942,9 +996,9 @@ class Archive:
             MessagePartRow(
                 event_id=row.id,
                 sequence=part.sequence,
-                content_type=part.content_type,
-                text=part.text,
-                raw_json=part.raw_json,
+                content_type=_portable_text(part.content_type),
+                text=_portable_text(part.text),
+                raw_json=_portable_text(part.raw_json),
             )
             for row, source in zip(rows, conversation.events, strict=True)
             for part in source.parts
@@ -1030,17 +1084,17 @@ def _migrate_v5_to_v6(
             update(ConversationRow)
             .where(ConversationRow.id == row.id)
             .values(
-                external_id=conversation.external_id,
-                logical_session_id=conversation.logical_session_id,
+                external_id=_portable_text(conversation.external_id),
+                logical_session_id=_portable_text(conversation.logical_session_id),
                 chat_sha256=conversation.chat_sha256,
-                conversation_kind=conversation.kind,
-                parent_external_id=conversation.parent_external_id,
-                title=conversation.title,
-                cwd=conversation.cwd,
-                model=conversation.model,
-                git_branch=conversation.git_branch,
-                started_at=conversation.started_at,
-                ended_at=conversation.ended_at,
+                conversation_kind=_portable_text(conversation.kind),
+                parent_external_id=_portable_text(conversation.parent_external_id),
+                title=_portable_text(conversation.title),
+                cwd=_portable_text(conversation.cwd),
+                model=_portable_text(conversation.model),
+                git_branch=_portable_text(conversation.git_branch),
+                started_at=_portable_text(conversation.started_at),
+                ended_at=_portable_text(conversation.ended_at),
                 metadata_json=_metadata_with_identity(row.metadata_json, conversation),
             )
         )
@@ -1064,16 +1118,16 @@ def _insert_migrated_events(
             EventRow.__table__.insert().values(
                 conversation_id=conversation_id,
                 sequence=source.sequence,
-                external_id=source.external_id,
-                parent_external_id=source.parent_external_id,
-                event_type=source.event_type,
-                event_subtype=source.event_subtype,
-                role=source.role,
-                visibility=source.visibility,
-                occurred_at=source.occurred_at,
-                searchable_text=source.searchable_text,
-                raw_json=source.raw_json,
-                parse_error=source.parse_error,
+                external_id=_portable_text(source.external_id),
+                parent_external_id=_portable_text(source.parent_external_id),
+                event_type=_portable_text(source.event_type),
+                event_subtype=_portable_text(source.event_subtype),
+                role=_portable_text(source.role),
+                visibility=_portable_text(source.visibility),
+                occurred_at=_portable_text(source.occurred_at),
+                searchable_text=_portable_text(source.searchable_text),
+                raw_json=_portable_text(source.raw_json),
+                parse_error=_portable_text(source.parse_error),
             )
         )
         event_id = result.inserted_primary_key[0]
@@ -1084,9 +1138,9 @@ def _insert_migrated_events(
                     {
                         "event_id": event_id,
                         "sequence": part.sequence,
-                        "content_type": part.content_type,
-                        "text": part.text,
-                        "raw_json": part.raw_json,
+                        "content_type": _portable_text(part.content_type),
+                        "text": _portable_text(part.text),
+                        "raw_json": _portable_text(part.raw_json),
                     }
                     for part in source.parts
                 ],
@@ -1101,19 +1155,19 @@ SCHEMA_MIGRATIONS: dict[int, SchemaMigration] = {
 def _update_conversation(
     row: ConversationRow, conversation: Conversation, source_mtime_ns: int
 ) -> None:
-    row.external_id = conversation.external_id
-    row.conversation_kind = conversation.kind
-    row.parent_external_id = conversation.parent_external_id
-    row.title = conversation.title
-    row.cwd = conversation.cwd
-    row.model = conversation.model
-    row.git_branch = conversation.git_branch
-    row.started_at = conversation.started_at
-    row.ended_at = conversation.ended_at
+    row.external_id = _portable_text(conversation.external_id) or ""
+    row.conversation_kind = _portable_text(conversation.kind) or "main"
+    row.parent_external_id = _portable_text(conversation.parent_external_id)
+    row.title = _portable_text(conversation.title)
+    row.cwd = _portable_text(conversation.cwd)
+    row.model = _portable_text(conversation.model)
+    row.git_branch = _portable_text(conversation.git_branch)
+    row.started_at = _portable_text(conversation.started_at)
+    row.ended_at = _portable_text(conversation.ended_at)
     row.source_mtime_ns = source_mtime_ns
     row.source_size = len(conversation.transcript)
     row.content_sha256 = conversation.sha256
-    row.logical_session_id = conversation.logical_session_id
+    row.logical_session_id = _portable_text(conversation.logical_session_id)
     row.chat_sha256 = conversation.chat_sha256
     row.transcript_codec = "zlib"
     row.transcript = zlib.compress(conversation.transcript)
@@ -1156,12 +1210,30 @@ def _conversation_identity(conversation: Conversation) -> tuple[str, str | None]
 
 
 def _metadata_with_identity(metadata: dict[str, Any], conversation: Conversation) -> dict[str, Any]:
-    stored = dict(metadata)
+    stored = _portable_json_value(metadata)
     stored["_msync"] = {
         "chat_sha256": conversation.chat_sha256,
-        "logical_session_id": conversation.logical_session_id,
+        "logical_session_id": _portable_text(conversation.logical_session_id),
     }
     return stored
+
+
+def _portable_text(value: str | None) -> str | None:
+    """Replace NUL characters that SQL text types cannot portably store."""
+
+    return value.replace("\x00", "\N{REPLACEMENT CHARACTER}") if value is not None else None
+
+
+def _portable_json_value(value: Any) -> Any:
+    """Make nested metadata safe for PostgreSQL JSON while retaining its shape."""
+
+    if isinstance(value, str):
+        return _portable_text(value)
+    if isinstance(value, dict):
+        return {_portable_text(str(key)): _portable_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_portable_json_value(item) for item in value]
+    return value
 
 
 def _configure_schema_lock_timeout(

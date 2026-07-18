@@ -4,11 +4,13 @@ import json
 import os
 import re
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy.engine import make_url
 from typer.testing import CliRunner
 
 from msync import database as database_module
@@ -21,8 +23,35 @@ from msync.tables import ConversationRow, LocationRow
 POSTGRES_URL = os.environ.get("MSYNC_POSTGRES_URL")
 
 
+@pytest.fixture
+def postgres_url() -> Iterator[str]:
+    """Give each integration test an isolated schema in the configured database."""
+
+    if POSTGRES_URL is None:
+        pytest.skip("MSYNC_POSTGRES_URL is not configured")
+    schema = f"msync_test_{uuid4().hex}"
+    admin_url = make_url(POSTGRES_URL)
+    if admin_url.drivername in {"postgres", "postgresql"}:
+        admin_url = admin_url.set(drivername="postgresql+psycopg")
+    engine = create_engine(admin_url, pool_pre_ping=True)
+    created = False
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+        created = True
+        isolated_url = admin_url.update_query_dict({"options": f"-csearch_path={schema}"})
+        yield isolated_url.render_as_string(hide_password=False)
+    finally:
+        if created:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
+        engine.dispose()
+
+
 @pytest.mark.skipif(not POSTGRES_URL, reason="MSYNC_POSTGRES_URL is not configured")
-def test_postgres_sync_writes_round_trip_native_histories(tmp_path: Path) -> None:
+def test_postgres_sync_writes_round_trip_native_histories(
+    tmp_path: Path, postgres_url: str
+) -> None:
     run_id = str(uuid4())
     claude_prompt = f"Postgres Claude prompt {run_id}"
     codex_prompt = f"Postgres Codex prompt {run_id}"
@@ -70,7 +99,7 @@ def test_postgres_sync_writes_round_trip_native_histories(tmp_path: Path) -> Non
                 "--dir",
                 str(codex_root),
                 "--database",
-                POSTGRES_URL,
+                postgres_url,
             ],
         )
 
@@ -92,7 +121,7 @@ def test_postgres_sync_writes_round_trip_native_histories(tmp_path: Path) -> Non
                     "--provider",
                     provider,
                     "--database",
-                    POSTGRES_URL,
+                    postgres_url,
                 ],
             )
             assert feedback.exit_code == 0, feedback.output
@@ -107,14 +136,14 @@ def test_postgres_sync_writes_round_trip_native_histories(tmp_path: Path) -> Non
                 "--dir",
                 str(codex_root),
                 "--database",
-                POSTGRES_URL,
+                postgres_url,
             ],
         )
         assert repeated.exit_code == 0, repeated.output
         assert len(_generated_paths(claude_root)) == 1
         assert len(_generated_paths(codex_root)) == 1
 
-        with Archive(POSTGRES_URL) as archive, archive.engine.connect() as connection:
+        with Archive(postgres_url) as archive, archive.engine.connect() as connection:
             locations = connection.execute(
                 select(LocationRow.id).where(LocationRow.root_path.in_(str(root) for root in roots))
             ).all()
@@ -126,7 +155,7 @@ def test_postgres_sync_writes_round_trip_native_histories(tmp_path: Path) -> Non
         assert len(locations) == 2
         assert len(conversations) == 2
     finally:
-        with Archive(POSTGRES_URL) as archive, archive.engine.begin() as connection:
+        with Archive(postgres_url) as archive, archive.engine.begin() as connection:
             connection.execute(
                 delete(LocationRow).where(LocationRow.root_path.in_(str(root) for root in roots))
             )
@@ -134,7 +163,7 @@ def test_postgres_sync_writes_round_trip_native_histories(tmp_path: Path) -> Non
 
 @pytest.mark.skipif(not POSTGRES_URL, reason="MSYNC_POSTGRES_URL is not configured")
 def test_postgres_concurrent_uploads_keep_one_logical_revision(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, postgres_url: str
 ) -> None:
     session_id = str(uuid4())
     items: list[tuple[Path, Path]] = []
@@ -182,7 +211,7 @@ def test_postgres_concurrent_uploads_keep_one_logical_revision(
     def upload(item: tuple[Path, Path]) -> None:
         root, path = item
         try:
-            with Archive(POSTGRES_URL) as archive:
+            with Archive(postgres_url) as archive:
                 archive.upload(
                     root=root,
                     provider=get_provider("codex"),
@@ -192,7 +221,7 @@ def test_postgres_concurrent_uploads_keep_one_logical_revision(
             errors.append(error)
 
     try:
-        with Archive(POSTGRES_URL):
+        with Archive(postgres_url):
             pass
         threads = [threading.Thread(target=upload, args=(item,)) for item in items]
         for thread in threads:
@@ -202,7 +231,7 @@ def test_postgres_concurrent_uploads_keep_one_logical_revision(
 
         assert not errors
         assert all(not thread.is_alive() for thread in threads)
-        with Archive(POSTGRES_URL) as archive, archive.engine.connect() as connection:
+        with Archive(postgres_url) as archive, archive.engine.connect() as connection:
             count = connection.scalar(
                 select(func.count(ConversationRow.id))
                 .join(LocationRow, ConversationRow.location_id == LocationRow.id)
@@ -210,7 +239,7 @@ def test_postgres_concurrent_uploads_keep_one_logical_revision(
             )
         assert count == 1
     finally:
-        with Archive(POSTGRES_URL) as archive, archive.engine.begin() as connection:
+        with Archive(postgres_url) as archive, archive.engine.begin() as connection:
             connection.execute(delete(LocationRow).where(LocationRow.root_path.in_(roots)))
 
 

@@ -17,6 +17,9 @@ def test_claude_schema_accepts_aliases_and_retains_new_provider_fields() -> None
             "type": "assistant",
             "sessionId": "session-1",
             "parentUuid": "message-1",
+            "isMeta": True,
+            "isSidechain": True,
+            "sourceToolUseID": "tool-1",
             "message": {
                 "role": "assistant",
                 "content": [{"type": "text", "text": "hello"}],
@@ -29,6 +32,9 @@ def test_claude_schema_accepts_aliases_and_retains_new_provider_fields() -> None
     dumped = record.model_dump(mode="json", by_alias=True)
     assert record.session_id == "session-1"
     assert record.parent_uuid == "message-1"
+    assert record.is_meta is True
+    assert record.is_sidechain is True
+    assert record.source_tool_use_id == "tool-1"
     assert dumped["futureRecordField"] == {"enabled": True}
     assert dumped["message"]["futureMessageField"] is True
 

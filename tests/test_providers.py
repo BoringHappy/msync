@@ -232,6 +232,60 @@ def test_claude_mixed_message_keeps_prose_separate_from_tool_payload() -> None:
     assert json.loads(event.parts[1].raw_json)["name"] == "Read"
 
 
+@pytest.mark.parametrize(
+    ("envelope", "content", "subtype"),
+    [
+        ({"isMeta": True}, "Internal context supplied to the model", "injected_context"),
+        (
+            {"isSidechain": True},
+            "Base directory for this skill: /opt/claude/skills/example\n\n# Skill instructions",
+            "skill_context",
+        ),
+        (
+            {"sourceToolUseID": "tool-1"},
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]\nBackground task completed",
+            "system_notification",
+        ),
+    ],
+)
+def test_claude_injected_context_is_not_a_human_message(
+    envelope: dict[str, object], content: str, subtype: str
+) -> None:
+    provider = get_provider("claude")
+    value = {
+        "type": "user",
+        "uuid": "context-1",
+        "sessionId": "session-1",
+        "message": {"role": "user", "content": content},
+        **envelope,
+    }
+
+    event = provider.decode_event(0, json.dumps(value), value)
+
+    assert event.role == "metadata"
+    assert event.event_subtype == subtype
+    assert event.visibility == "metadata"
+    assert event.searchable_text == ""
+    assert event.parts[0].text == content
+
+
+def test_claude_genuine_sidechain_prompt_remains_a_human_message() -> None:
+    provider = get_provider("claude")
+    value = {
+        "type": "user",
+        "uuid": "prompt-1",
+        "sessionId": "session-1",
+        "isSidechain": True,
+        "message": {"role": "user", "content": "Review the implementation."},
+    }
+
+    event = provider.decode_event(0, json.dumps(value), value)
+
+    assert event.role == "user"
+    assert event.visibility == "display"
+    assert event.searchable_text == "Review the implementation."
+
+
 @pytest.mark.parametrize("subtype", ["function_call", "function_call_output", "mcp_call"])
 def test_codex_tool_items_are_separate_display_events(subtype: str) -> None:
     provider = get_provider("codex")

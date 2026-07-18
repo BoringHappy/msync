@@ -81,6 +81,21 @@ def _archive_claude_tool_conversation(database: Path, root: Path) -> None:
             "message": {"role": "user", "content": "Inspect the build log"},
         },
         {
+            "type": "user",
+            "uuid": "skill-context-1",
+            "sessionId": "tool-session",
+            "timestamp": "2026-07-14T12:00:00.500Z",
+            "isMeta": True,
+            "isSidechain": True,
+            "message": {
+                "role": "user",
+                "content": (
+                    "Base directory for this skill: /opt/skills/review"
+                    "\n\nLarge internal instructions"
+                ),
+            },
+        },
+        {
             "type": "assistant",
             "uuid": "assistant-1",
             "sessionId": "tool-session",
@@ -169,6 +184,11 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
         search_results = client.get("/api/conversations", params={"search": "blue widget"})
         location_id = locations.json()[1]["id"]
         selected_location = client.get("/api/conversations", params={"location": location_id})
+        first_page = client.get("/api/conversations", params={"limit": 1, "offset": 0})
+        second_page = client.get("/api/conversations", params={"limit": 1, "offset": 1})
+        oldest = client.get("/api/conversations", params={"order": "oldest"})
+        by_title = client.get("/api/conversations", params={"order": "title"})
+        invalid_order = client.get("/api/conversations", params={"order": "random"})
 
     assert locations.status_code == 200
     assert len(locations.json()) == 2
@@ -179,6 +199,22 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
     assert [item["external_id"] for item in search_results.json()] == ["first-session"]
     assert len(selected_location.json()) == 1
     assert selected_location.json()[0]["location_id"] == location_id
+    assert len(first_page.json()) == 1
+    assert len(second_page.json()) == 1
+    assert first_page.json()[0]["id"] != second_page.json()[0]["id"]
+    assert [item["external_id"] for item in all_conversations.json()] == [
+        "second-session",
+        "first-session",
+    ]
+    assert [item["external_id"] for item in oldest.json()] == [
+        "first-session",
+        "second-session",
+    ]
+    assert [item["external_id"] for item in by_title.json()] == [
+        "first-session",
+        "second-session",
+    ]
+    assert invalid_order.status_code == 422
 
 
 def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) -> None:
@@ -195,6 +231,10 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
         client.auth = ("reader", "secret")
         summary = client.get("/api/conversations").json()[0]
         response = client.get(f"/api/conversations/{summary['id']}")
+        paged = client.get(
+            f"/api/conversations/{summary['id']}",
+            params={"event_limit": 2, "event_offset": 1},
+        )
         missing = client.get("/api/conversations/999999")
         page = client.get("/")
         script = client.get("/assets/app.js")
@@ -211,15 +251,49 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert detail["events"][1]["text"] == "Show all event detail"
     assert json.loads(detail["events"][1]["raw_json"])["type"] == "event_msg"
     assert any(event["visibility"] == "model" for event in detail["events"])
+    assert paged.status_code == 200
+    assert paged.json()["summary"]["event_count"] == 4
+    assert [event["sequence"] for event in paged.json()["events"]] == [1, 2]
     assert missing.status_code == 404
     assert "Raw events" in page.text
     assert "ctrlKey" in script.text
     assert "moveEventFocus" in script.text
     assert "location.hostname" in script.text
+    assert "SESSION_PAGE_SIZE" in script.text
+    assert "EVENT_PAGE_SIZE" in script.text
+    assert "loadMoreEvents" in script.text
+    assert "ensureDetails" in script.text
+    assert "disclosure.children.length === 1" in script.text
+    assert "matchesTranscriptQuery" in script.text
+    assert "requestId !== state.listRequest" in script.text
+    assert "reloadArchive" in script.text
+    assert "copyConversationLink" in script.text
+    assert "setSidebar" in script.text
+    assert "updateTitleOverflow" in script.text
+    assert "setFitWidth" in script.text
+    assert "moveHumanMessage" in script.text
+    assert "renderMarkdownTable" in script.text
     assert 'data-transcript-filter="tools"' in page.text
+    assert 'id="load-more"' in page.text
+    assert 'id="copy-link"' in page.text
+    assert 'id="transcript-search"' in page.text
+    assert 'id="sidebar-scrim"' in page.text
+    assert 'id="order-select"' in page.text
+    assert 'id="toggle-width"' in page.text
+    assert 'id="conversation-title-tooltip"' in page.text
+    assert 'id="previous-human"' in page.text
+    assert 'id="next-human"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
+    assert ".filter-count" in styles.text
+    assert ".transcript-search" in styles.text
+    assert ".transcript-load-more" in styles.text
+    assert ".sidebar-scrim:not(.hidden)" in styles.text
+    assert ".conversation.fit-width" in styles.text
+    assert ".title-tooltip" in styles.text
+    assert ".human-nav" in styles.text
+    assert ".markdown-table" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
 
@@ -240,14 +314,20 @@ def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Pat
     assert summary["message_count"] == 3
     assert [event["role"] for event in detail["events"]] == [
         "user",
+        "metadata",
         "assistant",
         "tool",
         "assistant",
     ]
-    assert detail["events"][1]["text"] == "I will check it."
-    assert detail["events"][2]["event_subtype"] == "tool_result"
-    assert detail["events"][2]["text"] == "Build completed successfully"
+    assert detail["events"][1]["event_subtype"] == "skill_context"
+    assert detail["events"][1]["visibility"] == "metadata"
+    assert detail["events"][1]["text"] == ""
+    assert detail["events"][2]["text"] == "I will check it."
+    assert detail["events"][3]["event_subtype"] == "tool_result"
+    assert detail["events"][3]["text"] == "Build completed successfully"
     assert "conversationItems" in script
+    assert "isInjectedClaudeContext" in script
+    assert "Claude skill/context" in script
     assert "appendToolItem" in script
     assert "renderMarkdown" in script
     assert "hasEmbeddedOutput" in script
@@ -256,6 +336,7 @@ def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Pat
     assert "navigator.clipboard" in script
     assert "tool-output-disclosure" in styles
     assert ".tool-finished" in styles
+    assert ".context-notice" in styles
 
 
 def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None:
