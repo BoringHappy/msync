@@ -1,136 +1,142 @@
 # msync
 
-Keep your AI conversations, context, and decisions in sync. `msync` archives local
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex JSONL transcripts in one
-database, then can generate native histories that both clients recognize and resume. SQLAlchemy
-provides SQLite and PostgreSQL persistence through the same schema and sync flow.
+Keep your Claude Code and Codex conversations in one searchable archive.
+
+`msync` can copy conversations between both clients, back them up to your own server, and provide a
+private web UI for browsing them later. Original transcript data is preserved.
+
+## Choose what you need
+
+| I want to... | Start with |
+| --- | --- |
+| Keep Claude Code and Codex history in sync | `msync sync --dir ~/.claude --dir ~/.codex` |
+| Search my local archive | `msync search "search text"` |
+| Browse my local archive | `MSYNC_SERVER_PASSWORD='password' msync server` |
+| Back up history to another machine | [Run a server](#back-up-to-an-msync-server), then use `msync upload` |
+| Upload every completed session automatically | [Install the plugin](#automatic-uploads) |
 
 ## Install
 
-Install or upgrade the CLI directly from GitHub with [uv](https://docs.astral.sh/uv/):
+Requirements: Python 3.14+ and [uv](https://docs.astral.sh/uv/).
 
 ```console
 $ uv tool install --upgrade git+https://github.com/BoringHappy/msync.git
+$ msync --help
 ```
 
-For local development:
+## Sync Claude Code and Codex locally
 
 ```console
-$ uv sync
-$ uv run msync --help
+$ msync sync --dir ~/.claude --dir ~/.codex
 ```
 
-To make the command available outside the checkout:
+This command:
+
+1. Archives new or changed conversations in `~/.msync/msync.sqlite`.
+2. Adds each conversation to the other client's history in its native format.
+3. Keeps sessions separate and resumable.
+
+Running it again is safe: unchanged and duplicate conversations are skipped. Existing native
+transcripts are not overwritten.
+
+For a custom directory, specify its provider when it cannot be detected from its name or contents:
 
 ```console
-$ uv tool install .
+$ msync sync --dir /mnt/claude-history --provider claude
 ```
 
-Python 3.14 or newer is required.
-
-## Docker
-
-The published container image is available at `ghcr.io/boringhappy/msync`. To run msync with the
-bundled PostgreSQL service, configure the accounts and database password, then start the default
-Compose configuration:
+Use another SQLite file or a PostgreSQL database with `--database`:
 
 ```console
-$ export MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web-password,bob-upload-token'
+$ msync sync --dir ~/.codex --database ./history.sqlite
+```
+
+## Search or browse the archive
+
+Search message text from the terminal:
+
+```console
+$ msync search "database migration"
+$ msync sample 5
+```
+
+Start the private web UI:
+
+```console
+$ MSYNC_SERVER_PASSWORD='choose-a-password' msync server
+```
+
+Open <http://127.0.0.1:8000> and sign in with username `msync` and the password you chose. Set a
+different username with `MSYNC_SERVER_USERNAME` or use `--username`.
+
+The browser includes archive summaries, conversation search, message and tool filters, raw event
+inspection, and deep links to sessions.
+
+## Back up to an msync server
+
+Remote backup has two parts: run an authenticated server, then upload from each client machine.
+
+### 1. Run the server with Docker
+
+Clone this repository, then start msync with its bundled PostgreSQL database:
+
+```console
+$ export MSYNC_SERVER_ACCOUNTS='alice,web-password,upload-token'
 $ export POSTGRES_PASSWORD='choose-a-strong-database-password'
 $ make docker-up-postgres
 ```
 
-PostgreSQL data is retained in a named volume. The container safely encodes the database URL at
-startup, so the PostgreSQL password can contain URL-reserved characters without additional
-escaping.
+Open <http://localhost:8000> and sign in as `alice` with `web-password`.
 
-To connect only the msync container to an existing PostgreSQL database, use the external-database
-configuration and provide its SQLAlchemy URL:
+Each account uses `username,password[,upload-token]`. Separate multiple accounts with semicolons:
 
 ```console
-$ export MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web-password,bob-upload-token'
+$ export MSYNC_SERVER_ACCOUNTS='alice,alice-password,alice-token;bob,bob-password,bob-token'
+```
+
+Usernames and tokens must be unique. Commas and semicolons cannot appear inside these values.
+
+To use an existing PostgreSQL database instead:
+
+```console
+$ export MSYNC_SERVER_ACCOUNTS='alice,web-password,upload-token'
 $ export MSYNC_DATABASE_URL='postgresql+psycopg://msync:secret@database.example.com/msync'
 $ make docker-up-external-db
 ```
 
-Use `host.docker.internal` as the database host when the database runs on the Docker host. Both
-configurations expose the browser on `http://localhost:8000` and use
-`ghcr.io/boringhappy/msync:latest`. `MSYNC_SERVER_ACCOUNTS` contains semicolon-separated
-`username,password[,token]` entries. Each password authenticates that user's browser login; the
-optional, unique token authenticates that user's remote uploads. Commas and semicolons cannot be
-used inside these credentials. Override `MSYNC_PORT` or `MSYNC_IMAGE` when a different port or
-pinned image tag is needed.
+Set `MSYNC_PORT` to change the published port or `MSYNC_IMAGE` to pin a different image tag. When
+PostgreSQL runs on the Docker host, use `host.docker.internal` as its hostname.
 
-## Upload history
-
-Upload Codex history to a running msync server. The URL and token can both come from the
-environment, which is the recommended configuration for automatic hooks:
+### 2. Upload history from a client
 
 ```console
 $ export MSYNC_UPLOAD_URL='https://history.example.com'
 $ export MSYNC_UPLOAD_TOKEN='alice-token'
+$ msync upload --dir ~/.claude
 $ msync upload --dir ~/.codex
 ```
 
-Claude Code and additional installations work the same way. `--url` and `--token` remain available
-for one-off commands, while the environment keeps the token out of shell history:
+The URL can also be passed with `--url` and the token with `--token`. Environment variables are
+recommended because they keep the token out of shell history.
+
+`upload` is read-only for the source directory. It verifies transcripts before sending them and
+uploads only new or changed sessions. A failed transcript is reported without preventing other
+valid transcripts from uploading. Each transcript can be up to 256 MiB.
+
+Use HTTPS whenever the server is available over a network. Upload tokens and archive contents
+should be protected like the original Claude Code and Codex history directories.
+
+## Automatic uploads
+
+The included plugin queues the completed session for upload after every Claude Code or Codex turn.
+It returns immediately and safely ignores repeated events.
+
+First install `msync` and set these variables in the environment that launches your client:
 
 ```console
-$ msync upload --dir ~/.claude
-$ msync upload --dir ~/.codex_another
+$ export MSYNC_UPLOAD_URL='https://history.example.com'
+$ export MSYNC_UPLOAD_TOKEN='alice-token'
 ```
-
-Locations are identified by account, hostname, and directory path, so users or machines that use
-the same path remain distinct in a shared archive. Both `upload` and `sync` default to the local
-machine name; override it with `--hostname` or `MSYNC_HOSTNAME` when a stable alias is preferable:
-
-```console
-$ msync upload --dir ~/.codex --url https://history.example.com --hostname workstation-a
-```
-
-The provider is detected from the directory layout and JSONL records. It can be specified when a
-custom layout is ambiguous:
-
-```console
-$ msync upload --dir /mnt/history --provider codex --url https://history.example.com
-```
-
-Upload one native session transcript without scanning the other history files:
-
-```console
-$ msync upload --dir ~/.codex \
-    --transcript ~/.codex/sessions/2026/07/18/rollout-session.jsonl \
-    --provider codex
-```
-
-The transcript must be contained by `--dir`. Its native session identifier is read from the file,
-so it cannot disagree with a separate command-line session ID.
-
-`upload` requires `--url` or `MSYNC_UPLOAD_URL`; direct `--database` uploads are no longer supported.
-The client detects and verifies every selected native transcript locally before opening a network
-connection. Empty, malformed, oversized, and timestamp-less sessions are skipped with their
-relative paths and failure reasons; verified sessions are still uploaded, while the command reports
-the failed count and exits non-zero for an incomplete upload. The client streams verified
-transcripts byte-for-byte, one file at a time, over the authenticated API and records the
-authenticated account, client hostname, source path, result counts, and upload time. A history
-directory has no aggregate upload limit; each individual transcript is capped at 256 MiB. The
-server rejects oversized request bodies before parsing them and spools accepted network bodies to
-disk before archive processing. Uploads retain the same hash-based update, duplicate, and schema
-checks. Treat an upload token like a password and use HTTPS whenever the server is reached over a
-network.
-
-### Automatic uploads from Claude Code and Codex
-
-The bundled `msync` plugin registers a `Stop` hook for both clients. Every completed agent turn
-starts a detached `msync upload` process for only the `transcript_path` supplied by that hook. The
-hook returns immediately. For Claude Code, the background process waits until the hook's final
-assistant message appears in the transcript and the file becomes quiet; Codex uses the quiet window
-directly. The worker then verifies and uploads the transcript. The server imports a new relative
-path, skips unchanged or stale content, or replaces the normalized events when a newer transcript
-has changed, so repeated and overlapping Stop events are safe upserts.
-
-Install the `msync` CLI as described above, export `MSYNC_UPLOAD_URL` and `MSYNC_UPLOAD_TOKEN` in the
-environment that launches the client, then install the plugin from this repository.
 
 For Claude Code:
 
@@ -146,249 +152,47 @@ $ codex plugin marketplace add BoringHappy/msync
 $ codex plugin add msync@msync
 ```
 
-Codex requires newly installed command hooks to be reviewed before they run; open `/hooks`, inspect
-the `msync upload-hook` command, and trust it. The plugin quietly does nothing when either required
-environment variable is absent. It reads the provider from the native transcript path and the
-session ID from the transcript content; neither value needs manual hook configuration.
+After installing the Codex plugin, open `/hooks`, review the `msync upload-hook` command, and trust
+it. The plugin does nothing when either required environment variable is missing.
 
-On every connection, `msync` detects whether its schema is absent, initializes a new database from
-the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
-unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
-triggers. Existing schemas are migrated by the explicit `msync upgrade` maintenance command.
-During the development phase, version 5 is the oldest supported upgrade baseline; earlier
-development schemas should be recreated or exported with their compatible msync release. Known
-migrations are registered as sequential steps. Schema v7 adds account ownership and tenant-local
-revision uniqueness. Schema v8 adds upload-time conversation metrics and owner revisions so the
-dashboard does not rescan native events on every request. Schema v9 adds account-owned upload
-history and normalized input, output, and cached token counts. Future migrations can extend the
-same chain without changing the CLI workflow. Partial or otherwise incompatible schemas fail
-before any transcript is uploaded.
+## Useful commands
 
-For a shared or large archive, stop uploads and run the schema upgrade explicitly before starting
-the web server:
-
-```console
-$ msync upgrade --database 'postgresql://msync:secret@localhost/msync'
-```
-
-The command reports each migration step and reindexing progress, and waits at most 10 seconds for
-concurrent database transactions by default. Use `--lock-timeout SECONDS` to change that limit. If
-another upload still holds a lock, the upgrade exits with recovery instructions instead of
-appearing to hang. Regular commands never perform a long migration during startup; they direct the
-operator to `msync upgrade` when the archive is behind. Upgrade every machine using a shared
-archive before resuming uploads.
-
-Uploads are idempotent. Each file is addressed by its source location and relative path, then
-compared by SHA-256. New files are inserted, changed files replace their normalized event records,
-and unchanged files are skipped. Before insertion, msync also skips a logical session revision that
-is already archived through another location or provider.
-
-The raw SHA-256 identifies an exact provider transcript. A canonical chat SHA-256 hashes the
-ordered visible `(role, text)` turns, while a stable logical session UUID follows the conversation
-through provider conversions and location changes. Both have indexed columns on `conversations`
-and are also stored under `metadata_json._msync`. A database unique index on
-`(account_username, logical_session_id, chat_sha256)` prevents concurrent or sequential uploads of
-an exported Claude or Codex copy from creating another conversation row within the same account. A
-changed chat hash distinguishes a new revision of the same logical session.
-
-`upload` only reads the source directory. Use `sync` when native history files should also be
-written.
-
-## Sync Claude and Codex
-
-Merge both local histories through the archive and write each conversation back in the native
-format of both clients:
-
-```console
-$ msync sync --dir ~/.claude --dir ~/.codex
-```
-
-The command runs in two phases: it first archives new or changed native transcripts from every
-location, then writes all archived conversations into each location's provider format. Session
-boundaries remain intact, so each source conversation appears as a separate resumable conversation
-instead of one combined transcript. Repeating the command is idempotent.
-
-Provider names are normally detected from the directory name or content. Specify one provider per
-directory, in the same order, for neutral or newly created locations:
-
-```console
-$ msync sync --dir /mnt/merged-claude --provider claude
-$ msync sync --dir /mnt/a --dir /mnt/b --provider claude --provider codex
-```
-
-`sync` uses the same `--database` option as the other commands, including PostgreSQL URLs. This also
-makes it possible to generate a new native history location from conversations that were uploaded
-earlier:
-
-```console
-$ msync sync --dir /mnt/merged-codex --provider codex --database ./history.sqlite
-```
-
-Native transcripts already belonging to the target provider are copied byte-for-byte when needed.
-Cross-provider conversion writes the visible user and assistant messages using typed native JSONL
-schemas. Provider-specific tool calls, reasoning, usage, and system metadata remain losslessly
-available in the archive but are not translated into the other provider's execution protocol.
-
-Every destination contains a `.msync-manifest.json` provenance file. It prevents exported copies
-from feeding back into the archive on the next sync. Existing sessions are immutable: a changed
-source receives a new deterministic revision ID and path, and same-provider path collisions are
-cloned under that revision identity instead of overwriting either session. Sessions continued in
-Claude or Codex are left untouched. Revision IDs derive only from the stable logical session UUID
-and canonical chat SHA-256, so the same revision gets the same native ID regardless of its source
-provider or location. A session already native to the destination location is skipped. Unknown path
-collisions are reported and left untouched. Sync rejects symlinks in every destination path
-component, and generated transcript and manifest files use owner-only permissions.
-
-## Search history
-
-Search the normalized message text in the default archive:
-
-```console
-$ msync search "blue widget"
-```
-
-Search uses a portable SQL `LIKE` query and returns each matching event with its provider,
-conversation, timestamp, role, and message text. Pass `--database` (or `--db`) to search a different
-archive:
-
-```console
-$ msync search "blue widget" --database ./history.sqlite
-```
-
-Randomly inspect a limited number of non-empty archived messages to spot-check imported data:
-
-```console
-$ msync sample 5
-$ msync sample 5 --database ./history.sqlite
-```
-
-## Browse history on the web
-
-Start the authenticated FastAPI history browser against the default archive:
-
-```console
-$ MSYNC_SERVER_PASSWORD='choose-a-strong-password' msync server
-```
-
-Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a terminal-inspired
-Claude/Codex layout. The overview dashboard summarizes session, message, tool, streak, provider,
-and recent-work activity. The dedicated **Insights** page adds a 30-day activity pulse, weekly and
-hourly rhythms, session depth, plus top project, tool, and model breakdowns. Metrics are scoped to
-the signed-in archive account, cached by its archive revision, and refreshed automatically within
-about 15 seconds of a completed upload. The session browser includes a location picker, search,
-chronological message rendering, and lossless event inspection. Tool calls and results share
-compact activity cards, while assistant messages render common Markdown, GitHub-style tables, and
-fenced code blocks without accepting
-embedded HTML. Injected Claude skill/context records are kept out of the human conversation and
-remain available in **Raw events**. Order the session list by time, activity, or title. Long
-conversation titles stay on one line and expose their full value on hover or keyboard focus. Use the
-**Activity**, **Chat**, **Tools**, and **Reasoning** filters (or keys 1–4), navigate messages with
-J/K and sessions with `[`/`]`, or jump between human messages with the floating arrows (Alt+↑/↓).
-Find text within the currently loaded events from the toolbar. **Fit width** switches between the
-focused reading column and the full window and remembers the selection. Large session lists and
-long transcripts load incrementally. The header refreshes archive contents, **Copy link** creates a
-deep link to the active session, and the mobile session drawer closes by tapping outside it.
-Select **Raw events** (or press Ctrl+O) to inspect every native record and its source JSON.
-
-If startup detects an old schema, it asks whether to upgrade the database. Answer `y` to run the
-registered migrations with the same bounded lock wait and progress reporting as `msync upgrade`,
-or accept the default `N` to leave the database unchanged and stop the server. For unattended
-startup, run `msync upgrade` explicitly during a maintenance window before launching the server.
-
-Choose a different archive, login, address, or port with command options:
-
-```console
-$ MSYNC_SERVER_PASSWORD='secret' msync server \
-    --database ./history.sqlite --username reader --host 127.0.0.1 --port 8765
-```
-
-`MSYNC_SERVER_USERNAME` can also set the username. If the password environment variable is absent,
-the command prompts without echoing the password. The default loopback address keeps the browser
-local. The sign-in form sends credentials to the server before creating an HTTP-only session
-cookie; put msync behind an HTTPS reverse proxy before binding it to a network-accessible address.
-
-For a shared server, configure multiple accounts in `username,password[,token]` format, separated
-by semicolons:
-
-```console
-$ MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web-password' \
-    msync server --database ./history.sqlite --host 0.0.0.0
-```
-
-The same value can be passed with `--accounts`. Commas and semicolons are delimiters and therefore
-cannot appear inside usernames, passwords, or tokens; usernames and tokens must also be unique.
-Every account can sign in through the browser login page. The optional third field enables
-Bearer-token uploads for that account. An entry with only username and password, such as `bob`
-above, is browser-only and cannot upload remotely. The username is also the persistent tenant
-identifier in the archive, so keep it stable; passwords and tokens can be rotated independently.
-Programmatic browser API clients can continue to send those credentials with HTTP Basic
-authentication.
-
-Locations, conversations, duplicate detection, list results, and conversation-detail lookups are
-isolated by account. A user cannot discover or fetch another user's conversation by guessing its
-numeric ID. After upgrading an existing single-user archive, its legacy unowned records are visible
-only to the first configured account; new token uploads are owned directly by the token's account.
-The original `MSYNC_SERVER_USERNAME`/`MSYNC_SERVER_PASSWORD` and `--username`/`--password` options
-remain available for single-user browsing, but that compatibility account has no upload token.
-
-## Storage model
-
-The database is deliberately split into distinct storage and indexing layers:
-
-| Table | Purpose |
+| Command | Purpose |
 | --- | --- |
-| `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
-| `locations` | One account, hostname, and Claude/Codex data-directory tuple, allowing isolated users, machines, and installations. |
-| `conversations` | Account-owned session metadata, tenant-local logical revision identity, and a zlib-compressed byte-exact source JSONL. |
-| `conversation_metrics` | Upload-time message, event, tool, token, timing, and preview facts used by the dashboard. |
-| `archive_revisions` | Per-owner change tokens used for aggregate cache invalidation and browser refresh. |
-| `upload_history` | Successful remote uploads with an account owner, source identity, result counts, and timestamp. |
-| `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
-| `message_parts` | Structured content blocks such as text, tool use, and tool results. |
-| `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |
+| `msync sync` | Archive local histories and write native Claude/Codex copies |
+| `msync upload` | Send new or changed transcripts to a remote server |
+| `msync search` | Find text in archived messages |
+| `msync sample` | Inspect random archived messages |
+| `msync server` | Start the authenticated web UI and upload API |
+| `msync upgrade` | Upgrade an existing archive schema |
 
-The retained transcript blob and per-event raw JSON preserve all data needed for future export or
-conversation reconstruction. Normalized columns are an index, not a replacement for the retained
-source. Schema upgrades can therefore rebuild normalized events from the byte-exact transcript;
-schema v6 does this once to distinguish human messages from tool content in existing archives.
-When Claude or Codex records include usage data, schema v9 also derives per-conversation token
-totals for the overview; records without provider usage data contribute zero rather than an
-estimate.
-Foreign keys record the location of the retained copy. Identical logical revisions found in
-another provider or location are skipped; different revisions remain distinct when they exist as
-separate source transcripts. SHA-256 hostname/path identities keep portable indexes compact.
-PostgreSQL full-text indexes can be added as a search adapter without changing the portable archive
-records.
+Run `msync COMMAND --help` for all options.
 
-## Provider architecture
+### Database upgrades
 
-History sources are parallel adapters under `src/msync/providers/`:
+If msync reports that an archive schema is old, stop other msync processes and run:
 
-| Module | Responsibility |
-| --- | --- |
-| `base.py` | Shared `HistoryProvider` contract, lossless JSONL reader, and content helpers. |
-| `claude.py` | Claude Code discovery, event parsing, session metadata, and subagent handling. |
-| `codex.py` | Codex session discovery, event parsing, and session metadata. |
-| `__init__.py` | Ordered provider registry, explicit lookup, and automatic format detection. |
+```console
+$ msync upgrade --database ~/.msync/msync.sqlite
+```
 
-Native message and rollout contracts are Pydantic models under `src/msync/schemas/`. They validate
-the fields msync reads and writes while retaining unknown fields added by future client versions.
-The Claude and Codex adapters use these models for both import validation and native generation.
+For a shared archive, upgrade it during a maintenance window before restarting uploads or the web
+server.
 
-The CLI and database use provider names from the registry rather than a hard-coded enum. Adding a
-future source requires a `HistoryProvider` subclass and one registry entry; upload orchestration,
-SQLAlchemy storage, location isolation, and CLI provider selection remain unchanged.
+## How data is handled
 
-Automatic detection is deterministic. It first checks whether the directory basename contains a
-registered provider name, case-insensitively. Without a name match, each adapter parses only its
-fixed internal candidates: Claude checks `history.jsonl` and `projects/**/*.jsonl`; Codex checks
-`history.jsonl`, `sessions/**/*.jsonl`, and `archived_sessions/**/*.jsonl`. Claude records are
-identified by fields such as `sessionId`/`uuid`, while Codex records use `session_id` or Codex event
-types such as `session_meta`. Conflicting evidence is reported as ambiguous instead of guessed.
+- SQLite is used by default; PostgreSQL is supported through the same SQLAlchemy schema.
+- Source JSONL is retained byte-for-byte in the archive and indexed for search and export.
+- Sync and upload are idempotent and use hashes to skip unchanged or duplicate sessions.
+- Generated histories include a `.msync-manifest.json` file to prevent exported copies from being
+  imported again.
+- Shared-server data is isolated by account.
+- `upload` only reads history directories; `sync` intentionally adds native transcript files to
+  every directory passed with `--dir`.
 
-The archive contains the full conversation content, so it should be protected like the original
-`~/.claude` and `~/.codex` directories. `upload` is read-only for provider directories; `sync`
-intentionally creates native transcripts in every directory passed to it.
+Provider-specific tool calls, reasoning, usage, and system metadata remain in the archive. When a
+conversation is converted for the other client, only visible user and assistant messages are
+translated into that client's native format.
 
 ## Development
 
@@ -398,3 +202,7 @@ $ uv run pytest
 $ uv run ruff check .
 $ uv run ruff format --check .
 ```
+
+Install the local checkout as a command with `uv tool install .`.
+
+Licensed under the [Apache License 2.0](LICENSE).
