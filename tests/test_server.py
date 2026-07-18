@@ -452,6 +452,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert paged.json()["summary"]["event_count"] == 4
     assert [event["sequence"] for event in paged.json()["events"]] == [1, 2]
     assert missing.status_code == 404
+    assert "<title>AI Coding Sessions · msync</title>" in page.text
     assert "Raw events" in page.text
     assert "ctrlKey" in script.text
     assert "moveEventFocus" in script.text
@@ -469,6 +470,20 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "updateTitleOverflow" in script.text
     assert "setFitWidth" in script.text
     assert "moveHumanMessage" in script.text
+    assert "sessionLoaderObserver" in script.text
+    assert "transcriptLoaderObserver" in script.text
+    assert "cancelEventPagination" in script.text
+    assert "transcriptLoaderObserver?.takeRecords()" in script.text
+    scroll_top_function = script.text.split("function scrollConversationTop()", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert 'behavior: "smooth"' not in scroll_top_function
+    scroll_bottom_function = script.text.split("function scrollConversationBottom()", 1)[
+        1
+    ].split("\n}", 1)[0]
+    assert "await loadMoreEvents()" in scroll_bottom_function
+    assert "elements.content.scrollHeight" in scroll_bottom_function
+    assert 'behavior: "smooth"' not in scroll_bottom_function
     assert "renderMarkdownTable" in script.text
     assert 'data-transcript-filter="tools"' in page.text
     assert 'id="load-more"' in page.text
@@ -480,6 +495,8 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert 'id="conversation-title-tooltip"' in page.text
     assert 'id="previous-human"' in page.text
     assert 'id="next-human"' in page.text
+    assert 'id="conversation-top"' in page.text
+    assert 'id="conversation-bottom"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
@@ -490,6 +507,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert ".conversation.fit-width" in styles.text
     assert ".title-tooltip" in styles.text
     assert ".human-nav" in styles.text
+    assert ".human-nav .nav-top, .human-nav .nav-bottom" in styles.text
     assert ".markdown-table" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
