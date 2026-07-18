@@ -28,6 +28,7 @@ from msync.schemas.claude import (
     ClaudeAssistantMessage,
     ClaudeAssistantRecord,
     ClaudeGeneratedContentBlock,
+    ClaudeGeneratedTranscript,
     ClaudeGeneratedUsage,
     ClaudeRecord,
     ClaudeUserMessage,
@@ -215,9 +216,7 @@ class ClaudeProvider(HistoryProvider):
     def validate_export_schema(self, transcript: bytes) -> None:
         """Accept only the two strict Claude record shapes emitted by msync."""
 
-        records = 0
-        session_id: str | None = None
-        parent_uuid: str | None = None
+        records: list[ClaudeUserRecord | ClaudeAssistantRecord] = []
         for line_number, raw_line in enumerate(transcript.splitlines(), start=1):
             if not raw_line.strip():
                 continue
@@ -227,27 +226,22 @@ class ClaudeProvider(HistoryProvider):
                     raise ValueError("record is not a JSON object")
                 record_type = value.get("type")
                 if record_type == "user":
-                    ClaudeUserRecord.model_validate(value)
+                    record = ClaudeUserRecord.model_validate(value)
                 elif record_type == "assistant":
-                    ClaudeAssistantRecord.model_validate(value)
+                    record = ClaudeAssistantRecord.model_validate(value)
                 else:
                     raise ValueError(f"unsupported generated Claude record type {record_type!r}")
-                current_session_id = value.get("sessionId")
-                if session_id is None:
-                    session_id = current_session_id
-                elif current_session_id != session_id:
-                    raise ValueError("all generated records must use the same sessionId")
-                if value.get("parentUuid") != parent_uuid:
-                    raise ValueError("generated parentUuid chain is not contiguous")
-                parent_uuid = value.get("uuid")
             except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as error:
                 detail = " ".join(str(error).split())
                 raise HistoryFormatError(
                     f"generated Claude transcript line {line_number} is invalid: {detail}"
                 ) from error
-            records += 1
-        if not records:
-            raise HistoryFormatError("generated Claude transcript contains no records")
+            records.append(record)
+        try:
+            ClaudeGeneratedTranscript.model_validate(records)
+        except ValidationError as error:
+            detail = " ".join(str(error).split())
+            raise HistoryFormatError(f"generated Claude transcript is invalid: {detail}") from error
 
     def export_relative_path(
         self,

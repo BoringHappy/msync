@@ -27,6 +27,7 @@ from msync.schemas.codex import (
     CodexContentBlock,
     CodexEventMessageLine,
     CodexEventMessagePayload,
+    CodexGeneratedTranscript,
     CodexResponseMessageLine,
     CodexResponseMessagePayload,
     CodexRolloutLine,
@@ -194,8 +195,7 @@ class CodexProvider(HistoryProvider):
     def validate_export_schema(self, transcript: bytes) -> None:
         """Validate generated rollout envelopes and their discriminated payloads."""
 
-        record_count = 0
-        session_meta_count = 0
+        records: list[CodexSessionMetaLine | CodexResponseMessageLine | CodexEventMessageLine] = []
         for line_number, raw_line in enumerate(transcript.splitlines(), start=1):
             if not raw_line.strip():
                 continue
@@ -207,28 +207,14 @@ class CodexProvider(HistoryProvider):
                 payload = value.get("payload")
                 payload_type = payload.get("type") if isinstance(payload, dict) else None
                 if record_type == "session_meta":
-                    CodexSessionMetaLine.model_validate(value)
-                    session_meta_count += 1
-                    if record_count:
-                        raise ValueError("session_meta must be the first generated record")
-                    if payload.get("id") != payload.get("session_id"):
-                        raise ValueError("session_meta id and session_id must match")
+                    record = CodexSessionMetaLine.model_validate(value)
                 elif record_type == "response_item" and payload_type == "message":
-                    line = CodexResponseMessageLine.model_validate(value)
-                    expected_content_type = (
-                        "input_text" if line.payload.role == "user" else "output_text"
-                    )
-                    if any(block.type != expected_content_type for block in line.payload.content):
-                        raise ValueError(
-                            f"{line.payload.role} messages require {expected_content_type} blocks"
-                        )
+                    record = CodexResponseMessageLine.model_validate(value)
                 elif record_type == "event_msg" and payload_type in {
                     "user_message",
                     "agent_message",
                 }:
-                    line = CodexEventMessageLine.model_validate(value)
-                    if line.payload.type == "user_message" and line.payload.phase is not None:
-                        raise ValueError("user_message events cannot declare an assistant phase")
+                    record = CodexEventMessageLine.model_validate(value)
                 else:
                     raise ValueError(
                         f"unsupported generated Codex record {record_type!r}/{payload_type!r}"
@@ -238,11 +224,12 @@ class CodexProvider(HistoryProvider):
                 raise HistoryFormatError(
                     f"generated Codex transcript line {line_number} is invalid: {detail}"
                 ) from error
-            record_count += 1
-        if not record_count:
-            raise HistoryFormatError("generated Codex transcript contains no records")
-        if session_meta_count != 1:
-            raise HistoryFormatError("generated Codex transcript requires exactly one session_meta")
+            records.append(record)
+        try:
+            CodexGeneratedTranscript.model_validate(records)
+        except ValidationError as error:
+            detail = " ".join(str(error).split())
+            raise HistoryFormatError(f"generated Codex transcript is invalid: {detail}") from error
 
     def export_relative_path(
         self,

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, RootModel, model_validator
 
 from msync.schemas.base import NativeRecord, StrictNativeRecord
 
@@ -138,3 +138,34 @@ class ClaudeAssistantRecord(ClaudeGeneratedRecord):
 
     type: Literal["assistant"] = "assistant"
     message: ClaudeAssistantMessage
+
+
+type ClaudeGeneratedTranscriptRecord = Annotated[
+    ClaudeUserRecord | ClaudeAssistantRecord,
+    Field(discriminator="type"),
+]
+
+
+class ClaudeGeneratedTranscript(RootModel[list[ClaudeGeneratedTranscriptRecord]]):
+    """A generated message chain that Claude Code can resume."""
+
+    @model_validator(mode="after")
+    def require_resumable_message_chain(self) -> Self:
+        """Keep every record reachable through Claude's parent UUID chain."""
+
+        if not self.root:
+            raise ValueError("generated Claude transcript contains no records")
+
+        session_id = self.root[0].session_id
+        parent_uuid: UUID | None = None
+        seen_uuids: set[UUID] = set()
+        for record in self.root:
+            if record.session_id != session_id:
+                raise ValueError("all generated records must use the same sessionId")
+            if record.uuid in seen_uuids:
+                raise ValueError("generated record UUIDs must be unique")
+            if record.parent_uuid != parent_uuid:
+                raise ValueError("generated parentUuid chain is not contiguous")
+            seen_uuids.add(record.uuid)
+            parent_uuid = record.uuid
+        return self

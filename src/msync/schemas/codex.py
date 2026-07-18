@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import Field, SerializeAsAny
+from pydantic import Field, RootModel, SerializeAsAny, model_validator
 
 from msync.schemas.base import NativeRecord, StrictNativeRecord
 
@@ -56,6 +56,15 @@ class CodexResponseMessagePayload(StrictNativeRecord):
     role: Literal["user", "assistant"]
     content: list[CodexContentBlock]
 
+    @model_validator(mode="after")
+    def require_role_content_type(self) -> Self:
+        """Use the native block type expected for each message role."""
+
+        expected_type = "input_text" if self.role == "user" else "output_text"
+        if any(block.type != expected_type for block in self.content):
+            raise ValueError(f"{self.role} messages require {expected_type} blocks")
+        return self
+
 
 class CodexEventMessagePayload(StrictNativeRecord):
     """A user-facing message event replayed by Codex's session UI."""
@@ -66,6 +75,14 @@ class CodexEventMessagePayload(StrictNativeRecord):
     images: list[str] | None = None
     local_images: list[str] | None = None
     text_elements: list[dict[str, object]] | None = None
+
+    @model_validator(mode="after")
+    def prohibit_user_message_phase(self) -> Self:
+        """Reserve response phases for agent messages."""
+
+        if self.type == "user_message" and self.phase is not None:
+            raise ValueError("user_message events cannot declare an assistant phase")
+        return self
 
 
 class CodexRolloutLine(NativeRecord):
@@ -103,3 +120,25 @@ class CodexEventMessageLine(CodexGeneratedRolloutLine):
 
     type: Literal["event_msg"] = "event_msg"
     payload: CodexEventMessagePayload
+
+
+type CodexGeneratedTranscriptRecord = Annotated[
+    CodexSessionMetaLine | CodexResponseMessageLine | CodexEventMessageLine,
+    Field(discriminator="type"),
+]
+
+
+class CodexGeneratedTranscript(RootModel[list[CodexGeneratedTranscriptRecord]]):
+    """A generated rollout that Codex can discover and replay."""
+
+    @model_validator(mode="after")
+    def require_session_metadata(self) -> Self:
+        """Keep the canonical session metadata first and unambiguous."""
+
+        if not self.root:
+            raise ValueError("generated Codex transcript contains no records")
+        if not isinstance(self.root[0], CodexSessionMetaLine):
+            raise ValueError("session_meta must be the first generated record")
+        if sum(isinstance(record, CodexSessionMetaLine) for record in self.root) != 1:
+            raise ValueError("generated Codex transcript requires exactly one session_meta")
+        return self
