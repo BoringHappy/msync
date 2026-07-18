@@ -180,21 +180,15 @@ def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -
     with Archive(database, upgrade_reporter=lambda *step: upgrade_steps.append(step)) as archive:
         assert archive.browse_conversations()[0].external_id == "migration-session"
 
-    expected_hash = hashlib.sha256(
-        f"\0{archive.hostname.casefold()}\0{root}".encode()
-    ).hexdigest()
+    expected_hash = hashlib.sha256(f"\0{archive.hostname.casefold()}\0{root}".encode()).hexdigest()
     with closing(sqlite3.connect(database)) as connection:
-        location_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(locations)")
-        }
+        location_columns = {row[1] for row in connection.execute("PRAGMA table_info(locations)")}
         conversation_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(conversations)")
         }
         revision_columns = tuple(
             row[2]
-            for row in connection.execute(
-                "PRAGMA index_info(conversations_logical_revision_uq)"
-            )
+            for row in connection.execute("PRAGMA index_info(conversations_logical_revision_uq)")
         )
         stored_location = connection.execute(
             "SELECT account_username, root_path_hash FROM locations"

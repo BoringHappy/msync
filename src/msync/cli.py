@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -16,7 +17,13 @@ from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
-from msync.database import Archive, SchemaUpgradeRequiredError, SearchResult, UploadResult
+from msync.database import (
+    Archive,
+    ArchivedConversation,
+    SchemaUpgradeRequiredError,
+    SearchResult,
+    UploadResult,
+)
 from msync.hooks import queue_session_upload, wait_for_transcript_stable
 from msync.providers import (
     HistoryFormatError,
@@ -237,15 +244,13 @@ def sync(
             help="Provider history directory to merge (repeat for each location).",
         ),
     ],
-    database: Annotated[
+    url: Annotated[
         str,
         typer.Option(
-            "--database",
-            "--db",
-            help="SQLite path or SQLAlchemy database URL.",
-            show_default=str(DEFAULT_DATABASE),
+            envvar="MSYNC_ENDPOINT",
+            help="Base URL of the msync server to synchronize (or set MSYNC_ENDPOINT).",
         ),
-    ] = str(DEFAULT_DATABASE),
+    ],
     provider: Annotated[
         list[str] | None,
         typer.Option(
@@ -262,11 +267,20 @@ def sync(
             help="Hostname recorded for these source locations (defaults to this machine).",
         ),
     ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_TOKEN",
+            help="API access token for --url (or set MSYNC_TOKEN).",
+        ),
+    ] = None,
 ) -> None:
-    """Merge histories through the archive and write each provider's native format."""
+    """Merge remote archive histories into each provider's native format."""
 
     roots = [path.expanduser().resolve() for path in directory]
     try:
+        if not token:
+            raise ValueError("--url requires --token or MSYNC_TOKEN.")
         if len(set(roots)) != len(roots):
             raise HistoryFormatError("Each sync directory must be unique.")
         for root in roots:
@@ -276,31 +290,58 @@ def sync(
         for root in roots:
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        with Archive(database, hostname=hostname, auto_upgrade=False) as archive:
-            uploads = []
-            for root, selected_provider in zip(roots, selected_providers, strict=True):
-                transcripts = unmanaged_transcripts(
-                    root,
-                    selected_provider.discover(root),
-                )
-                uploads.append(
-                    archive.upload(
-                        root=root,
-                        provider=selected_provider,
-                        transcripts=transcripts,
-                    )
-                )
-            conversations = archive.conversations()
-            sync_results = [
-                sync_conversations(
-                    conversations,
-                    destination=root,
+        verified_by_root: list[list[Path]] = []
+        verification_failures: list[SessionVerificationFailure] = []
+        for root, selected_provider in zip(roots, selected_providers, strict=True):
+            transcripts = unmanaged_transcripts(root, selected_provider.discover(root))
+            verified, failures = _verify_transcripts(
+                root=root,
+                provider=selected_provider,
+                transcripts=transcripts,
+            )
+            verified_by_root.append(verified)
+            verification_failures.extend(failures)
+        if verification_failures:
+            _print_session_verification(
+                verified=sum(len(transcripts) for transcripts in verified_by_root),
+                failures=tuple(verification_failures),
+            )
+            raise HistoryFormatError(
+                "Sync stopped before upload because a session failed validation."
+            )
+
+        location_hostname = _upload_hostname(hostname)
+        uploads: list[UploadResult] = []
+        server_display = _server_url(url)
+        for root, selected_provider, transcripts in zip(
+            roots,
+            selected_providers,
+            verified_by_root,
+            strict=True,
+        ):
+            if transcripts:
+                upload_result, server_display = _remote_upload(
+                    url=server_display,
+                    token=token,
+                    root=root,
+                    hostname=location_hostname,
                     provider=selected_provider,
+                    transcripts=transcripts,
                 )
-                for root, selected_provider in zip(roots, selected_providers, strict=True)
-            ]
-            database_display = archive.display_database
-            location_hostname = archive.hostname
+            else:
+                upload_result = UploadResult(location_id=0)
+            uploads.append(upload_result)
+
+        conversations = _remote_conversations(server_display, token)
+        sync_results = [
+            sync_conversations(
+                conversations,
+                destination=root,
+                provider=selected_provider,
+                current_hostname=location_hostname,
+            )
+            for root, selected_provider in zip(roots, selected_providers, strict=True)
+        ]
     except (
         HistoryFormatError,
         ImportError,
@@ -319,7 +360,7 @@ def sync(
             root=root,
             provider=selected_provider,
             hostname=location_hostname,
-            database=database_display,
+            server=server_display,
             upload=upload_result,
             result=sync_result,
         )
@@ -370,15 +411,6 @@ def server(
             help="Single-user web password (or set MSYNC_SERVER_PASSWORD).",
         ),
     ] = None,
-    database: Annotated[
-        str,
-        typer.Option(
-            "--database",
-            "--db",
-            help="SQLite path or SQLAlchemy database URL.",
-            show_default=str(DEFAULT_DATABASE),
-        ),
-    ] = str(DEFAULT_DATABASE),
     host: Annotated[
         str,
         typer.Option(help="Address on which the web server listens."),
@@ -407,6 +439,7 @@ def server(
 ) -> None:
     """Start the authenticated history browser and remote-upload API."""
 
+    database = os.environ.get("MSYNC_DATABASE_URL") or str(DEFAULT_DATABASE)
     console.print("Checking database schema...")
     try:
         import uvicorn
@@ -465,17 +498,22 @@ def search(
         str,
         typer.Argument(help="Text to find in archived conversation messages."),
     ],
-    database: Annotated[
+    url: Annotated[
         str,
         typer.Option(
-            "--database",
-            "--db",
-            help="SQLite path or SQLAlchemy database URL.",
-            show_default=str(DEFAULT_DATABASE),
+            envvar="MSYNC_ENDPOINT",
+            help="Base URL of the msync server to search (or set MSYNC_ENDPOINT).",
         ),
-    ] = str(DEFAULT_DATABASE),
+    ],
+    token: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_TOKEN",
+            help="API access token for --url (or set MSYNC_TOKEN).",
+        ),
+    ] = None,
 ) -> None:
-    """Search archived conversation messages."""
+    """Search remote archived conversation messages."""
 
     query = search_text.strip()
     if not query:
@@ -483,9 +521,11 @@ def search(
         raise typer.Exit(code=1)
 
     try:
-        with Archive(database, auto_upgrade=False) as archive:
-            results = archive.search(query)
-    except (ImportError, OSError, RuntimeError, SQLAlchemyError) as error:
+        if not token:
+            raise ValueError("--url requires --token or MSYNC_TOKEN.")
+        conversations = _remote_conversations(url, token, search_text=query)
+        results = _conversation_results(conversations, search_text=query)
+    except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
         error_console.print(f"[bold red]Search failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
 
@@ -500,23 +540,29 @@ def search(
 def sample(
     limit: Annotated[
         int,
-        typer.Argument(min=1, help="Maximum number of archived messages to inspect."),
+        typer.Argument(min=1, max=500, help="Maximum number of archived messages to inspect."),
     ],
-    database: Annotated[
+    url: Annotated[
         str,
         typer.Option(
-            "--database",
-            "--db",
-            help="SQLite path or SQLAlchemy database URL.",
-            show_default=str(DEFAULT_DATABASE),
+            envvar="MSYNC_ENDPOINT",
+            help="Base URL of the msync server to sample (or set MSYNC_ENDPOINT).",
         ),
-    ] = str(DEFAULT_DATABASE),
+    ],
+    token: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_TOKEN",
+            help="API access token for --url (or set MSYNC_TOKEN).",
+        ),
+    ] = None,
 ) -> None:
-    """Show a random sample of archived conversation messages."""
+    """Show a random sample of remote archived conversation messages."""
 
     try:
-        with Archive(database, auto_upgrade=False) as archive:
-            results = archive.sample(limit)
+        if not token:
+            raise ValueError("--url requires --token or MSYNC_TOKEN.")
+        results = _remote_sample(url, token, limit)
     except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
         error_console.print(f"[bold red]Sample failed:[/bold red] {error}")
         raise typer.Exit(code=1) from error
@@ -663,15 +709,9 @@ def _print_session_verification(
         error_console.print(Text.assemble(("  Reason: ", "dim"), failure.reason))
 
 
-def _remote_upload(
-    *,
-    url: str,
-    token: str,
-    root: Path,
-    hostname: str,
-    provider: HistoryProvider,
-    transcripts: list[Path],
-) -> tuple[UploadResult, str]:
+def _server_url(url: str) -> str:
+    """Validate and normalize an msync server base URL."""
+
     try:
         server_url = httpx.URL(url)
     except (TypeError, ValueError) as error:
@@ -682,8 +722,216 @@ def _remote_upload(
         raise ValueError(
             "msync server URL must not contain credentials, a query string, or a fragment."
         )
+    return str(server_url).rstrip("/")
 
-    endpoint = f"{str(server_url).rstrip('/')}/api/upload"
+
+def _remote_json(
+    url: str,
+    token: str,
+    path: str,
+    *,
+    params: dict[str, str | int] | None = None,
+) -> object:
+    """Read one authenticated JSON API response without following redirects."""
+
+    server_url = _server_url(url)
+    try:
+        response = httpx.get(
+            f"{server_url}{path}",
+            params=params,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+            timeout=httpx.Timeout(connect=10, read=60, write=10, pool=10),
+        )
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"Could not reach msync server {server_url}: {error}") from error
+    if not response.is_success:
+        try:
+            detail = response.json().get("detail")
+        except ValueError, AttributeError:
+            detail = None
+        message = detail if isinstance(detail, str) and detail else response.reason_phrase
+        raise RuntimeError(f"msync server returned HTTP {response.status_code}: {message}")
+    try:
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError("msync server returned invalid JSON.") from error
+
+
+def _remote_conversations(
+    url: str,
+    token: str,
+    *,
+    search_text: str = "",
+) -> list[ArchivedConversation]:
+    """Reconstruct the authenticated account's raw-event archive through the public API."""
+
+    locations_payload = _remote_json(url, token, "/api/locations")
+    if not isinstance(locations_payload, list):
+        raise RuntimeError("msync server returned an invalid location list.")
+    location_details: dict[int, tuple[str, str]] = {}
+    for item in locations_payload:
+        if not isinstance(item, dict):
+            raise RuntimeError("msync server returned an invalid location.")
+        location_id = item.get("id")
+        hostname = item.get("hostname")
+        root_path = item.get("root_path")
+        if (
+            not isinstance(location_id, int)
+            or not isinstance(hostname, str)
+            or not hostname
+            or not isinstance(root_path, str)
+            or not root_path
+        ):
+            raise RuntimeError("msync server returned an invalid location.")
+        location_details[location_id] = (hostname, root_path)
+
+    summaries: list[dict[str, object]] = []
+    offset = 0
+    while True:
+        page = _remote_json(
+            url,
+            token,
+            "/api/conversations",
+            params={
+                "search": search_text,
+                "order": "oldest",
+                "limit": 500,
+                "offset": offset,
+            },
+        )
+        if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
+            raise RuntimeError("msync server returned an invalid conversation list.")
+        summaries.extend(page)
+        if len(page) < 500:
+            break
+        offset += len(page)
+
+    conversations: list[ArchivedConversation] = []
+    for summary in summaries:
+        conversation_id = summary.get("id")
+        location_id = summary.get("location_id")
+        provider_name = summary.get("provider")
+        if (
+            not isinstance(conversation_id, int)
+            or not isinstance(location_id, int)
+            or not isinstance(provider_name, str)
+            or location_id not in location_details
+        ):
+            raise RuntimeError("msync server returned an invalid conversation summary.")
+        detail = _remote_json(url, token, f"/api/conversations/{conversation_id}")
+        if not isinstance(detail, dict):
+            raise RuntimeError("msync server returned an invalid conversation.")
+        relative_path = detail.get("relative_path")
+        events = detail.get("events")
+        if not isinstance(relative_path, str) or not relative_path or not isinstance(events, list):
+            raise RuntimeError("msync server returned an invalid conversation.")
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("msync server returned an unsafe conversation path.")
+        raw_records: list[str] = []
+        for event in events:
+            raw_json = event.get("raw_json") if isinstance(event, dict) else None
+            if not isinstance(raw_json, str) or not raw_json:
+                raise RuntimeError("msync server returned an invalid conversation event.")
+            raw_records.append(raw_json)
+        transcript = ("\n".join(raw_records) + "\n").encode()
+        source_hostname, source_root = location_details[location_id]
+        root = Path(source_root)
+        provider = get_provider(provider_name)
+        conversation = provider.read(root / relative, root, transcript=transcript)
+        conversations.append(
+            ArchivedConversation(
+                location_id=location_id,
+                source_hostname=source_hostname,
+                source_root=source_root,
+                source_mtime_ns=0,
+                conversation=conversation,
+            )
+        )
+    return conversations
+
+
+def _remote_sample(url: str, token: str, limit: int) -> list[SearchResult]:
+    """Request a bounded random message sample from the authenticated archive."""
+
+    payload = _remote_json(url, token, "/api/sample", params={"limit": limit})
+    if not isinstance(payload, list):
+        raise RuntimeError("msync server returned an invalid message sample.")
+    results: list[SearchResult] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise RuntimeError("msync server returned an invalid sampled message.")
+        provider = item.get("provider")
+        conversation_id = item.get("conversation_id")
+        title = item.get("title")
+        relative_path = item.get("relative_path")
+        role = item.get("role")
+        occurred_at = item.get("occurred_at")
+        event_text = item.get("text")
+        if (
+            not isinstance(provider, str)
+            or not isinstance(conversation_id, str)
+            or (title is not None and not isinstance(title, str))
+            or not isinstance(relative_path, str)
+            or (role is not None and not isinstance(role, str))
+            or (occurred_at is not None and not isinstance(occurred_at, str))
+            or not isinstance(event_text, str)
+        ):
+            raise RuntimeError("msync server returned an invalid sampled message.")
+        results.append(
+            SearchResult(
+                provider=provider,
+                conversation_id=conversation_id,
+                title=title,
+                relative_path=relative_path,
+                role=role,
+                occurred_at=occurred_at,
+                text=event_text,
+            )
+        )
+    return results
+
+
+def _conversation_results(
+    conversations: list[ArchivedConversation],
+    *,
+    search_text: str = "",
+) -> list[SearchResult]:
+    """Flatten remote normalized events into the CLI's rich search result view."""
+
+    query = search_text.casefold()
+    results: list[SearchResult] = []
+    for archived in conversations:
+        conversation = archived.conversation
+        for event in conversation.events:
+            event_text = event.searchable_text.strip()
+            if not event_text or (query and query not in event_text.casefold()):
+                continue
+            results.append(
+                SearchResult(
+                    provider=conversation.provider,
+                    conversation_id=conversation.external_id,
+                    title=conversation.title,
+                    relative_path=conversation.relative_path,
+                    role=event.role,
+                    occurred_at=event.occurred_at,
+                    text=event_text,
+                )
+            )
+    return results
+
+
+def _remote_upload(
+    *,
+    url: str,
+    token: str,
+    root: Path,
+    hostname: str,
+    provider: HistoryProvider,
+    transcripts: list[Path],
+) -> tuple[UploadResult, str]:
+    server_url = _server_url(url)
+    endpoint = f"{server_url}/api/upload"
     aggregate: UploadResult | None = None
     timeout = httpx.Timeout(connect=10, read=None, write=None, pool=10)
     for path in transcripts:
@@ -733,7 +981,7 @@ def _remote_upload(
             )
     if aggregate is None:
         raise RuntimeError("Remote upload requires at least one transcript.")
-    return aggregate, str(server_url).rstrip("/")
+    return aggregate, server_url
 
 
 def _stream_remote_transcript(prefix: bytes, path: Path) -> Iterator[bytes]:
@@ -744,7 +992,7 @@ def _stream_remote_transcript(prefix: bytes, path: Path) -> Iterator[bytes]:
 
 
 def _remote_upload_response(response: httpx.Response) -> UploadResult:
-    if response.is_error:
+    if not response.is_success:
         try:
             detail = response.json().get("detail")
         except ValueError, AttributeError:
@@ -772,7 +1020,7 @@ def _print_sync_result(
     root: Path,
     provider: HistoryProvider,
     hostname: str,
-    database: str,
+    server: str,
     upload: UploadResult,
     result: SyncResult,
 ) -> None:
@@ -782,7 +1030,7 @@ def _print_sync_result(
     table.add_row("Provider", provider.name)
     table.add_row("Hostname", hostname)
     table.add_row("Location", str(root))
-    table.add_row("Database", database)
+    table.add_row("Server", server)
     table.add_row("Transcripts scanned", str(upload.scanned))
     table.add_row("Archived", str(upload.imported))
     table.add_row("Archive updated", str(upload.updated))

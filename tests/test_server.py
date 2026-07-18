@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from msync.cli import app
-from msync.database import Archive
+from msync.database import Archive, RemoteTranscript
 from msync.providers import get_provider
 from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata, encode_upload_prefix
 from msync.server import (
@@ -530,6 +530,67 @@ def test_access_tokens_upload_read_and_isolate_accounts(
         ).fetchall() == [("alice", 2), ("carol", 1)]
 
 
+def test_remote_sample_is_bounded_and_tenant_isolated(tmp_path: Path) -> None:
+    database = tmp_path / "sample.sqlite"
+    accounts = (
+        ServerAccount("alice", "alice-password", "alice-token"),
+        ServerAccount("bob", "bob-password", "bob-token"),
+    )
+    with Archive(database) as archive:
+        for username, message in (("alice", "Alice only"), ("bob", "Bob only")):
+            content = (
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-14T12:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": f"{username}-session", "cwd": "/tmp"},
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "timestamp": "2026-07-14T12:00:01Z",
+                        "type": "event_msg",
+                        "payload": {"type": "user_message", "message": message},
+                    }
+                )
+                + "\n"
+            ).encode()
+            archive.upload_remote(
+                root_path=f"/home/{username}/.codex",
+                display_name=".codex",
+                provider=get_provider("codex"),
+                hostname=f"{username}-host",
+                account_username=username,
+                transcripts=[
+                    RemoteTranscript(
+                        relative_path=f"sessions/{username}.jsonl",
+                        content=content,
+                    )
+                ],
+            )
+
+    web_app = create_app(database, accounts=accounts)
+    with TestClient(web_app) as client:
+        alice = client.get(
+            "/api/sample", params={"limit": 1}, headers=_upload_headers("alice-token")
+        )
+        bob = client.get("/api/sample", params={"limit": 1}, headers=_upload_headers("bob-token"))
+        too_large = client.get(
+            "/api/sample",
+            params={"limit": 501},
+            headers=_upload_headers("alice-token"),
+        )
+        unauthenticated = client.get("/api/sample", params={"limit": 1})
+
+    assert alice.status_code == 200
+    assert [item["text"] for item in alice.json()] == ["Alice only"]
+    assert bob.status_code == 200
+    assert [item["text"] for item in bob.json()] == ["Bob only"]
+    assert too_large.status_code == 422
+    assert unauthenticated.status_code == 401
+
+
 def test_remote_upload_upserts_changed_single_transcript(tmp_path: Path) -> None:
     web_app = create_app(
         tmp_path / "archive.sqlite",
@@ -1010,13 +1071,12 @@ def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None
             "secret",
             "--username",
             "reader",
-            "--database",
-            str(database),
             "--host",
             "127.0.0.1",
             "--port",
             "8765",
         ],
+        env={"MSYNC_DATABASE_URL": str(database)},
     )
 
     assert result.exit_code == 0, result.output
@@ -1043,9 +1103,8 @@ def test_server_command_accepts_multi_account_configuration(
             "server",
             "--accounts",
             "alice,alice-password,alice-token;bob,bob-password",
-            "--database",
-            str(tmp_path / "server.sqlite"),
         ],
+        env={"MSYNC_DATABASE_URL": str(tmp_path / "server.sqlite")},
     )
 
     assert result.exit_code == 0, result.output
@@ -1065,8 +1124,9 @@ def test_server_command_leaves_old_schema_unchanged_when_upgrade_declined(
 
     result = CliRunner().invoke(
         app,
-        ["server", "--password", "secret", "--database", str(database)],
+        ["server", "--password", "secret"],
         input="n\n",
+        env={"MSYNC_DATABASE_URL": str(database)},
     )
 
     assert result.exit_code == 1
@@ -1098,8 +1158,9 @@ def test_server_command_upgrades_old_schema_when_confirmed(
     monkeypatch.setattr("uvicorn.run", fake_run)
     result = CliRunner().invoke(
         app,
-        ["server", "--password", "secret", "--database", str(database)],
+        ["server", "--password", "secret"],
         input="y\n",
+        env={"MSYNC_DATABASE_URL": str(database)},
     )
 
     assert result.exit_code == 0, result.output

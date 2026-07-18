@@ -43,20 +43,19 @@ def command(
     arguments: Sequence[str],
     environment: Mapping[str, str],
 ) -> list[str]:
-    """Return the msync command, adding a generated database URL when needed."""
+    """Return the msync command; database configuration is environment-only."""
 
-    result = ["msync", *arguments]
-    configured_url = database_url(environment)
-    has_database_option = any(argument in {"--database", "--db"} for argument in arguments)
-    if configured_url is not None and not has_database_option:
-        result.extend(("--database", configured_url))
-    return result
+    del environment
+    return ["msync", *arguments]
 
 
 def main() -> None:
     """Replace the container entrypoint process with msync."""
 
     try:
+        configured_url = database_url(os.environ) or os.environ.get("MSYNC_DATABASE_URL")
+        if configured_url is not None:
+            os.environ["MSYNC_DATABASE_URL"] = configured_url
         selected_command = command(sys.argv[1:], os.environ)
     except ValueError as error:
         print(f"Container startup failed: {error}", file=sys.stderr)

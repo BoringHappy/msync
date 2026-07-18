@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from msync.database import Archive, RemoteTranscript
+from msync.database import Archive, RemoteTranscript, SearchResult
 from msync.providers import get_provider
 from msync.remote import (
     UPLOAD_BODY_MAX_BYTES,
@@ -149,6 +149,20 @@ class UploadResponse(BaseModel):
     duplicates: int
     events: int
     message_parts: int
+
+
+class SearchResultResponse(BaseModel):
+    """One bounded archived message returned to a CLI client."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    provider: str
+    conversation_id: str
+    title: str | None
+    relative_path: str
+    role: str | None
+    occurred_at: str | None
+    text: str
 
 
 class LocationResponse(BaseModel):
@@ -714,6 +728,17 @@ def create_app(
             limit=limit,
             offset=offset,
             preview_max_chars=preview_chars,
+            account_username=account.username,
+            include_legacy=account.username == legacy_owner,
+        )
+
+    @app.get("/api/sample", response_model=list[SearchResultResponse])
+    def sample_messages(
+        limit: Annotated[int, Query(ge=1, le=500)] = 5,
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
+    ) -> list[SearchResult]:
+        return archive.sample(
+            limit,
             account_username=account.username,
             include_legacy=account.username == legacy_owner,
         )

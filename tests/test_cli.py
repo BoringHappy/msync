@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 from collections.abc import Iterator
-from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from click import unstyle
+from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from msync.cli import app
 from msync.database import Archive
 from msync.providers import get_provider
 from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata
+from msync.server import ServerAccount, create_app
+
+REMOTE_URL = "https://history.example"
+REMOTE_TOKEN = "cli-token"
+REMOTE_ACCOUNT = "cli-user"
 
 
 def _write_codex_transcript(
@@ -48,7 +52,36 @@ def _archive_transcripts(root: Path, database: Path, provider_name: str = "codex
             root=resolved_root,
             provider=provider,
             transcripts=provider.discover(resolved_root),
+            account_username=REMOTE_ACCOUNT,
         )
+
+
+@pytest.fixture
+def remote_cli_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    database = tmp_path / "remote-cli.sqlite"
+    web_app = create_app(
+        database,
+        accounts=(ServerAccount(REMOTE_ACCOUNT, "password", REMOTE_TOKEN),),
+    )
+    with TestClient(web_app) as client:
+
+        def remote_get(
+            url: str,
+            *,
+            params: dict[str, str | int] | None,
+            headers: dict[str, str],
+            timeout: httpx.Timeout,
+        ) -> httpx.Response:
+            del timeout
+            target = httpx.URL(url)
+            assert f"{target.scheme}://{target.host}" == REMOTE_URL
+            return client.get(target.path, params=params, headers=headers)
+
+        monkeypatch.setattr("msync.cli.httpx.get", remote_get)
+        yield database
 
 
 def test_upload_requires_url(tmp_path: Path) -> None:
@@ -599,6 +632,27 @@ def test_upload_no_longer_accepts_database(tmp_path: Path) -> None:
     assert "No such option: --database" in unstyle(result.output)
 
 
+def test_no_command_accepts_database_option(tmp_path: Path) -> None:
+    root = tmp_path / ".codex"
+    root.mkdir()
+    commands = (
+        ["sync", "--dir", str(root), "--provider", "codex"],
+        ["search", "history"],
+        ["sample", "1"],
+        ["server", "--password", "secret"],
+    )
+
+    for command in commands:
+        result = CliRunner().invoke(
+            app,
+            [*command, "--database", "archive.sqlite"],
+            env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
+        )
+
+        assert result.exit_code == 2
+        assert "No such option: --database" in unstyle(result.output)
+
+
 def test_upload_rejects_oversized_transcript_before_network_access(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -636,23 +690,10 @@ def test_upgrade_command_is_not_available() -> None:
     assert "No such command 'upgrade'" in unstyle(result.output)
 
 
-def test_regular_command_directs_schema_upgrade_through_server(tmp_path: Path) -> None:
-    database = tmp_path / "archive.sqlite"
-    with Archive(database):
-        pass
-    with closing(sqlite3.connect(database)) as connection:
-        connection.execute("UPDATE schema_info SET value = '5' WHERE key = 'schema_version'")
-        connection.execute("PRAGMA user_version = 5")
-        connection.commit()
-
-    result = CliRunner().invoke(app, ["sample", "1", "--database", str(database)])
-
-    assert result.exit_code == 1
-    assert "must be upgraded to 9" in result.output
-    assert "msync server --database <database>" in result.output
-
-
-def test_search_command_finds_text_with_like_query(tmp_path: Path) -> None:
+def test_search_command_finds_text_with_remote_query(
+    tmp_path: Path,
+    remote_cli_archive: Path,
+) -> None:
     root = tmp_path / ".codex"
     transcript = root / "sessions/rollout.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -680,12 +721,12 @@ def test_search_command_finds_text_with_like_query(tmp_path: Path) -> None:
         )
         + "\n"
     )
-    database = tmp_path / "search.sqlite"
-    _archive_transcripts(root, database)
+    _archive_transcripts(root, remote_cli_archive)
 
     result = CliRunner().invoke(
         app,
-        ["search", "blue widget", "--database", str(database)],
+        ["search", "blue widget"],
+        env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
     )
 
     assert result.exit_code == 0, result.output
@@ -694,19 +735,21 @@ def test_search_command_finds_text_with_like_query(tmp_path: Path) -> None:
     assert "Find the blue widget today" in result.output
 
 
-def test_search_command_reports_no_matches(tmp_path: Path) -> None:
-    database = tmp_path / "empty.sqlite"
-
+def test_search_command_reports_no_matches(remote_cli_archive: Path) -> None:
     result = CliRunner().invoke(
         app,
-        ["search", "missing", "--database", str(database)],
+        ["search", "missing"],
+        env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
     )
 
     assert result.exit_code == 0, result.output
     assert "No matches found for missing." in result.output
 
 
-def test_sample_command_limits_random_messages(tmp_path: Path) -> None:
+def test_sample_command_limits_random_remote_messages(
+    tmp_path: Path,
+    remote_cli_archive: Path,
+) -> None:
     root = tmp_path / ".codex"
     transcript = root / "sessions/rollout.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -737,12 +780,12 @@ def test_sample_command_limits_random_messages(tmp_path: Path) -> None:
         )
         + "\n"
     )
-    database = tmp_path / "sample.sqlite"
-    _archive_transcripts(root, database)
+    _archive_transcripts(root, remote_cli_archive)
 
     result = CliRunner().invoke(
         app,
-        ["sample", "2", "--database", str(database)],
+        ["sample", "2"],
+        env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
     )
 
     assert result.exit_code == 0, result.output
@@ -754,12 +797,52 @@ def test_sample_command_limits_random_messages(tmp_path: Path) -> None:
     assert result.output.count("Role         user") == 2
 
 
-def test_sample_command_reports_empty_archive(tmp_path: Path) -> None:
-    database = tmp_path / "empty.sqlite"
+def test_sample_requests_only_the_bounded_remote_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[str, dict[str, str | int] | None]] = []
 
+    def fake_get(
+        url: str,
+        *,
+        params: dict[str, str | int] | None,
+        headers: dict[str, str],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del headers, timeout
+        requests.append((url, params))
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "provider": "codex",
+                    "conversation_id": "sample-session",
+                    "title": "Sample message",
+                    "relative_path": "sessions/sample.jsonl",
+                    "role": "user",
+                    "occurred_at": "2026-07-14T12:00:01Z",
+                    "text": "One bounded sample",
+                }
+            ],
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr("msync.cli.httpx.get", fake_get)
     result = CliRunner().invoke(
         app,
-        ["sample", "3", "--database", str(database)],
+        ["sample", "1", "--url", REMOTE_URL, "--token", REMOTE_TOKEN],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "One bounded sample" in result.output
+    assert requests == [(f"{REMOTE_URL}/api/sample", {"limit": 1})]
+
+
+def test_sample_command_reports_empty_archive(remote_cli_archive: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["sample", "3"],
+        env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
     )
 
     assert result.exit_code == 0, result.output

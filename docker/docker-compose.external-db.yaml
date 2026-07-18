@@ -9,11 +9,10 @@ services:
       - "${MSYNC_PORT:-8000}:8000"
     environment:
       MSYNC_SERVER_ACCOUNTS: "${MSYNC_SERVER_ACCOUNTS:?Set MSYNC_SERVER_ACCOUNTS}"
+      MSYNC_DATABASE_URL: "${MSYNC_DATABASE_URL:?Set MSYNC_DATABASE_URL to a SQLAlchemy database URL}"
     command:
       - server
       - --host
       - 0.0.0.0
-      - --database
-      - "${MSYNC_DATABASE_URL:?Set MSYNC_DATABASE_URL to a SQLAlchemy database URL}"
     extra_hosts:
       - host.docker.internal:host-gateway

@@ -23,6 +23,7 @@ LABEL org.opencontainers.image.source="https://github.com/BoringHappy/msync" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV PATH="/app/.venv/bin:$PATH" \
+    MSYNC_DATABASE_URL="/data/msync.sqlite" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -42,4 +43,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()"]
 
 ENTRYPOINT ["python", "-m", "msync.docker_entrypoint"]
-CMD ["server", "--host", "0.0.0.0", "--database", "/data/msync.sqlite"]
+CMD ["server", "--host", "0.0.0.0"]
