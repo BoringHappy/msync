@@ -469,6 +469,8 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "updateTitleOverflow" in script.text
     assert "setFitWidth" in script.text
     assert "moveHumanMessage" in script.text
+    assert "sessionLoaderObserver" in script.text
+    assert "transcriptLoaderObserver" in script.text
     assert "renderMarkdownTable" in script.text
     assert 'data-transcript-filter="tools"' in page.text
     assert 'id="load-more"' in page.text
@@ -480,6 +482,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert 'id="conversation-title-tooltip"' in page.text
     assert 'id="previous-human"' in page.text
     assert 'id="next-human"' in page.text
+    assert 'id="conversation-top"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
@@ -490,6 +493,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert ".conversation.fit-width" in styles.text
     assert ".title-tooltip" in styles.text
     assert ".human-nav" in styles.text
+    assert ".human-nav .nav-top" in styles.text
     assert ".markdown-table" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 

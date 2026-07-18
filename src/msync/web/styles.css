@@ -199,7 +199,7 @@ select:focus, .search-box:focus-within { border-color: #6d7479; }
 .sidebar-foot { padding: 8px 14px; border-top: 1px solid var(--line); color: var(--dim); font-size: 9px; }
 .sidebar-foot span { margin: 0 5px; }
 .load-more {
-  flex: none;
+  width: 100%;
   min-height: 34px;
   border: 0;
   border-top: 1px solid var(--line);
@@ -368,6 +368,7 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 }
 .human-nav button + button { border-top: 1px solid var(--line); }
 .human-nav button:hover { color: var(--accent); background: var(--accent-soft); }
+.human-nav .nav-top { font-size: 8px; font-weight: 700; letter-spacing: .06em; }
 .event { position: relative; margin: 0 0 22px; padding-left: 30px; }
 .event::before { content: ""; position: absolute; left: 7px; top: 24px; bottom: -25px; width: 1px; background: var(--line-soft); }
 .event:last-child::before { display: none; }
