@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import socket
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 from rich.rule import Rule
@@ -20,6 +22,13 @@ from msync.providers import (
     detect_provider,
     get_provider,
     provider_names,
+)
+from msync.remote import (
+    UPLOAD_CONTENT_TYPE,
+    UPLOAD_STREAM_CHUNK_BYTES,
+    UPLOAD_TRANSCRIPT_MAX_BYTES,
+    RemoteUploadMetadata,
+    encode_upload_prefix,
 )
 from msync.synchronization import SyncResult, sync_conversations, unmanaged_transcripts
 
@@ -57,14 +66,14 @@ def upload(
         ),
     ],
     database: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--database",
             "--db",
             help="SQLite path or SQLAlchemy database URL.",
             show_default=str(DEFAULT_DATABASE),
         ),
-    ] = str(DEFAULT_DATABASE),
+    ] = None,
     provider: Annotated[
         str,
         typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
@@ -76,23 +85,59 @@ def upload(
             help="Hostname recorded for this source location (defaults to this machine).",
         ),
     ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(
+            help="Base URL of an msync server that accepts remote uploads.",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_UPLOAD_TOKEN",
+            help="Upload token for --url (or set MSYNC_UPLOAD_TOKEN).",
+        ),
+    ] = None,
 ) -> None:
-    """Read new and changed transcripts into the configured archive."""
+    """Read new and changed transcripts into a local or remote archive."""
 
     root = directory.expanduser().resolve()
     try:
+        if url is not None and database is not None:
+            raise ValueError("--url and --database cannot be used together.")
+        if url is None and token is not None:
+            raise ValueError("--token requires --url.")
+        if url is not None and not token:
+            raise ValueError("--url requires --token or MSYNC_UPLOAD_TOKEN.")
         selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
         transcripts = selected_provider.discover(root)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
-        with Archive(database, hostname=hostname, auto_upgrade=False) as archive:
-            result = archive.upload(
+        if url is not None:
+            location_hostname = _upload_hostname(hostname)
+            result, target_display = _remote_upload(
+                url=url,
+                token=token or "",
                 root=root,
+                hostname=location_hostname,
                 provider=selected_provider,
                 transcripts=transcripts,
             )
-            database_display = archive.display_database
-            location_hostname = archive.hostname
+            target_label = "Server"
+        else:
+            with Archive(
+                database or str(DEFAULT_DATABASE),
+                hostname=hostname,
+                auto_upgrade=False,
+            ) as archive:
+                result = archive.upload(
+                    root=root,
+                    provider=selected_provider,
+                    transcripts=transcripts,
+                )
+                target_display = archive.display_database
+                location_hostname = archive.hostname
+            target_label = "Database"
     except (
         HistoryFormatError,
         ImportError,
@@ -110,7 +155,7 @@ def upload(
     table.add_row("Provider", selected_provider.name)
     table.add_row("Hostname", location_hostname)
     table.add_row("Location", str(root))
-    table.add_row("Database", database_display)
+    table.add_row(target_label, target_display)
     table.add_row("Transcripts", str(result.scanned))
     table.add_row("Imported", str(result.imported))
     table.add_row("Updated", str(result.updated))
@@ -286,15 +331,14 @@ def upgrade(
 @app.command()
 def server(
     password: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--password",
             envvar="MSYNC_SERVER_PASSWORD",
-            prompt="Server password",
             hide_input=True,
-            help="Password required by the web UI (or set MSYNC_SERVER_PASSWORD).",
+            help="Single-user web password (or set MSYNC_SERVER_PASSWORD).",
         ),
-    ],
+    ] = None,
     database: Annotated[
         str,
         typer.Option(
@@ -319,17 +363,44 @@ def server(
             help="Username required by the web UI.",
         ),
     ] = "msync",
+    accounts: Annotated[
+        str | None,
+        typer.Option(
+            envvar="MSYNC_SERVER_ACCOUNTS",
+            help=(
+                "Semicolon-separated username,password[,token] accounts "
+                "(or set MSYNC_SERVER_ACCOUNTS)."
+            ),
+        ),
+    ] = None,
 ) -> None:
-    """Start the authenticated web UI for browsing archived chat history."""
+    """Start the authenticated history browser and remote-upload API."""
 
     console.print("Checking database schema...")
     try:
         import uvicorn
 
-        from msync.server import create_app
+        from msync.server import create_app, parse_server_accounts
+
+        configured_accounts = parse_server_accounts(accounts) if accounts is not None else None
+        if configured_accounts is None:
+            selected_password = password
+            if selected_password is None:
+                selected_password = typer.prompt("Server password", hide_input=True)
+
+            def build_app() -> object:
+                return create_app(database, username=username, password=selected_password)
+
+            login_display = username
+        else:
+
+            def build_app() -> object:
+                return create_app(database, accounts=configured_accounts)
+
+            login_display = f"one of {len(configured_accounts)} configured accounts"
 
         try:
-            web_app = create_app(database, username=username, password=password)
+            web_app = build_app()
         except SchemaUpgradeRequiredError as error:
             console.print(
                 f"Database schema version {error.current_version} must be upgraded to "
@@ -339,7 +410,7 @@ def server(
                 error_console.print("Server not started; the database was not upgraded.")
                 raise typer.Exit(code=1) from error
             upgrade(database=database, lock_timeout=10)
-            web_app = create_app(database, username=username, password=password)
+            web_app = build_app()
     except typer.Exit:
         raise
     except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
@@ -348,11 +419,11 @@ def server(
 
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     console.print(f"History browser: [bold cyan]http://{display_host}:{port}[/bold cyan]")
-    console.print(f"Sign in as [bold]{username}[/bold]. Press Ctrl+C to stop.")
+    console.print(f"Sign in as [bold]{login_display}[/bold]. Press Ctrl+C to stop.")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         error_console.print(
-            "[yellow]Security note:[/yellow] Basic authentication requires an HTTPS reverse "
-            "proxy when exposed beyond this machine."
+            "[yellow]Security note:[/yellow] Basic and token authentication require an HTTPS "
+            "reverse proxy when exposed beyond this machine."
         )
     uvicorn.run(web_app, host=host, port=port)
 
@@ -463,6 +534,122 @@ def _sync_providers(roots: list[Path], names: list[str]) -> list[HistoryProvider
         detect_provider(root) if name == "auto" else get_provider(name)
         for root, name in zip(roots, selections, strict=True)
     ]
+
+
+def _upload_hostname(hostname: str | None) -> str:
+    value = socket.gethostname() if hostname is None else hostname
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("Location hostname must not be empty.")
+    if len(normalized) > 255:
+        raise ValueError("Location hostname must not exceed 255 characters.")
+    return normalized
+
+
+def _remote_upload(
+    *,
+    url: str,
+    token: str,
+    root: Path,
+    hostname: str,
+    provider: HistoryProvider,
+    transcripts: list[Path],
+) -> tuple[UploadResult, str]:
+    try:
+        server_url = httpx.URL(url)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid msync server URL: {error}") from error
+    if server_url.scheme not in {"http", "https"} or not server_url.host:
+        raise ValueError("msync server URL must be an absolute http:// or https:// URL.")
+    if server_url.username or server_url.password or server_url.query or server_url.fragment:
+        raise ValueError(
+            "msync server URL must not contain credentials, a query string, or a fragment."
+        )
+
+    endpoint = f"{str(server_url).rstrip('/')}/api/upload"
+    aggregate: UploadResult | None = None
+    timeout = httpx.Timeout(connect=10, read=None, write=None, pool=10)
+    for path in transcripts:
+        stat = path.stat()
+        if stat.st_size > UPLOAD_TRANSCRIPT_MAX_BYTES:
+            raise ValueError(
+                f"Transcript exceeds the 256 MiB remote upload limit: {path}"
+            )
+        metadata = RemoteUploadMetadata(
+            provider=provider.name,
+            hostname=hostname,
+            root_path=str(root),
+            display_name=root.name or str(root),
+            relative_path=path.relative_to(root).as_posix(),
+            source_mtime_ns=stat.st_mtime_ns,
+        )
+        prefix = encode_upload_prefix(metadata)
+        try:
+            response = httpx.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": UPLOAD_CONTENT_TYPE,
+                    "Content-Length": str(len(prefix) + stat.st_size),
+                },
+                content=_stream_remote_transcript(prefix, path),
+                timeout=timeout,
+            )
+        except httpx.HTTPError as error:
+            raise RuntimeError(f"Could not reach msync server {server_url}: {error}") from error
+        file_result = _remote_upload_response(response)
+        if aggregate is None:
+            aggregate = UploadResult(location_id=file_result.location_id)
+        elif aggregate.location_id != file_result.location_id:
+            raise RuntimeError("msync server changed location IDs during the upload.")
+        for field_name in (
+            "scanned",
+            "imported",
+            "updated",
+            "unchanged",
+            "duplicates",
+            "events",
+            "message_parts",
+        ):
+            setattr(
+                aggregate,
+                field_name,
+                getattr(aggregate, field_name) + getattr(file_result, field_name),
+            )
+    if aggregate is None:
+        raise RuntimeError("Remote upload requires at least one transcript.")
+    return aggregate, str(server_url).rstrip("/")
+
+
+def _stream_remote_transcript(prefix: bytes, path: Path) -> Iterator[bytes]:
+    yield prefix
+    with path.open("rb") as stream:
+        while chunk := stream.read(UPLOAD_STREAM_CHUNK_BYTES):
+            yield chunk
+
+
+def _remote_upload_response(response: httpx.Response) -> UploadResult:
+    if response.is_error:
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        message = detail if isinstance(detail, str) and detail else response.reason_phrase
+        raise RuntimeError(f"msync server returned HTTP {response.status_code}: {message}")
+    try:
+        values = response.json()
+        return UploadResult(
+            location_id=int(values["location_id"]),
+            scanned=int(values["scanned"]),
+            imported=int(values["imported"]),
+            updated=int(values["updated"]),
+            unchanged=int(values["unchanged"]),
+            duplicates=int(values["duplicates"]),
+            events=int(values["events"]),
+            message_parts=int(values["message_parts"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("msync server returned an invalid upload response.") from error
 
 
 def _print_sync_result(

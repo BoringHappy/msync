@@ -1,24 +1,131 @@
-"""Authenticated FastAPI application for browsing archived conversations."""
+"""Authenticated FastAPI application for browsing and uploading conversations."""
 
 from __future__ import annotations
 
 import secrets
-from collections.abc import AsyncIterator
+import tempfile
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, ConfigDict
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBasic,
+    HTTPBasicCredentials,
+    HTTPBearer,
+)
+from pydantic import BaseModel, ConfigDict, ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from msync.database import Archive
+from msync.database import Archive, RemoteTranscript
+from msync.providers import get_provider
+from msync.remote import (
+    UPLOAD_BODY_MAX_BYTES,
+    UPLOAD_CONTENT_TYPE,
+    UPLOAD_METADATA_MAX_BYTES,
+    UPLOAD_STREAM_CHUNK_BYTES,
+    UPLOAD_TRANSCRIPT_MAX_BYTES,
+    RemoteUploadMetadata,
+)
 
 _BASIC_SECURITY = HTTPBasic(auto_error=False)
 _BasicCredentials = Annotated[HTTPBasicCredentials | None, Depends(_BASIC_SECURITY)]
+_BEARER_SECURITY = HTTPBearer(auto_error=False)
+_BearerCredentials = Annotated[
+    HTTPAuthorizationCredentials | None,
+    Depends(_BEARER_SECURITY),
+]
+
+
+@dataclass(slots=True, frozen=True)
+class ServerAccount:
+    """One browser login with an optional remote-upload token."""
+
+    username: str
+    password: str
+    token: str | None = None
+
+
+class _UploadBodyTooLarge(Exception):
+    """Stop reading an upload as soon as it crosses the request limit."""
+
+
+class UploadBodyLimitMiddleware:
+    """Reject oversized upload bodies before FastAPI buffers or parses them."""
+
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") != "/api/upload":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", ()))
+        raw_content_length = headers.get(b"content-length")
+        if raw_content_length is not None:
+            try:
+                content_length = int(raw_content_length)
+            except ValueError:
+                content_length = 0
+            if content_length > self.max_body_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received = 0
+        response_started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    raise _UploadBodyTooLarge
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _UploadBodyTooLarge:
+            if response_started:
+                raise
+            await self._reject(scope, receive, send)
+
+    async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {"detail": "Upload request body exceeds the 256 MiB transcript limit."},
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        )
+        await response(scope, receive, send)
+
+
+class UploadResponse(BaseModel):
+    """Counts produced by a remote archive upload."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    location_id: int
+    scanned: int
+    imported: int
+    updated: int
+    unchanged: int
+    duplicates: int
+    events: int
+    message_parts: int
 
 
 class LocationResponse(BaseModel):
@@ -102,35 +209,62 @@ class ConversationResponse(BaseModel):
 def create_app(
     database: str | Path,
     *,
-    username: str,
-    password: str,
+    username: str | None = None,
+    password: str | None = None,
+    accounts: Sequence[ServerAccount] | None = None,
 ) -> FastAPI:
-    """Build an authenticated web application for one msync archive."""
+    """Build an authenticated, tenant-isolated web application for one archive."""
 
-    if not username:
-        raise ValueError("Server username must not be empty.")
-    if not password:
-        raise ValueError("Server password must not be empty.")
+    if accounts is not None and (username is not None or password is not None):
+        raise ValueError("Configure server accounts or a username/password pair, not both.")
+    configured_accounts = (
+        tuple(accounts)
+        if accounts is not None
+        else (ServerAccount(username or "", password or ""),)
+    )
+    _validate_accounts(configured_accounts)
+    legacy_owner = configured_accounts[0].username
 
     # Long-running schema migrations belong in the explicit CLI maintenance workflow. Starting
     # the web process against an old archive should fail quickly with upgrade instructions instead
     # of silently waiting for uploads or rewriting a large archive before Uvicorn can report ready.
     archive = Archive(database, auto_upgrade=False)
 
-    def require_auth(credentials: _BasicCredentials) -> str:
-        valid_username = credentials is not None and secrets.compare_digest(
-            credentials.username.encode("utf-8"), username.encode("utf-8")
+    def require_auth(credentials: _BasicCredentials) -> ServerAccount:
+        if credentials is not None:
+            supplied_username = credentials.username.encode("utf-8")
+            supplied_password = credentials.password.encode("utf-8")
+            for account in configured_accounts:
+                valid_username = secrets.compare_digest(
+                    supplied_username,
+                    account.username.encode("utf-8"),
+                )
+                valid_password = secrets.compare_digest(
+                    supplied_password,
+                    account.password.encode("utf-8"),
+                )
+                if valid_username and valid_password:
+                    return account
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": 'Basic realm="msync", charset="UTF-8"'},
         )
-        valid_password = credentials is not None and secrets.compare_digest(
-            credentials.password.encode("utf-8"), password.encode("utf-8")
+
+    def require_upload_token(credentials: _BearerCredentials) -> ServerAccount:
+        if credentials is not None and credentials.scheme.casefold() == "bearer":
+            supplied_token = credentials.credentials.encode("utf-8")
+            for account in configured_accounts:
+                if account.token is not None and secrets.compare_digest(
+                    supplied_token,
+                    account.token.encode("utf-8"),
+                ):
+                    return account
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A valid upload token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        if not (valid_username and valid_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required.",
-                headers={"WWW-Authenticate": 'Basic realm="msync", charset="UTF-8"'},
-            )
-        return credentials.username
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -141,10 +275,13 @@ def create_app(
         title="msync history browser",
         description="Browse normalized Claude and Codex chat histories.",
         version="0.1.0",
-        dependencies=[Depends(require_auth)],
         lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     app.state.archive = archive
+    app.add_middleware(UploadBodyLimitMiddleware, max_body_bytes=UPLOAD_BODY_MAX_BYTES)
 
     @app.middleware("http")
     async def security_headers(request: Any, call_next: Any) -> Response:
@@ -159,20 +296,28 @@ def create_app(
         return response
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    def index() -> HTMLResponse:
+    def index(account: ServerAccount = Depends(require_auth)) -> HTMLResponse:  # noqa: B008
+        del account
         return HTMLResponse(_web_asset("index.html"))
 
     @app.get("/assets/styles.css", include_in_schema=False)
-    def styles() -> Response:
+    def styles(account: ServerAccount = Depends(require_auth)) -> Response:  # noqa: B008
+        del account
         return Response(_web_asset("styles.css"), media_type="text/css")
 
     @app.get("/assets/app.js", include_in_schema=False)
-    def javascript() -> Response:
+    def javascript(account: ServerAccount = Depends(require_auth)) -> Response:  # noqa: B008
+        del account
         return Response(_web_asset("app.js"), media_type="text/javascript")
 
     @app.get("/api/locations", response_model=list[LocationResponse])
-    def locations() -> list[Any]:
-        return archive.browse_locations()
+    def locations(
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
+    ) -> list[Any]:
+        return archive.browse_locations(
+            account_username=account.username,
+            include_legacy=account.username == legacy_owner,
+        )
 
     @app.get("/api/conversations", response_model=list[ConversationSummaryResponse])
     def conversations(
@@ -181,6 +326,7 @@ def create_app(
         order: Literal["newest", "oldest", "messages", "events", "title"] = "newest",
         limit: Annotated[int, Query(ge=1, le=500)] = 200,
         offset: Annotated[int, Query(ge=0)] = 0,
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
     ) -> list[Any]:
         return archive.browse_conversations(
             location_id=location,
@@ -188,24 +334,162 @@ def create_app(
             order_by=order,
             limit=limit,
             offset=offset,
+            account_username=account.username,
+            include_legacy=account.username == legacy_owner,
         )
+
+    @app.post("/api/upload", response_model=UploadResponse)
+    async def upload(
+        request: Request,
+        account: ServerAccount = Depends(require_upload_token),  # noqa: B008
+    ) -> Any:
+        metadata, content = await _read_upload_request(request)
+        try:
+            return await run_in_threadpool(
+                archive.upload_remote,
+                root_path=metadata.root_path,
+                display_name=metadata.display_name,
+                provider=get_provider(metadata.provider),
+                hostname=metadata.hostname,
+                account_username=account.username,
+                transcripts=[
+                    RemoteTranscript(
+                        relative_path=metadata.relative_path,
+                        content=content,
+                        source_mtime_ns=metadata.source_mtime_ns,
+                    )
+                ],
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(error),
+            ) from error
 
     @app.get("/api/conversations/{conversation_id}", response_model=ConversationResponse)
     def conversation(
         conversation_id: int,
         event_limit: Annotated[int | None, Query(ge=1, le=500)] = None,
         event_offset: Annotated[int, Query(ge=0)] = 0,
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
     ) -> Any:
         result = archive.browse_conversation(
             conversation_id,
             event_limit=event_limit,
             event_offset=event_offset,
+            account_username=account.username,
+            include_legacy=account.username == legacy_owner,
         )
         if result is None:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         return result
 
     return app
+
+
+async def _read_upload_request(request: Request) -> tuple[RemoteUploadMetadata, bytes]:
+    content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip()
+    if content_type.casefold() != UPLOAD_CONTENT_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Remote uploads require Content-Type: {UPLOAD_CONTENT_TYPE}.",
+        )
+
+    with tempfile.SpooledTemporaryFile(max_size=UPLOAD_STREAM_CHUNK_BYTES, mode="w+b") as body:
+        buffered = bytearray()
+        async for chunk in request.stream():
+            buffered.extend(chunk)
+            if len(buffered) >= UPLOAD_STREAM_CHUNK_BYTES:
+                await run_in_threadpool(body.write, bytes(buffered))
+                buffered.clear()
+        if buffered:
+            await run_in_threadpool(body.write, bytes(buffered))
+        body.seek(0)
+        prefix = body.read(4)
+        if len(prefix) != 4:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote upload body is missing its metadata length prefix.",
+            )
+        metadata_length = int.from_bytes(prefix, byteorder="big")
+        if metadata_length < 1 or metadata_length > UPLOAD_METADATA_MAX_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote upload metadata length is invalid.",
+            )
+        metadata_payload = body.read(metadata_length)
+        if len(metadata_payload) != metadata_length:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote upload metadata is truncated.",
+            )
+        try:
+            metadata = RemoteUploadMetadata.model_validate_json(metadata_payload)
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Remote upload metadata is invalid: {error}",
+            ) from error
+        content = await run_in_threadpool(body.read, UPLOAD_TRANSCRIPT_MAX_BYTES + 1)
+        if len(content) > UPLOAD_TRANSCRIPT_MAX_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Transcript exceeds the 256 MiB upload limit.",
+            )
+    return metadata, content
+
+
+def parse_server_accounts(value: str) -> tuple[ServerAccount, ...]:
+    """Parse ``username,password[,token]`` records separated by semicolons."""
+
+    if not value:
+        raise ValueError("Server accounts must not be empty.")
+    accounts: list[ServerAccount] = []
+    for entry in value.split(";"):
+        parts = entry.split(",")
+        if len(parts) not in {2, 3}:
+            raise ValueError(
+                "Each server account must use username,password[,token] format; "
+                "commas and semicolons are not allowed inside credentials."
+            )
+        username, password = parts[:2]
+        token = parts[2] if len(parts) == 3 and parts[2] else None
+        accounts.append(ServerAccount(username=username, password=password, token=token))
+    configured = tuple(accounts)
+    _validate_accounts(configured)
+    return configured
+
+
+def _validate_accounts(accounts: Sequence[ServerAccount]) -> None:
+    if not accounts:
+        raise ValueError("At least one server account is required.")
+    usernames: set[str] = set()
+    tokens: set[str] = set()
+    for account in accounts:
+        if not account.username:
+            raise ValueError("Server username must not be empty.")
+        if len(account.username) > 255:
+            raise ValueError("Server username must not exceed 255 characters.")
+        if not account.password:
+            raise ValueError("Server password must not be empty.")
+        for field_name, value in (
+            ("username", account.username),
+            ("password", account.password),
+            ("token", account.token),
+        ):
+            if value is not None and any(delimiter in value for delimiter in (",", ";")):
+                raise ValueError(
+                    f"Server account {field_name} must not contain ',' or ';'."
+                )
+        if account.username in usernames:
+            raise ValueError(f"Duplicate server username {account.username!r}.")
+        usernames.add(account.username)
+        if account.token is not None:
+            if not account.token:
+                raise ValueError("Server upload token must not be empty.")
+            if account.token in tokens:
+                raise ValueError("Server upload tokens must be unique.")
+            tokens.add(account.token)
 
 
 def _web_asset(name: str) -> str:
