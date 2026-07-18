@@ -172,20 +172,18 @@ the command line.
 | `msync search` | Find text in archived messages |
 | `msync sample` | Inspect random archived messages |
 | `msync server` | Start the authenticated web UI and upload API |
-| `msync upgrade` | Upgrade an existing archive schema |
 
 Run `msync COMMAND --help` for all options.
 
 ### Database upgrades
 
-If msync reports that an archive schema is old, stop other msync processes and run:
+`msync server` checks the archive schema before startup and offers to upgrade old schemas. For a
+shared archive, stop other msync processes and approve the upgrade during a maintenance window
+before restarting uploads.
 
 ```console
-$ msync upgrade --database ~/.msync/msync.sqlite
+$ msync server --database ~/.msync/msync.sqlite
 ```
-
-For a shared archive, upgrade it during a maintenance window before restarting uploads or the web
-server.
 
 ## How data is handled
 

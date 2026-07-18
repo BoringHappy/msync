@@ -286,7 +286,7 @@ def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None
         connection.execute("PRAGMA user_version = 5")
         connection.commit()
 
-    with pytest.raises(SchemaUpgradeRequiredError, match="msync upgrade") as captured:
+    with pytest.raises(SchemaUpgradeRequiredError, match="msync server") as captured:
         Archive(database, auto_upgrade=False)
 
     assert captured.value.current_version == 5

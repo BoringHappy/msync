@@ -325,28 +325,8 @@ def sync(
         )
 
 
-@app.command()
-def upgrade(
-    database: Annotated[
-        str,
-        typer.Option(
-            "--database",
-            "--db",
-            help="SQLite path or SQLAlchemy database URL.",
-            show_default=str(DEFAULT_DATABASE),
-        ),
-    ] = str(DEFAULT_DATABASE),
-    lock_timeout: Annotated[
-        int,
-        typer.Option(
-            "--lock-timeout",
-            min=1,
-            max=3600,
-            help="Seconds to wait for concurrent database transactions during an upgrade.",
-        ),
-    ] = 10,
-) -> None:
-    """Upgrade an archive schema during a maintenance window."""
+def _upgrade_server_database(database: str, *, lock_timeout: int = 10) -> None:
+    """Upgrade an archive schema before starting the server."""
 
     steps: list[tuple[int, int]] = []
 
@@ -361,19 +341,13 @@ def upgrade(
         if completed == 0 or completed == total or completed % 100 == 0:
             console.print(f"Reindexing conversations: {completed}/{total}")
 
-    console.print("Checking database schema...")
-    try:
-        with Archive(
-            database,
-            schema_lock_timeout=lock_timeout,
-            upgrade_reporter=report_upgrade,
-            upgrade_progress_reporter=report_progress,
-        ) as archive:
-            database_display = archive.display_database
-            initialized = archive.initialized_new_database
-    except (ImportError, OSError, RuntimeError, SQLAlchemyError, ValueError) as error:
-        error_console.print(f"[bold red]Upgrade failed:[/bold red] {error}")
-        raise typer.Exit(code=1) from error
+    with Archive(
+        database,
+        schema_lock_timeout=lock_timeout,
+        upgrade_reporter=report_upgrade,
+        upgrade_progress_reporter=report_progress,
+    ) as archive:
+        initialized = archive.initialized_new_database
 
     if initialized:
         console.print(f"Database initialized at schema version {archive.schema_version}.")
@@ -383,7 +357,6 @@ def upgrade(
         )
     else:
         console.print(f"Database schema is current at version {archive.schema_version}.")
-    console.print(f"Database: {database_display}")
 
 
 @app.command()
@@ -467,7 +440,7 @@ def server(
             if not typer.confirm("Upgrade the database now?", default=False):
                 error_console.print("Server not started; the database was not upgraded.")
                 raise typer.Exit(code=1) from error
-            upgrade(database=database, lock_timeout=10)
+            _upgrade_server_database(database)
             web_app = build_app()
     except typer.Exit:
         raise

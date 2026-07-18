@@ -63,7 +63,8 @@ class SchemaUpgradeRequiredError(RuntimeError):
         self.target_version = SCHEMA_VERSION
         super().__init__(
             f"Database schema version {current_version} must be upgraded to {SCHEMA_VERSION}. "
-            "Stop other msync processes, then run `msync upgrade --database <database>`."
+            "Stop other msync processes, then start `msync server --database <database>` "
+            "to upgrade it."
         )
 
 
@@ -76,7 +77,7 @@ class SchemaUpgradeBlockedError(RuntimeError):
         super().__init__(
             f"Database schema upgrade from {current_version} to {SCHEMA_VERSION} is blocked by "
             "another transaction. Stop or finish other msync uploads and servers, then retry "
-            "`msync upgrade`."
+            "`msync server`."
         )
 
 
