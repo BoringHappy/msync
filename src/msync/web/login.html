@@ -5,13 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Sign in · msync</title>
+    <link rel="icon" type="image/png" href="/assets/logo.png">
     <link rel="stylesheet" href="/assets/styles.css">
   </head>
   <body class="login-page">
     <div class="scanline" aria-hidden="true"></div>
     <header class="topbar login-topbar">
       <a class="brand" href="/login" aria-label="msync sign in">
-        <span class="brand-mark">◇</span>
+        <span class="brand-mark" aria-hidden="true"><img class="brand-logo" src="/assets/logo.png" alt=""></span>
         <span>msync</span>
       </a>
       <div class="top-status"><span class="status-light login-status-light"></span> authentication required</div>
@@ -24,7 +25,7 @@
           <span>msync / secure archive</span>
         </div>
         <div class="login-card-body">
-          <div class="login-glyph" aria-hidden="true">◇</div>
+          <div class="login-logo" aria-hidden="true"><img src="/assets/logo.png" alt=""></div>
           <h1 id="login-title">Sign in to your archive</h1>
           <p class="login-intro">Enter your msync account credentials to browse coding sessions.</p>
 
