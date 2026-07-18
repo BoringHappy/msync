@@ -74,7 +74,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, .event:focus-vi
 }
 
 .brand-mark { color: var(--accent); font-size: 19px; line-height: 1; }
-.brand-dim { color: var(--dim); font-weight: 400; }
 .primary-nav { display: flex; align-self: stretch; align-items: center; gap: 4px; margin-left: 16px; }
 .primary-nav a {
   position: relative;
@@ -790,7 +789,6 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 @media (max-width: 760px) {
   .topbar { gap: 5px; padding: 0 8px; }
   .brand { gap: 5px; }
-  .brand-dim { display: none; }
   .primary-nav { gap: 0; margin-left: 3px; }
   .primary-nav a { padding: 0 6px; font-size: 8px; }
   .primary-nav a[aria-current="page"]::after { right: 6px; left: 6px; }
