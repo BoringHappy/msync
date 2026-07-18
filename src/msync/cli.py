@@ -17,6 +17,7 @@ from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
 from msync.database import Archive, SchemaUpgradeRequiredError, SearchResult, UploadResult
+from msync.hooks import queue_session_upload, wait_for_transcript_stable
 from msync.providers import (
     HistoryFormatError,
     HistoryProvider,
@@ -77,9 +78,39 @@ def upload(
     url: Annotated[
         str,
         typer.Option(
-            help="Base URL of an msync server that accepts remote uploads.",
+            envvar="MSYNC_UPLOAD_URL",
+            help=(
+                "Base URL of an msync server that accepts remote uploads (or set MSYNC_UPLOAD_URL)."
+            ),
         ),
     ],
+    transcript: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Upload only this transcript instead of scanning --dir.",
+        ),
+    ] = None,
+    wait_for_transcript: Annotated[
+        bool,
+        typer.Option(
+            "--wait-for-transcript",
+            hidden=True,
+            help="Wait for a selected transcript to stop changing before upload.",
+        ),
+    ] = False,
+    expected_assistant_sha256: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-assistant-sha256",
+            hidden=True,
+            help="Wait until this assistant-message digest appears in the transcript.",
+        ),
+    ] = None,
     provider: Annotated[
         str,
         typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
@@ -106,9 +137,20 @@ def upload(
         if not token:
             raise ValueError("--url requires --token or MSYNC_UPLOAD_TOKEN.")
         selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
-        transcripts = selected_provider.discover(root)
+        transcripts = _upload_transcripts(root, selected_provider, transcript)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
+        if expected_assistant_sha256 is not None and not wait_for_transcript:
+            raise ValueError("--expected-assistant-sha256 requires --wait-for-transcript.")
+        if wait_for_transcript:
+            if transcript is None:
+                raise ValueError("--wait-for-transcript requires --transcript.")
+            wait_for_transcript_stable(
+                transcripts[0],
+                provider=selected_provider,
+                root=root,
+                expected_assistant_sha256=expected_assistant_sha256,
+            )
         verified_transcripts, verification_failures = _verify_transcripts(
             root=root,
             provider=selected_provider,
@@ -163,6 +205,22 @@ def upload(
     console.print(table)
     if verification_failures:
         raise typer.Exit(code=1)
+
+
+@app.command("upload-hook", hidden=True)
+def upload_hook(
+    provider: Annotated[
+        str | None,
+        typer.Option(help=f"Provider override ({', '.join(provider_names())})."),
+    ] = None,
+) -> None:
+    """Queue one transcript upload from a Claude Code or Codex Stop hook."""
+
+    try:
+        queue_session_upload(provider)
+    except (OSError, RuntimeError, ValueError) as error:
+        error_console.print(f"[bold red]Upload hook failed:[/bold red] {error}")
+        raise typer.Exit(code=1) from error
 
 
 @app.command()
@@ -544,6 +602,21 @@ def _upload_hostname(hostname: str | None) -> str:
     if len(normalized) > 255:
         raise ValueError("Location hostname must not exceed 255 characters.")
     return normalized
+
+
+def _upload_transcripts(
+    root: Path,
+    provider: HistoryProvider,
+    transcript: Path | None,
+) -> list[Path]:
+    if transcript is None:
+        return provider.discover(root)
+    path = transcript.expanduser().resolve()
+    if not path.is_relative_to(root):
+        raise HistoryFormatError(f"Transcript must be contained in --dir: {path}")
+    if path.suffix.casefold() != ".jsonl" or path.name in provider.ignored_filenames:
+        raise HistoryFormatError(f"Not a {provider.name} conversation transcript: {path}")
+    return [path]
 
 
 def _verify_transcripts(

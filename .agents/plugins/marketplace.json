@@ -1,0 +1,20 @@
+{
+  "name": "msync",
+  "interface": {
+    "displayName": "msync"
+  },
+  "plugins": [
+    {
+      "name": "msync",
+      "source": {
+        "source": "local",
+        "path": "./plugins/msync"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

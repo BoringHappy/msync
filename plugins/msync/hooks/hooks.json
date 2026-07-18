@@ -1,0 +1,16 @@
+{
+  "description": "Queue the completed session transcript for upload to msync.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "msync upload-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

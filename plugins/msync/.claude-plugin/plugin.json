@@ -1,0 +1,17 @@
+{
+  "name": "msync",
+  "displayName": "msync",
+  "version": "0.1.0",
+  "description": "Upload the current Claude Code session to msync after every turn.",
+  "author": {
+    "name": "BoringHappy"
+  },
+  "homepage": "https://github.com/BoringHappy/msync",
+  "repository": "https://github.com/BoringHappy/msync",
+  "license": "Apache-2.0",
+  "keywords": [
+    "conversation-history",
+    "sync",
+    "upload"
+  ]
+}
