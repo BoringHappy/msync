@@ -65,15 +65,12 @@ def upload(
             help="Provider data directory to archive.",
         ),
     ],
-    database: Annotated[
-        str | None,
+    url: Annotated[
+        str,
         typer.Option(
-            "--database",
-            "--db",
-            help="SQLite path or SQLAlchemy database URL.",
-            show_default=str(DEFAULT_DATABASE),
+            help="Base URL of an msync server that accepts remote uploads.",
         ),
-    ] = None,
+    ],
     provider: Annotated[
         str,
         typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
@@ -85,12 +82,6 @@ def upload(
             help="Hostname recorded for this source location (defaults to this machine).",
         ),
     ] = None,
-    url: Annotated[
-        str | None,
-        typer.Option(
-            help="Base URL of an msync server that accepts remote uploads.",
-        ),
-    ] = None,
     token: Annotated[
         str | None,
         typer.Option(
@@ -99,45 +90,25 @@ def upload(
         ),
     ] = None,
 ) -> None:
-    """Read new and changed transcripts into a local or remote archive."""
+    """Upload new and changed transcripts to a remote archive."""
 
     root = directory.expanduser().resolve()
     try:
-        if url is not None and database is not None:
-            raise ValueError("--url and --database cannot be used together.")
-        if url is None and token is not None:
-            raise ValueError("--token requires --url.")
-        if url is not None and not token:
+        if not token:
             raise ValueError("--url requires --token or MSYNC_UPLOAD_TOKEN.")
         selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
         transcripts = selected_provider.discover(root)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
-        if url is not None:
-            location_hostname = _upload_hostname(hostname)
-            result, target_display = _remote_upload(
-                url=url,
-                token=token or "",
-                root=root,
-                hostname=location_hostname,
-                provider=selected_provider,
-                transcripts=transcripts,
-            )
-            target_label = "Server"
-        else:
-            with Archive(
-                database or str(DEFAULT_DATABASE),
-                hostname=hostname,
-                auto_upgrade=False,
-            ) as archive:
-                result = archive.upload(
-                    root=root,
-                    provider=selected_provider,
-                    transcripts=transcripts,
-                )
-                target_display = archive.display_database
-                location_hostname = archive.hostname
-            target_label = "Database"
+        location_hostname = _upload_hostname(hostname)
+        result, target_display = _remote_upload(
+            url=url,
+            token=token,
+            root=root,
+            hostname=location_hostname,
+            provider=selected_provider,
+            transcripts=transcripts,
+        )
     except (
         HistoryFormatError,
         ImportError,
@@ -155,7 +126,7 @@ def upload(
     table.add_row("Provider", selected_provider.name)
     table.add_row("Hostname", location_hostname)
     table.add_row("Location", str(root))
-    table.add_row(target_label, target_display)
+    table.add_row("Server", target_display)
     table.add_row("Transcripts", str(result.scanned))
     table.add_row("Imported", str(result.imported))
     table.add_row("Updated", str(result.updated))

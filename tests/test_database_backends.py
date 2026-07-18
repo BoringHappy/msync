@@ -39,7 +39,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("8",)
+        ).fetchone() == ("9",)
         primary_keys = {
             table: tuple(
                 row[1] for row in connection.execute(f"PRAGMA table_info({table})") if row[5]
@@ -52,6 +52,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
             "conversations": ("id",),
             "conversation_metrics": ("conversation_id",),
             "archive_revisions": ("account_username",),
+            "upload_history": ("id",),
             "events": ("id",),
             "message_parts": ("id",),
         }
@@ -135,12 +136,12 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
     assert detail.events[1].text == "command\N{REPLACEMENT CHARACTER}output"
     assert [match.role for match in matches] == ["tool"]
     assert stored == source
-    assert upgrade_steps == [(5, 6), (6, 7), (7, 8)]
+    assert upgrade_steps == [(5, 6), (6, 7), (7, 8), (8, 9)]
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("8",)
+        ).fetchone() == ("9",)
 
 
 def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -> None:
@@ -199,7 +200,7 @@ def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -
             "SELECT account_username, root_path_hash FROM locations"
         ).fetchone()
 
-    assert upgrade_steps == [(6, 7), (7, 8)]
+    assert upgrade_steps == [(6, 7), (7, 8), (8, 9)]
     assert "account_username" in location_columns
     assert "account_username" in conversation_columns
     assert revision_columns == ("account_username", "logical_session_id", "chat_sha256")
@@ -211,6 +212,68 @@ def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -
         assert connection.execute(
             "SELECT account_username, revision FROM archive_revisions"
         ).fetchone() == ("", 1)
+
+
+def test_v8_archive_adds_upload_history_and_backfills_token_metrics(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    root = (tmp_path / ".codex").resolve()
+    transcript = root / "sessions/token-migration.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in (
+                {
+                    "timestamp": "2026-07-14T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "token-migration", "cwd": "/tmp"},
+                },
+                {
+                    "timestamp": "2026-07-14T12:00:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 80,
+                                "cached_input_tokens": 30,
+                                "output_tokens": 20,
+                                "total_tokens": 100,
+                            }
+                        },
+                    },
+                },
+            )
+        )
+    )
+    with Archive(database) as archive:
+        archive.upload(root=root, provider=get_provider("codex"), transcripts=[transcript])
+
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("DROP TABLE upload_history")
+        connection.execute("ALTER TABLE conversation_metrics DROP COLUMN input_token_count")
+        connection.execute("ALTER TABLE conversation_metrics DROP COLUMN output_token_count")
+        connection.execute("ALTER TABLE conversation_metrics DROP COLUMN cached_input_token_count")
+        connection.execute("UPDATE schema_info SET value = '8' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+
+    upgrade_steps: list[tuple[int, int]] = []
+    with Archive(database, upgrade_reporter=lambda *step: upgrade_steps.append(step)) as archive:
+        totals = archive.browse_metrics().totals
+
+    assert upgrade_steps == [(8, 9)]
+    assert totals.input_tokens == 80
+    assert totals.output_tokens == 20
+    assert totals.cached_input_tokens == 30
+    assert totals.tokens == 100
+    with closing(sqlite3.connect(database)) as connection:
+        assert {row[1] for row in connection.execute("PRAGMA table_info(upload_history)")} >= {
+            "id",
+            "account_username",
+            "relative_path",
+            "uploaded_at",
+        }
 
 
 def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None:
@@ -227,7 +290,7 @@ def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None
         Archive(database, auto_upgrade=False)
 
     assert captured.value.current_version == 5
-    assert captured.value.target_version == 8
+    assert captured.value.target_version == 9
 
 
 def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:
@@ -281,8 +344,8 @@ def test_newer_schema_version_requires_newer_msync(tmp_path: Path) -> None:
         pass
 
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute("UPDATE schema_info SET value = '9' WHERE key = 'schema_version'")
-        connection.execute("PRAGMA user_version = 9")
+        connection.execute("UPDATE schema_info SET value = '10' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 10")
         connection.commit()
 
     with pytest.raises(RuntimeError, match="upgrade msync"):

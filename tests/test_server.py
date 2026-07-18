@@ -484,7 +484,9 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
     assert len(carol_conversations.json()) == 1
     assert alice_metrics.json()["totals"]["sessions"] == 1
     assert bob_metrics.json()["totals"]["sessions"] == 0
-    assert alice_revision.json()["revision"] == 1
+    assert [entry["unchanged"] for entry in alice_metrics.json()["recent_uploads"]] == [1, 0]
+    assert bob_metrics.json()["recent_uploads"] == []
+    assert alice_revision.json()["revision"] == 2
     assert bob_revision.json()["revision"] == 0
     assert cross_account_detail.status_code == 404
 
@@ -497,6 +499,80 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
             "SELECT account_username, count(*) FROM conversations "
             "GROUP BY account_username ORDER BY account_username"
         ).fetchall() == [("alice", 1), ("carol", 1)]
+        assert connection.execute(
+            "SELECT account_username, count(*) FROM upload_history "
+            "GROUP BY account_username ORDER BY account_username"
+        ).fetchall() == [("alice", 2), ("carol", 1)]
+
+
+def test_overview_returns_latest_five_uploads_for_current_account(tmp_path: Path) -> None:
+    web_app = create_app(
+        tmp_path / "archive.sqlite",
+        accounts=(
+            ServerAccount("alice", "alice-password", "alice-token"),
+            ServerAccount("bob", "bob-password", "bob-token"),
+        ),
+    )
+
+    with TestClient(web_app) as client:
+        for sequence in range(6):
+            metadata = {
+                "provider": "codex",
+                "hostname": "alice-laptop",
+                "root_path": "/home/alice/.codex",
+                "display_name": ".codex",
+                "relative_path": f"sessions/{sequence}.jsonl",
+            }
+            content = (
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-14T12:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": f"alice-{sequence}", "cwd": "/tmp"},
+                    }
+                )
+                + "\n"
+            ).encode()
+            response = client.post(
+                "/api/upload",
+                content=_remote_upload_body(metadata, content),
+                headers=_upload_headers("alice-token"),
+            )
+            assert response.status_code == 200
+
+        bob_metadata = {
+            "provider": "codex",
+            "hostname": "bob-laptop",
+            "root_path": "/home/bob/.codex",
+            "display_name": ".codex",
+            "relative_path": "sessions/bob.jsonl",
+        }
+        bob_content = (
+            json.dumps(
+                {
+                    "timestamp": "2026-07-14T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": "bob-session", "cwd": "/tmp"},
+                }
+            )
+            + "\n"
+        ).encode()
+        response = client.post(
+            "/api/upload",
+            content=_remote_upload_body(bob_metadata, bob_content),
+            headers=_upload_headers("bob-token"),
+        )
+        assert response.status_code == 200
+
+        alice_metrics = client.get("/api/metrics", auth=("alice", "alice-password")).json()
+        bob_metrics = client.get("/api/metrics", auth=("bob", "bob-password")).json()
+
+    assert [entry["relative_path"] for entry in alice_metrics["recent_uploads"]] == [
+        f"sessions/{sequence}.jsonl" for sequence in range(5, 0, -1)
+    ]
+    assert [entry["relative_path"] for entry in bob_metrics["recent_uploads"]] == [
+        "sessions/bob.jsonl"
+    ]
 
 
 def test_remote_upload_rejects_paths_outside_the_source_root(tmp_path: Path) -> None:
@@ -662,15 +738,18 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert metrics["totals"]["sessions"] == 1
     assert metrics["totals"]["messages"] == 2
     assert metrics["totals"]["events"] == 4
+    assert metrics["totals"]["tokens"] == 0
     assert metrics["totals"]["active_days"] == 1
     assert metrics["totals"]["latest_streak_days"] == 1
     assert metrics["providers"] == [{"label": "codex", "sessions": 1, "messages": 2}]
     assert len(metrics["activity"]) == 30
     assert metrics["recent_sessions"][0]["external_id"] == "detail-session"
+    assert metrics["recent_uploads"] == []
     assert metrics["revision"] == revision_response.json()["revision"] == 1
     assert "<title>AI Coding Sessions · msync</title>" in page.text
     assert 'id="dashboard"' in page.text
     assert 'id="insights"' in page.text
+    assert 'id="recent-uploads"' in page.text
     assert 'href="/insights"' in page.text
     assert "Raw events" in page.text
     assert "ctrlKey" in script.text
@@ -695,6 +774,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "cancelEventPagination" in script.text
     assert "transcriptLoaderObserver?.takeRecords()" in script.text
     assert "renderDashboard" in script.text
+    assert "renderRecentUploads" in script.text
     assert 'request("/api/metrics"' in script.text
     assert "renderActivityChart" in script.text
     assert "METRICS_REVISION_POLL_MS" in script.text
@@ -902,12 +982,12 @@ def test_server_command_upgrades_old_schema_when_confirmed(
 
     assert result.exit_code == 0, result.output
     assert "Upgrade the database now? [y/N]" in result.output
-    assert "Database schema upgrade complete: 5 → 8" in result.output
+    assert "Database schema upgrade complete: 5 → 9" in result.output
     assert captured["app"].title == "msync history browser"
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("8",)
+        ).fetchone() == ("9",)
 
 
 def test_server_rejects_empty_credentials(tmp_path: Path) -> None:

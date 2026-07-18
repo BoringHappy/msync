@@ -108,6 +108,77 @@ def test_codex_upload_is_lossless_searchable_and_idempotent(tmp_path: Path) -> N
         ).fetchone() == ("", 1)
 
 
+def test_overview_aggregates_native_claude_and_codex_token_usage(tmp_path: Path) -> None:
+    codex_root = tmp_path / ".codex"
+    codex_path = codex_root / "sessions/codex.jsonl"
+    codex_records = _codex_records("codex-tokens")
+    codex_records.append(
+        {
+            "timestamp": "2026-07-14T10:00:04Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 40,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 120,
+                    }
+                },
+            },
+        }
+    )
+    _write_jsonl(codex_path, codex_records)
+
+    claude_root = tmp_path / ".claude"
+    claude_path = claude_root / "projects/-work/claude.jsonl"
+    _write_jsonl(
+        claude_path,
+        [
+            {
+                "type": "user",
+                "uuid": "claude-user",
+                "sessionId": "claude-tokens",
+                "message": {"role": "user", "content": "Count these tokens"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "claude-assistant",
+                "sessionId": "claude-tokens",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Counted"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation_input_tokens": 3,
+                        "cache_read_input_tokens": 2,
+                    },
+                },
+            },
+        ],
+    )
+
+    with Archive(tmp_path / "tokens.sqlite") as archive:
+        for root, path, provider_name in (
+            (codex_root, codex_path, "codex"),
+            (claude_root, claude_path, "claude"),
+        ):
+            archive.upload(
+                root=root,
+                provider=get_provider(provider_name),
+                transcripts=[path],
+            )
+        totals = archive.browse_metrics().totals
+
+    assert totals.input_tokens == 115
+    assert totals.output_tokens == 25
+    assert totals.cached_input_tokens == 45
+    assert totals.tokens == 140
+
+
 def test_normalized_text_replaces_database_incompatible_nul_bytes(tmp_path: Path) -> None:
     root = tmp_path / ".codex"
     transcript_path = root / "sessions/nul.jsonl"

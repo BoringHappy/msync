@@ -311,6 +311,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, .event:focus-vi
 .recent-arrow { grid-column: 2; grid-row: 1 / 3; align-self: center; color: #434b51; font-size: 14px; }
 .recent-session:hover .recent-arrow { color: var(--accent); transform: translateX(2px); }
 
+.upload-panel { grid-column: 1 / -1; min-height: 0; }
+.upload-history-list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.upload-history-row {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: #0e1215;
+}
+.upload-path { overflow: hidden; color: #dcd8d0; font-size: 10px; font-weight: 650; white-space: nowrap; text-overflow: ellipsis; }
+.upload-time, .upload-meta, .upload-events { overflow: hidden; color: var(--dim); font-size: 8px; white-space: nowrap; text-overflow: ellipsis; }
+.upload-meta { text-transform: uppercase; letter-spacing: .05em; }
+.upload-events { color: var(--blue); }
+
 .mix-panel { min-height: 310px; }
 .provider-layout { display: grid; grid-template-columns: 140px minmax(0, 1fr); align-items: center; gap: 15px; min-height: 220px; }
 .provider-ring { position: relative; width: 132px; height: 132px; }
@@ -378,6 +394,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, .event:focus-vi
 .metric-skeleton { min-height: 126px; border: 1px solid var(--line-soft); }
 .signal-skeleton { height: 215px; margin-top: 12px; }
 .recent-skeleton { height: 61px; margin-top: 8px; }
+.upload-skeleton { height: 91px; }
 .provider-skeleton { height: 220px; }
 @keyframes dashboard-shimmer { to { transform: translateX(100%); } }
 
@@ -782,6 +799,7 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 @media (max-width: 1040px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .overview-grid { grid-template-columns: 1fr; }
+  .upload-history-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .activity-panel, .signal-panel, .recent-panel, .mix-panel { min-height: 0; }
   .signal-copy { min-height: 220px; }
 }
@@ -824,6 +842,7 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
   .provider-layout { grid-template-columns: 120px minmax(0, 1fr); }
   .provider-ring { width: 112px; height: 112px; }
   .hour-chart { gap: 5px 3px; }
+  .upload-history-list { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

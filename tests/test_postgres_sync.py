@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -22,7 +21,7 @@ from msync.providers import get_provider
 from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata, encode_upload_prefix
 from msync.server import ServerAccount, create_app
 from msync.synchronization import MANIFEST_NAME
-from msync.tables import ConversationRow, LocationRow
+from msync.tables import ConversationRow, LocationRow, UploadHistoryRow
 
 POSTGRES_URL = os.environ.get("MSYNC_POSTGRES_URL")
 
@@ -116,20 +115,15 @@ def test_postgres_sync_writes_round_trip_native_histories(
         assert get_provider("codex").read(codex_generated[0], codex_root).title == claude_prompt
 
         for root, provider in ((claude_root, "claude"), (codex_root, "codex")):
-            feedback = CliRunner().invoke(
-                app,
-                [
-                    "upload",
-                    "--dir",
-                    str(root),
-                    "--provider",
-                    provider,
-                    "--database",
-                    postgres_url,
-                ],
-            )
-            assert feedback.exit_code == 0, feedback.output
-            assert re.search(r"Duplicates skipped\s+1", feedback.output)
+            selected_provider = get_provider(provider)
+            resolved_root = root.resolve()
+            with Archive(postgres_url) as archive:
+                feedback = archive.upload(
+                    root=resolved_root,
+                    provider=selected_provider,
+                    transcripts=selected_provider.discover(resolved_root),
+                )
+            assert feedback.duplicates == 1
 
         repeated = CliRunner().invoke(
             app,
@@ -315,8 +309,14 @@ def test_postgres_remote_uploads_are_isolated_by_account(postgres_url: str) -> N
         conversation_owners = connection.execute(
             select(ConversationRow.account_username).order_by(ConversationRow.account_username)
         ).scalars().all()
+        upload_owners = connection.execute(
+            select(UploadHistoryRow.account_username).order_by(
+                UploadHistoryRow.account_username
+            )
+        ).scalars().all()
     assert location_owners == ["postgres-alice", "postgres-bob"]
     assert conversation_owners == ["postgres-alice", "postgres-bob"]
+    assert upload_owners == ["postgres-alice", "postgres-bob"]
 
 
 @pytest.mark.skipif(not POSTGRES_URL, reason="MSYNC_POSTGRES_URL is not configured")

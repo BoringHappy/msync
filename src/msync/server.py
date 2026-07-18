@@ -187,6 +187,26 @@ class ConversationSummaryResponse(BaseModel):
     preview: str | None
 
 
+class UploadHistoryResponse(BaseModel):
+    """One successful remote upload owned by the current account."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    provider: str
+    hostname: str
+    root_path: str
+    relative_path: str
+    scanned: int
+    imported: int
+    updated: int
+    unchanged: int
+    duplicates: int
+    events: int
+    message_parts: int
+    uploaded_at: datetime
+
+
 class SummaryTotalsResponse(BaseModel):
     """Headline archive metrics shown on the dashboard."""
 
@@ -197,6 +217,10 @@ class SummaryTotalsResponse(BaseModel):
     events: int
     tool_calls: int
     reasoning_events: int
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    tokens: int
     locations: int
     active_days: int
     latest_streak_days: int
@@ -250,6 +274,7 @@ class ArchiveMetricsResponse(BaseModel):
     hours: list[CountMetricResponse]
     session_depth: list[CountMetricResponse]
     recent_sessions: list[ConversationSummaryResponse]
+    recent_uploads: list[UploadHistoryResponse]
     latest_activity_at: str | None
     revision: int
 
