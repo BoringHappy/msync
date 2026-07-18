@@ -43,7 +43,7 @@ def test_hook_queues_one_native_transcript_without_credentials_in_arguments(
     environment = {
         "PATH": os.environ.get("PATH", ""),
         "MSYNC_UPLOAD_URL": "https://history.example",
-        "MSYNC_UPLOAD_TOKEN": "secret-token",
+        "MSYNC_TOKEN": "secret-token",
     }
 
     hook_input = {

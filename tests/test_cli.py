@@ -55,7 +55,15 @@ def test_upload_requires_url(tmp_path: Path) -> None:
     root = tmp_path / ".codex_custom"
     _write_codex_transcript(root)
 
-    result = CliRunner().invoke(app, ["upload", "--dir", str(root)])
+    result = CliRunner().invoke(
+        app,
+        ["upload", "--dir", str(root)],
+        env={
+            "MSYNC_UPLOAD_URL": "",
+            "MSYNC_TOKEN": "",
+            "MSYNC_UPLOAD_TOKEN": "",
+        },
+    )
 
     assert result.exit_code == 2
     assert "Missing option '--url'" in unstyle(result.output)
@@ -277,9 +285,11 @@ def test_upload_sends_native_transcripts_to_remote_server(
         assert request["body"][4 + metadata_length :] == transcript_content
 
 
+@pytest.mark.parametrize("token_variable", ["MSYNC_TOKEN", "MSYNC_UPLOAD_TOKEN"])
 def test_upload_sends_only_selected_transcript_with_environment_credentials(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    token_variable: str,
 ) -> None:
     root = tmp_path / ".codex"
     _write_codex_transcript(root, session_id="first", filename="first.jsonl")
@@ -326,7 +336,9 @@ def test_upload_sends_only_selected_transcript_with_environment_credentials(
         ],
         env={
             "MSYNC_UPLOAD_URL": "https://history.example",
-            "MSYNC_UPLOAD_TOKEN": "env-token",
+            "MSYNC_TOKEN": "",
+            "MSYNC_UPLOAD_TOKEN": "",
+            token_variable: "env-token",
         },
     )
 
@@ -562,6 +574,7 @@ def test_upload_requires_token(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         app,
         ["upload", "--dir", str(root), "--url", "https://history.example"],
+        env={"MSYNC_TOKEN": "", "MSYNC_UPLOAD_TOKEN": ""},
     )
 
     assert result.exit_code == 1

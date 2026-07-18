@@ -60,7 +60,7 @@ _BASIC_CHALLENGE = 'Basic realm="msync", charset="UTF-8"'
 
 @dataclass(slots=True, frozen=True)
 class ServerAccount:
-    """One browser login with an optional remote-upload token."""
+    """One browser login with an optional API access token."""
 
     username: str
     password: str
@@ -369,6 +369,20 @@ def create_app(
                 return account
         return None
 
+    def authenticate_token(
+        credentials: HTTPAuthorizationCredentials | None,
+    ) -> ServerAccount | None:
+        if credentials is None or credentials.scheme.casefold() != "bearer":
+            return None
+        supplied_token = credentials.credentials.encode("utf-8")
+        for account in configured_accounts:
+            if account.token is not None and secrets.compare_digest(
+                supplied_token,
+                account.token.encode("utf-8"),
+            ):
+                return account
+        return None
+
     def session_cookie(account: ServerAccount) -> str:
         payload = json.dumps(
             {
@@ -466,7 +480,7 @@ def create_app(
         set_csrf_cookie(response, request, token)
         return response
 
-    def authenticated_account(
+    def authenticated_browser_account(
         request: Request,
         credentials: _BasicCredentials,
     ) -> ServerAccount | None:
@@ -476,31 +490,33 @@ def create_app(
             return authenticate_credentials(credentials.username, credentials.password)
         return session_account(request)
 
-    def require_auth(request: Request, credentials: _BasicCredentials) -> ServerAccount:
-        account = authenticated_account(request, credentials)
+    def require_auth(
+        request: Request,
+        credentials: _BasicCredentials,
+        token: _BearerCredentials,
+    ) -> ServerAccount:
+        account = authenticate_token(token)
+        if account is None:
+            account = authenticated_browser_account(request, credentials)
         if account is not None:
             return account
         challenge_headers = None
         if request.headers.get(_BROWSER_REQUEST_HEADER) != "1":
-            challenge_headers = {"WWW-Authenticate": _BASIC_CHALLENGE}
+            challenge = "Bearer" if token is not None else _BASIC_CHALLENGE
+            challenge_headers = {"WWW-Authenticate": challenge}
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required.",
             headers=challenge_headers,
         )
 
-    def require_upload_token(credentials: _BearerCredentials) -> ServerAccount:
-        if credentials is not None and credentials.scheme.casefold() == "bearer":
-            supplied_token = credentials.credentials.encode("utf-8")
-            for account in configured_accounts:
-                if account.token is not None and secrets.compare_digest(
-                    supplied_token,
-                    account.token.encode("utf-8"),
-                ):
-                    return account
+    def require_token(credentials: _BearerCredentials) -> ServerAccount:
+        account = authenticate_token(credentials)
+        if account is not None:
+            return account
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="A valid upload token is required.",
+            detail="A valid access token is required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -540,7 +556,7 @@ def create_app(
         next_path: Annotated[str, Query(alias="next", max_length=2048)] = "/",
     ) -> Response:
         destination = _safe_next_path(next_path)
-        if authenticated_account(request, credentials) is not None:
+        if authenticated_browser_account(request, credentials) is not None:
             return RedirectResponse(destination, status_code=status.HTTP_303_SEE_OTHER)
         return login_response(request, destination)
 
@@ -604,7 +620,7 @@ def create_app(
     @app.get("/insights", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def index(request: Request, credentials: _BasicCredentials) -> Response:
-        if authenticated_account(request, credentials) is None:
+        if authenticated_browser_account(request, credentials) is None:
             destination = request.url.path
             if request.url.query:
                 destination = f"{destination}?{request.url.query}"
@@ -674,7 +690,7 @@ def create_app(
     @app.post("/api/upload", response_model=UploadResponse)
     async def upload(
         request: Request,
-        account: ServerAccount = Depends(require_upload_token),  # noqa: B008
+        account: ServerAccount = Depends(require_token),  # noqa: B008
     ) -> Any:
         metadata, content = await _read_upload_request(request)
         try:
@@ -817,9 +833,9 @@ def _validate_accounts(accounts: Sequence[ServerAccount]) -> None:
         usernames.add(account.username)
         if account.token is not None:
             if not account.token:
-                raise ValueError("Server upload token must not be empty.")
+                raise ValueError("Server access token must not be empty.")
             if account.token in tokens:
-                raise ValueError("Server upload tokens must be unique.")
+                raise ValueError("Server access tokens must be unique.")
             tokens.add(account.token)
 
 

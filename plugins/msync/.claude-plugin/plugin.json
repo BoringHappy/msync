@@ -1,8 +1,8 @@
 {
   "name": "msync",
   "displayName": "msync",
-  "version": "0.1.0",
-  "description": "Upload the current Claude Code session to msync after every turn.",
+  "version": "0.2.0",
+  "description": "Upload sessions and recall project context from a remote msync archive.",
   "author": {
     "name": "BoringHappy"
   },
@@ -12,6 +12,7 @@
   "keywords": [
     "conversation-history",
     "sync",
-    "upload"
+    "upload",
+    "search"
   ]
 }

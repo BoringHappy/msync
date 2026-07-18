@@ -37,7 +37,8 @@ def queue_session_upload(
     """Start a detached one-transcript upload and return without waiting for it."""
 
     environment = os.environ if environ is None else environ
-    if not environment.get("MSYNC_UPLOAD_URL") or not environment.get("MSYNC_UPLOAD_TOKEN"):
+    token = environment.get("MSYNC_TOKEN") or environment.get("MSYNC_UPLOAD_TOKEN")
+    if not environment.get("MSYNC_UPLOAD_URL") or not token:
         return False
 
     stream = sys.stdin if input_stream is None else input_stream

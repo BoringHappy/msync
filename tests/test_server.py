@@ -368,7 +368,7 @@ def test_server_account_configuration_rejects_ambiguous_or_duplicate_credentials
             raise AssertionError(f"Accepted invalid server accounts: {value}")
 
 
-def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_only(
+def test_access_tokens_upload_read_and_isolate_accounts(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "archive.sqlite"
@@ -452,16 +452,35 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
         carol_locations = client.get("/api/locations", auth=("carol", "carol-password"))
         alice_conversations = client.get("/api/conversations", auth=("alice", "alice-password"))
         carol_conversations = client.get("/api/conversations", auth=("carol", "carol-password"))
+        alice_token_locations = client.get(
+            "/api/locations",
+            headers=_upload_headers("alice-token"),
+        )
+        alice_token_conversations = client.get(
+            "/api/conversations",
+            headers=_upload_headers("alice-token"),
+        )
+        carol_token_conversations = client.get(
+            "/api/conversations",
+            headers=_upload_headers("carol-token"),
+        )
+        invalid_token = client.get(
+            "/api/conversations",
+            headers=_upload_headers("wrong-token"),
+        )
         alice_metrics = client.get("/api/metrics", auth=("alice", "alice-password"))
         bob_metrics = client.get("/api/metrics", auth=("bob", "bob-password"))
-        alice_revision = client.get(
-            "/api/metrics/revision", auth=("alice", "alice-password")
-        )
+        alice_revision = client.get("/api/metrics/revision", auth=("alice", "alice-password"))
         bob_revision = client.get("/api/metrics/revision", auth=("bob", "bob-password"))
         carol_conversation_id = carol_conversations.json()[0]["id"]
+        alice_conversation_id = alice_token_conversations.json()[0]["id"]
+        alice_token_detail = client.get(
+            f"/api/conversations/{alice_conversation_id}",
+            headers=_upload_headers("alice-token"),
+        )
         cross_account_detail = client.get(
             f"/api/conversations/{carol_conversation_id}",
-            auth=("alice", "alice-password"),
+            headers=_upload_headers("alice-token"),
         )
 
     assert no_token.status_code == 401
@@ -482,6 +501,12 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
     assert len(carol_locations.json()) == 1
     assert len(alice_conversations.json()) == 1
     assert len(carol_conversations.json()) == 1
+    assert len(alice_token_locations.json()) == 1
+    assert len(alice_token_conversations.json()) == 1
+    assert len(carol_token_conversations.json()) == 1
+    assert alice_token_detail.status_code == 200
+    assert invalid_token.status_code == 401
+    assert invalid_token.headers["www-authenticate"] == "Bearer"
     assert alice_metrics.json()["totals"]["sessions"] == 1
     assert bob_metrics.json()["totals"]["sessions"] == 0
     assert [entry["unchanged"] for entry in alice_metrics.json()["recent_uploads"]] == [1, 0]

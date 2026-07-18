@@ -1,0 +1,4 @@
+interface:
+  display_name: "Recall History"
+  short_description: "Find context in remote msync conversations"
+  default_prompt: "Use $recall-history to find prior conversations relevant to this project."

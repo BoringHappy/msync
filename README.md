@@ -81,14 +81,14 @@ Remote backup has two parts: run an authenticated server, then upload from each 
 Clone this repository, then start msync with its bundled PostgreSQL database:
 
 ```console
-$ export MSYNC_SERVER_ACCOUNTS='alice,web-password,upload-token'
+$ export MSYNC_SERVER_ACCOUNTS='alice,web-password,access-token'
 $ export POSTGRES_PASSWORD='choose-a-strong-database-password'
 $ make docker-up-postgres
 ```
 
 Open <http://localhost:8000> and sign in as `alice` with `web-password`.
 
-Each account uses `username,password[,upload-token]`. Separate multiple accounts with semicolons:
+Each account uses `username,password[,access-token]`. Separate multiple accounts with semicolons:
 
 ```console
 $ export MSYNC_SERVER_ACCOUNTS='alice,alice-password,alice-token;bob,bob-password,bob-token'
@@ -111,20 +111,22 @@ PostgreSQL runs on the Docker host, use `host.docker.internal` as its hostname.
 
 ```console
 $ export MSYNC_UPLOAD_URL='https://history.example.com'
-$ export MSYNC_UPLOAD_TOKEN='alice-token'
+$ export MSYNC_TOKEN='alice-token'
 $ msync upload --dir ~/.claude
 $ msync upload --dir ~/.codex
 ```
 
-The URL can also be passed with `--url` and the token with `--token`. Environment variables are
-recommended because they keep the token out of shell history.
+The URL can also be passed with `--url` and the token with `--token`. `MSYNC_UPLOAD_TOKEN` is
+deprecated but remains available as a compatibility alias for `MSYNC_TOKEN`. Environment variables
+are recommended because they keep the token out of shell history.
 
 `upload` is read-only for the source directory. It verifies transcripts before sending them and
 uploads only new or changed sessions. A failed transcript is reported without preventing other
 valid transcripts from uploading. Each transcript can be up to 256 MiB.
 
-Use HTTPS whenever the server is available over a network. Upload tokens and archive contents
-should be protected like the original Claude Code and Codex history directories.
+Use HTTPS whenever the server is available over a network. Access tokens can upload and read the
+account's archive, so protect them and the archive contents like the original Claude Code and Codex
+history directories.
 
 ## Automatic uploads
 
@@ -136,7 +138,7 @@ Set these variables in the environment that launches your client:
 
 ```console
 $ export MSYNC_UPLOAD_URL='https://history.example.com'
-$ export MSYNC_UPLOAD_TOKEN='alice-token'
+$ export MSYNC_TOKEN='alice-token'
 ```
 
 For Claude Code:
@@ -155,6 +157,12 @@ $ codex plugin add msync@msync
 
 After installing the Codex plugin, open `/hooks`, review the `msync upload-hook` command, and trust
 it. The plugin does nothing when either required environment variable is missing.
+
+The plugin also includes the `recall-history` skill for both Claude Code and Codex. It searches the
+remote archive with the same `MSYNC_TOKEN`, filters sessions to the current repository when asked,
+and reads selected conversations as project context. For example, ask the agent to use
+`recall-history` to find an earlier decision or investigation. The skill never passes the token on
+the command line.
 
 ## Useful commands
 
