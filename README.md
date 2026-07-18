@@ -52,7 +52,7 @@ $ msync upload --dir /mnt/claude-history --provider claude
 # Explicit options take priority over MSYNC_ENDPOINT and MSYNC_TOKEN.
 $ msync upload --dir ~/.claude --url https://history.example.com --token alice-token
 
-# Build a local archive, keep both clients in sync, and search from the terminal.
+# Upload local changes, merge the remote archive into both clients, and search the server.
 $ msync sync --dir ~/.claude --dir ~/.codex
 $ msync search "database migration"
 $ msync sample 5
@@ -61,9 +61,9 @@ $ msync sample 5
 $ msync COMMAND --help
 ```
 
-To search history uploaded to the server, open the web UI at `MSYNC_ENDPOINT` and use its search
-box. `msync search` and `msync sample` query the local archive created by `msync sync`, which
-defaults to `~/.msync/msync.sqlite`.
+All client commands use the server configured by `MSYNC_ENDPOINT` and authenticate with
+`MSYNC_TOKEN`. Pass `--url` and `--token` explicitly only when environment variables are
+unavailable.
 
 `upload` only reads the source directory. It verifies transcripts before sending them and uploads
 only new or changed sessions; failed transcripts do not prevent other valid transcripts from
@@ -108,19 +108,21 @@ results to the current repository and never passes the token on the command line
 
 `msync sync` performs three operations:
 
-1. Archives new or changed conversations in `~/.msync/msync.sqlite`.
-2. Adds each conversation to the other client's history in its native format.
+1. Uploads new or changed local conversations to `MSYNC_ENDPOINT`.
+2. Downloads the account's archive and adds each conversation to the other client's history in its
+   native format.
 3. Keeps sessions separate and resumable.
 
 Running it again is safe: unchanged and duplicate conversations are skipped, and existing native
 transcripts are not overwritten. Generated histories contain a `.msync-manifest.json` file so they
 are not imported again.
 
-Use another SQLite file or a PostgreSQL database with `--database`:
+Use another server explicitly with `--url`; regular use should rely on `MSYNC_ENDPOINT` so secrets
+and server addresses do not need to be repeated:
 
 ```console
-$ msync sync --dir ~/.codex --database ./history.sqlite
-$ msync search "database migration" --database ./history.sqlite
+$ msync sync --dir ~/.codex --url https://history.example.com
+$ msync search "database migration" --url https://history.example.com
 ```
 
 ## Server configuration
@@ -154,6 +156,9 @@ To run the web UI locally without Docker:
 ```console
 $ MSYNC_SERVER_PASSWORD='choose-a-password' msync server
 ```
+
+The server uses `~/.msync/msync.sqlite` by default. Set `MSYNC_DATABASE_URL` to a different SQLite
+path or SQLAlchemy PostgreSQL URL; database configuration is not accepted as a command-line option.
 
 Open <http://127.0.0.1:8000> and sign in with username `msync`. Set a different username with
 `MSYNC_SERVER_USERNAME` or `--username`.

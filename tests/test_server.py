@@ -1010,13 +1010,12 @@ def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None
             "secret",
             "--username",
             "reader",
-            "--database",
-            str(database),
             "--host",
             "127.0.0.1",
             "--port",
             "8765",
         ],
+        env={"MSYNC_DATABASE_URL": str(database)},
     )
 
     assert result.exit_code == 0, result.output
@@ -1043,9 +1042,8 @@ def test_server_command_accepts_multi_account_configuration(
             "server",
             "--accounts",
             "alice,alice-password,alice-token;bob,bob-password",
-            "--database",
-            str(tmp_path / "server.sqlite"),
         ],
+        env={"MSYNC_DATABASE_URL": str(tmp_path / "server.sqlite")},
     )
 
     assert result.exit_code == 0, result.output
@@ -1065,8 +1063,9 @@ def test_server_command_leaves_old_schema_unchanged_when_upgrade_declined(
 
     result = CliRunner().invoke(
         app,
-        ["server", "--password", "secret", "--database", str(database)],
+        ["server", "--password", "secret"],
         input="n\n",
+        env={"MSYNC_DATABASE_URL": str(database)},
     )
 
     assert result.exit_code == 1
@@ -1098,8 +1097,9 @@ def test_server_command_upgrades_old_schema_when_confirmed(
     monkeypatch.setattr("uvicorn.run", fake_run)
     result = CliRunner().invoke(
         app,
-        ["server", "--password", "secret", "--database", str(database)],
+        ["server", "--password", "secret"],
         input="y\n",
+        env={"MSYNC_DATABASE_URL": str(database)},
     )
 
     assert result.exit_code == 0, result.output

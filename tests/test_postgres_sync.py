@@ -5,9 +5,11 @@ import json
 import os
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, delete, func, inspect, select
@@ -24,6 +26,9 @@ from msync.synchronization import MANIFEST_NAME
 from msync.tables import ConversationRow, LocationRow, UploadHistoryRow
 
 POSTGRES_URL = os.environ.get("MSYNC_POSTGRES_URL")
+REMOTE_URL = "https://history.example"
+REMOTE_TOKEN = "postgres-sync-token"
+REMOTE_ACCOUNT = "postgres-sync-user"
 
 
 @pytest.fixture
@@ -51,9 +56,51 @@ def postgres_url() -> Iterator[str]:
         engine.dispose()
 
 
+@contextmanager
+def _remote_cli(
+    database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    web_app = create_app(
+        database,
+        accounts=(ServerAccount(REMOTE_ACCOUNT, "password", REMOTE_TOKEN),),
+    )
+    with TestClient(web_app) as client:
+
+        def remote_get(
+            url: str,
+            *,
+            params: dict[str, str | int] | None,
+            headers: dict[str, str],
+            timeout: httpx.Timeout,
+        ) -> httpx.Response:
+            del timeout
+            target = httpx.URL(url)
+            assert f"{target.scheme}://{target.host}" == REMOTE_URL
+            return client.get(target.path, params=params, headers=headers)
+
+        def remote_post(
+            url: str,
+            *,
+            headers: dict[str, str],
+            content: Iterator[bytes],
+            timeout: httpx.Timeout,
+        ) -> httpx.Response:
+            del timeout
+            target = httpx.URL(url)
+            assert f"{target.scheme}://{target.host}" == REMOTE_URL
+            return client.post(target.path, headers=headers, content=b"".join(content))
+
+        monkeypatch.setattr("msync.cli.httpx.get", remote_get)
+        monkeypatch.setattr("msync.cli.httpx.post", remote_post)
+        yield
+
+
 @pytest.mark.skipif(not POSTGRES_URL, reason="MSYNC_POSTGRES_URL is not configured")
 def test_postgres_sync_writes_round_trip_native_histories(
-    tmp_path: Path, postgres_url: str
+    tmp_path: Path,
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_id = str(uuid4())
     claude_prompt = f"Postgres Claude prompt {run_id}"
@@ -93,18 +140,21 @@ def test_postgres_sync_writes_round_trip_native_histories(
     roots = [claude_root.resolve(), codex_root.resolve()]
 
     try:
-        result = CliRunner().invoke(
-            app,
-            [
-                "sync",
-                "--dir",
-                str(claude_root),
-                "--dir",
-                str(codex_root),
-                "--database",
-                postgres_url,
-            ],
-        )
+        with _remote_cli(postgres_url, monkeypatch):
+            result = CliRunner().invoke(
+                app,
+                [
+                    "sync",
+                    "--dir",
+                    str(claude_root),
+                    "--dir",
+                    str(codex_root),
+                    "--url",
+                    REMOTE_URL,
+                    "--token",
+                    REMOTE_TOKEN,
+                ],
+            )
 
         assert result.exit_code == 0, result.output
         claude_generated = _generated_paths(claude_root)
@@ -122,21 +172,25 @@ def test_postgres_sync_writes_round_trip_native_histories(
                     root=resolved_root,
                     provider=selected_provider,
                     transcripts=selected_provider.discover(resolved_root),
+                    account_username=REMOTE_ACCOUNT,
                 )
             assert feedback.duplicates == 1
 
-        repeated = CliRunner().invoke(
-            app,
-            [
-                "sync",
-                "--dir",
-                str(claude_root),
-                "--dir",
-                str(codex_root),
-                "--database",
-                postgres_url,
-            ],
-        )
+        with _remote_cli(postgres_url, monkeypatch):
+            repeated = CliRunner().invoke(
+                app,
+                [
+                    "sync",
+                    "--dir",
+                    str(claude_root),
+                    "--dir",
+                    str(codex_root),
+                    "--url",
+                    REMOTE_URL,
+                    "--token",
+                    REMOTE_TOKEN,
+                ],
+            )
         assert repeated.exit_code == 0, repeated.output
         assert len(_generated_paths(claude_root)) == 1
         assert len(_generated_paths(codex_root)) == 1
@@ -303,17 +357,29 @@ def test_postgres_remote_uploads_are_isolated_by_account(postgres_url: str) -> N
     assert len(bob_conversations.json()) == 1
 
     with Archive(postgres_url) as archive, archive.engine.connect() as connection:
-        location_owners = connection.execute(
-            select(LocationRow.account_username).order_by(LocationRow.account_username)
-        ).scalars().all()
-        conversation_owners = connection.execute(
-            select(ConversationRow.account_username).order_by(ConversationRow.account_username)
-        ).scalars().all()
-        upload_owners = connection.execute(
-            select(UploadHistoryRow.account_username).order_by(
-                UploadHistoryRow.account_username
+        location_owners = (
+            connection.execute(
+                select(LocationRow.account_username).order_by(LocationRow.account_username)
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
+        conversation_owners = (
+            connection.execute(
+                select(ConversationRow.account_username).order_by(ConversationRow.account_username)
+            )
+            .scalars()
+            .all()
+        )
+        upload_owners = (
+            connection.execute(
+                select(UploadHistoryRow.account_username).order_by(
+                    UploadHistoryRow.account_username
+                )
+            )
+            .scalars()
+            .all()
+        )
     assert location_owners == ["postgres-alice", "postgres-bob"]
     assert conversation_owners == ["postgres-alice", "postgres-bob"]
     assert upload_owners == ["postgres-alice", "postgres-bob"]
@@ -349,9 +415,7 @@ def test_postgres_v6_schema_upgrades_to_tenant_ownership(
                 "CREATE UNIQUE INDEX conversations_logical_revision_uq "
                 "ON conversations(logical_session_id, chat_sha256)"
             )
-            connection.exec_driver_sql(
-                "ALTER TABLE conversations DROP COLUMN account_username"
-            )
+            connection.exec_driver_sql("ALTER TABLE conversations DROP COLUMN account_username")
             connection.exec_driver_sql("ALTER TABLE locations DROP COLUMN account_username")
             connection.exec_driver_sql(
                 "UPDATE locations SET root_path_hash = %s",

@@ -4,9 +4,13 @@ import json
 import re
 import sqlite3
 import stat
+from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
 
+import httpx
+import pytest
+from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from msync.cli import app
@@ -14,7 +18,12 @@ from msync.database import Archive, UploadResult
 from msync.providers import get_provider
 from msync.schemas.claude import ClaudeRecord
 from msync.schemas.codex import CodexRolloutLine
+from msync.server import ServerAccount, create_app
 from msync.synchronization import MANIFEST_NAME
+
+REMOTE_URL = "https://history.example"
+REMOTE_TOKEN = "sync-token"
+REMOTE_ACCOUNT = "sync-user"
 
 
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
@@ -30,7 +39,55 @@ def _archive_transcripts(database: Path, root: Path, provider_name: str = "codex
             root=resolved_root,
             provider=provider,
             transcripts=provider.discover(resolved_root),
+            account_username=REMOTE_ACCOUNT,
         )
+
+
+@pytest.fixture
+def remote_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    """Route real CLI HTTP calls through an authenticated temporary server archive."""
+
+    database = tmp_path / "remote.sqlite"
+    web_app = create_app(
+        database,
+        accounts=(ServerAccount(REMOTE_ACCOUNT, "password", REMOTE_TOKEN),),
+    )
+    with TestClient(web_app) as client:
+
+        def remote_get(
+            url: str,
+            *,
+            params: dict[str, str | int] | None,
+            headers: dict[str, str],
+            timeout: httpx.Timeout,
+        ) -> httpx.Response:
+            del timeout
+            target = httpx.URL(url)
+            assert f"{target.scheme}://{target.host}" == REMOTE_URL
+            return client.get(target.path, params=params, headers=headers)
+
+        def remote_post(
+            url: str,
+            *,
+            headers: dict[str, str],
+            content: Iterator[bytes],
+            timeout: httpx.Timeout,
+        ) -> httpx.Response:
+            del timeout
+            target = httpx.URL(url)
+            assert f"{target.scheme}://{target.host}" == REMOTE_URL
+            return client.post(target.path, headers=headers, content=b"".join(content))
+
+        monkeypatch.setattr("msync.cli.httpx.get", remote_get)
+        monkeypatch.setattr("msync.cli.httpx.post", remote_post)
+        yield database
+
+
+def _remote_options() -> list[str]:
+    return ["--url", REMOTE_URL, "--token", REMOTE_TOKEN]
 
 
 def _claude_records() -> list[dict[str, object]]:
@@ -88,7 +145,10 @@ def _codex_records() -> list[dict[str, object]]:
     ]
 
 
-def test_sync_merges_both_platforms_into_native_resumable_histories(tmp_path: Path) -> None:
+def test_sync_merges_both_platforms_into_native_resumable_histories(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     claude_root = tmp_path / ".claude"
     codex_root = tmp_path / ".codex"
     claude_path = claude_root / "projects/-work-claude-project/claude-session.jsonl"
@@ -101,8 +161,6 @@ def test_sync_merges_both_platforms_into_native_resumable_histories(tmp_path: Pa
     _write_jsonl(codex_path, _codex_records())
     original_claude = claude_path.read_bytes()
     original_codex = codex_path.read_bytes()
-    database = tmp_path / "sync.sqlite"
-
     first = CliRunner().invoke(
         app,
         [
@@ -111,9 +169,8 @@ def test_sync_merges_both_platforms_into_native_resumable_histories(tmp_path: Pa
             str(claude_root),
             "--dir",
             str(codex_root),
-            "--database",
-            str(database),
         ],
+        env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
     )
 
     assert first.exit_code == 0, first.output
@@ -171,24 +228,25 @@ def test_sync_merges_both_platforms_into_native_resumable_histories(tmp_path: Pa
             str(claude_root),
             "--dir",
             str(codex_root),
-            "--database",
-            str(database),
         ],
+        env={"MSYNC_ENDPOINT": REMOTE_URL, "MSYNC_TOKEN": REMOTE_TOKEN},
     )
 
     assert second.exit_code == 0, second.output
     assert len(re.findall(r"Native histories unchanged\s+1", second.output)) == 2
-    with closing(sqlite3.connect(database)) as connection:
+    with closing(sqlite3.connect(remote_archive)) as connection:
         assert connection.execute("SELECT count(*) FROM locations").fetchone() == (2,)
         assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (2,)
 
 
-def test_sync_can_generate_an_explicit_provider_location_from_archive(tmp_path: Path) -> None:
+def test_sync_can_generate_an_explicit_provider_location_from_archive(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
-    database = tmp_path / "sync.sqlite"
-    _archive_transcripts(database, codex_root)
+    _archive_transcripts(remote_archive, codex_root)
     destination = tmp_path / "neutral-output"
 
     result = CliRunner().invoke(
@@ -199,8 +257,7 @@ def test_sync_can_generate_an_explicit_provider_location_from_archive(tmp_path: 
             str(destination),
             "--provider",
             "claude",
-            "--database",
-            str(database),
+            *_remote_options(),
         ],
     )
 
@@ -210,12 +267,14 @@ def test_sync_can_generate_an_explicit_provider_location_from_archive(tmp_path: 
     assert get_provider("claude").read(generated[0], destination).title == "Question from Codex"
 
 
-def test_sync_does_not_overwrite_a_continued_export(tmp_path: Path) -> None:
+def test_sync_does_not_overwrite_a_continued_export(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
     destination = tmp_path / ".claude"
-    database = tmp_path / "sync.sqlite"
     arguments = [
         "sync",
         "--dir",
@@ -226,8 +285,7 @@ def test_sync_does_not_overwrite_a_continued_export(tmp_path: Path) -> None:
         "codex",
         "--provider",
         "claude",
-        "--database",
-        str(database),
+        *_remote_options(),
     ]
     first = CliRunner().invoke(app, arguments)
     assert first.exit_code == 0, first.output
@@ -254,12 +312,12 @@ def test_sync_does_not_overwrite_a_continued_export(tmp_path: Path) -> None:
 
 def test_changed_source_creates_new_session_without_overwriting_previous(
     tmp_path: Path,
+    remote_archive: Path,
 ) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
     destination = tmp_path / ".claude"
-    database = tmp_path / "sync.sqlite"
     arguments = [
         "sync",
         "--dir",
@@ -270,8 +328,7 @@ def test_changed_source_creates_new_session_without_overwriting_previous(
         "codex",
         "--provider",
         "claude",
-        "--database",
-        str(database),
+        *_remote_options(),
     ]
     first = CliRunner().invoke(app, arguments)
     assert first.exit_code == 0, first.output
@@ -296,12 +353,14 @@ def test_changed_source_creates_new_session_without_overwriting_previous(
     assert any("A later Codex turn" in path.read_text() for path in generated if path != previous)
 
 
-def test_sync_reuses_a_managed_revision_from_an_older_path_scheme(tmp_path: Path) -> None:
+def test_sync_reuses_a_managed_revision_from_an_older_path_scheme(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
     claude_root = tmp_path / ".claude"
-    database = tmp_path / "sync.sqlite"
     arguments = [
         "sync",
         "--dir",
@@ -312,8 +371,7 @@ def test_sync_reuses_a_managed_revision_from_an_older_path_scheme(tmp_path: Path
         "codex",
         "--provider",
         "claude",
-        "--database",
-        str(database),
+        *_remote_options(),
     ]
     first = CliRunner().invoke(app, arguments)
     assert first.exit_code == 0, first.output
@@ -333,7 +391,10 @@ def test_sync_reuses_a_managed_revision_from_an_older_path_scheme(tmp_path: Path
     assert _generated_paths(claude_root) == [legacy]
 
 
-def test_same_provider_revisions_are_cloned_instead_of_conflicting(tmp_path: Path) -> None:
+def test_same_provider_revisions_are_cloned_instead_of_conflicting(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     first_root = tmp_path / "codex-a"
     second_root = tmp_path / "codex-b"
     relative_path = Path("sessions/2026/07/14/rollout-shared.jsonl")
@@ -362,8 +423,7 @@ def test_same_provider_revisions_are_cloned_instead_of_conflicting(tmp_path: Pat
             "codex",
             "--provider",
             "codex",
-            "--database",
-            str(tmp_path / "archive.sqlite"),
+            *_remote_options(),
         ],
     )
 
@@ -377,12 +437,14 @@ def test_same_provider_revisions_are_cloned_instead_of_conflicting(tmp_path: Pat
         assert titles == {"Question from Codex", "Question from the second Codex location"}
 
 
-def test_sync_rejects_symlinked_destination_components(tmp_path: Path) -> None:
+def test_sync_rejects_symlinked_destination_components(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
-    database = tmp_path / "archive.sqlite"
-    _archive_transcripts(database, codex_root)
+    _archive_transcripts(remote_archive, codex_root)
     destination = tmp_path / ".claude"
     outside = tmp_path / "outside"
     destination.mkdir()
@@ -397,8 +459,7 @@ def test_sync_rejects_symlinked_destination_components(tmp_path: Path) -> None:
             str(destination),
             "--provider",
             "claude",
-            "--database",
-            str(database),
+            *_remote_options(),
         ],
     )
 
@@ -407,12 +468,14 @@ def test_sync_rejects_symlinked_destination_components(tmp_path: Path) -> None:
     assert list(outside.rglob("*.jsonl")) == []
 
 
-def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_path: Path) -> None:
+def test_logical_session_identity_prevents_cross_provider_upload_feedback(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
     codex_root = tmp_path / ".codex"
     codex_path = codex_root / "sessions/2026/07/14/rollout-source.jsonl"
     _write_jsonl(codex_path, _codex_records())
     claude_root = tmp_path / ".claude"
-    database = tmp_path / "sync.sqlite"
     first = CliRunner().invoke(
         app,
         [
@@ -425,12 +488,11 @@ def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_pa
             "codex",
             "--provider",
             "claude",
-            "--database",
-            str(database),
+            *_remote_options(),
         ],
     )
     assert first.exit_code == 0, first.output
-    upload_copy = _archive_transcripts(database, claude_root, "claude")
+    upload_copy = _archive_transcripts(remote_archive, claude_root, "claude")
     assert upload_copy.duplicates == 1
 
     cycle_arguments = [
@@ -443,17 +505,16 @@ def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_pa
         "codex",
         "--provider",
         "claude",
-        "--database",
-        str(database),
+        *_remote_options(),
     ]
     for _ in range(3):
-        repeated_upload = _archive_transcripts(database, claude_root, "claude")
+        repeated_upload = _archive_transcripts(remote_archive, claude_root, "claude")
         assert repeated_upload.duplicates == 1
         repeated_sync = CliRunner().invoke(app, cycle_arguments)
         assert repeated_sync.exit_code == 0, repeated_sync.output
         assert len(_generated_paths(claude_root)) == 1
 
-    with closing(sqlite3.connect(database)) as connection:
+    with closing(sqlite3.connect(remote_archive)) as connection:
         metadata = [
             json.loads(row[0])
             for row in connection.execute("SELECT metadata_json FROM conversations")
@@ -472,8 +533,7 @@ def test_logical_session_identity_prevents_cross_provider_upload_feedback(tmp_pa
             str(merged),
             "--provider",
             "claude",
-            "--database",
-            str(database),
+            *_remote_options(),
         ],
     )
 

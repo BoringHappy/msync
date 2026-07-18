@@ -63,7 +63,8 @@ class SchemaUpgradeRequiredError(RuntimeError):
         self.target_version = SCHEMA_VERSION
         super().__init__(
             f"Database schema version {current_version} must be upgraded to {SCHEMA_VERSION}. "
-            "Stop other msync processes, then start `msync server --database <database>` "
+            "Stop other msync processes, set MSYNC_DATABASE_URL to this database, then start "
+            "`msync server` "
             "to upgrade it."
         )
 
