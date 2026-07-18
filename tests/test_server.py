@@ -471,6 +471,12 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "moveHumanMessage" in script.text
     assert "sessionLoaderObserver" in script.text
     assert "transcriptLoaderObserver" in script.text
+    assert "cancelEventPagination" in script.text
+    assert "transcriptLoaderObserver?.takeRecords()" in script.text
+    scroll_top_function = script.text.split("function scrollConversationTop()", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert 'behavior: "smooth"' not in scroll_top_function
     assert "renderMarkdownTable" in script.text
     assert 'data-transcript-filter="tools"' in page.text
     assert 'id="load-more"' in page.text

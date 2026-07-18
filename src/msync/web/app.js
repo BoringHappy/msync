@@ -81,10 +81,20 @@ const transcriptLoaderObserver = typeof IntersectionObserver === "undefined"
   ? null
   : new IntersectionObserver((entries) => {
     const loader = entries.find((entry) => entry.isIntersecting)?.target;
-    if (!loader || state.eventLoading) return;
+    const activeLoader = elements.transcript.querySelector(".transcript-load-more");
+    if (!loader || loader !== activeLoader || state.eventLoading) return;
     transcriptLoaderObserver.unobserve(loader);
     loadMoreEvents();
   }, { root: elements.content, rootMargin: "0px 0px 480px" });
+
+function cancelEventPagination() {
+  transcriptLoaderObserver?.takeRecords();
+  transcriptLoaderObserver?.disconnect();
+  state.eventRequest += 1;
+  state.eventController?.abort();
+  state.eventController = null;
+  state.eventLoading = false;
+}
 
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -236,9 +246,7 @@ async function loadConversations({ append = false, keepSelection = false } = {})
   if (!append) {
     state.conversationRequest += 1;
     state.conversationController?.abort();
-    state.eventRequest += 1;
-    state.eventController?.abort();
-    state.eventLoading = false;
+    cancelEventPagination();
     elements.sessionList.replaceChildren(node("div", "loading", "Loading sessions…"));
   }
   elements.sessionList.setAttribute("aria-busy", "true");
@@ -350,9 +358,7 @@ async function openConversation(id) {
   if (!id) return;
   const requestId = ++state.conversationRequest;
   state.conversationController?.abort();
-  state.eventRequest += 1;
-  state.eventController?.abort();
-  state.eventLoading = false;
+  cancelEventPagination();
   const controller = new AbortController();
   state.conversationController = controller;
   elements.footerStatus.textContent = "Loading transcript…";
@@ -363,6 +369,8 @@ async function openConversation(id) {
       signal: controller.signal,
     });
     if (requestId !== state.conversationRequest) return;
+    // A queued observer may have started pagination for the old session while this request ran.
+    cancelEventPagination();
     state.activeConversation = detail;
     state.detailsExpanded = false;
     state.humanCursorSequence = null;
@@ -381,6 +389,7 @@ async function openConversation(id) {
   } catch (error) {
     if (error.name === "AbortError") return;
     if (requestId !== state.conversationRequest) return;
+    cancelEventPagination();
     showToast(`Could not load session: ${error.message}`);
     elements.footerStatus.textContent = "Load failed";
     elements.conversation.setAttribute("aria-busy", "false");
@@ -1358,7 +1367,7 @@ async function loadMoreEvents() {
 
 function scrollConversationTop() {
   state.humanCursorSequence = null;
-  elements.content.scrollTo({ top: 0, behavior: "smooth" });
+  elements.content.scrollTo({ top: 0 });
 }
 
 async function copyConversationLink() {
