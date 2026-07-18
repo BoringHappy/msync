@@ -45,6 +45,9 @@ class LocationRow(Base):
     __table_args__ = (Index("locations_root_path_hash_uq", "root_path_hash", unique=True),)
 
     id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    account_username: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=""
+    )
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     hostname: Mapped[str] = mapped_column(String(255), nullable=False)
     root_path: Mapped[str] = mapped_column(LONG_TEXT, nullable=False)
@@ -69,6 +72,7 @@ class ConversationRow(Base):
         ),
         Index(
             "conversations_logical_revision_uq",
+            "account_username",
             "logical_session_id",
             "chat_sha256",
             unique=True,
@@ -78,6 +82,9 @@ class ConversationRow(Base):
     )
 
     id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    account_username: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=""
+    )
     location_id: Mapped[int] = mapped_column(
         ID_TYPE, ForeignKey("locations.id", ondelete="CASCADE"), nullable=False
     )

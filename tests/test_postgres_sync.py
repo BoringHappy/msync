@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -9,7 +11,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, delete, func, select
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, delete, func, inspect, select
 from sqlalchemy.engine import make_url
 from typer.testing import CliRunner
 
@@ -17,6 +20,7 @@ from msync import database as database_module
 from msync.cli import app
 from msync.database import Archive
 from msync.providers import get_provider
+from msync.server import ServerAccount, create_app
 from msync.synchronization import MANIFEST_NAME
 from msync.tables import ConversationRow, LocationRow
 
@@ -241,6 +245,145 @@ def test_postgres_concurrent_uploads_keep_one_logical_revision(
     finally:
         with Archive(postgres_url) as archive, archive.engine.begin() as connection:
             connection.execute(delete(LocationRow).where(LocationRow.root_path.in_(roots)))
+
+
+@pytest.mark.skipif(not POSTGRES_URL, reason="MSYNC_POSTGRES_URL is not configured")
+def test_postgres_remote_uploads_are_isolated_by_account(postgres_url: str) -> None:
+    web_app = create_app(
+        postgres_url,
+        accounts=(
+            ServerAccount("postgres-alice", "alice-password", "alice-token"),
+            ServerAccount("postgres-bob", "bob-password", "bob-token"),
+        ),
+    )
+    content = (
+        json.dumps(
+            {
+                "timestamp": "2026-07-14T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "postgres-tenant-session", "cwd": "/tmp"},
+            }
+        )
+        + "\n"
+    ).encode()
+    payload = {
+        "provider": "codex",
+        "hostname": "postgres-client",
+        "root_path": "/home/client/.codex",
+        "display_name": ".codex",
+        "transcripts": [
+            {
+                "relative_path": "sessions/tenant.jsonl",
+                "content_base64": base64.b64encode(content).decode(),
+            }
+        ],
+    }
+
+    with TestClient(web_app) as client:
+        alice_upload = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        bob_upload = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer bob-token"},
+        )
+        alice_conversations = client.get(
+            "/api/conversations",
+            auth=("postgres-alice", "alice-password"),
+        )
+        bob_conversations = client.get(
+            "/api/conversations",
+            auth=("postgres-bob", "bob-password"),
+        )
+
+    assert alice_upload.status_code == 200
+    assert alice_upload.json()["imported"] == 1
+    assert bob_upload.status_code == 200
+    assert bob_upload.json()["imported"] == 1
+    assert len(alice_conversations.json()) == 1
+    assert len(bob_conversations.json()) == 1
+
+    with Archive(postgres_url) as archive, archive.engine.connect() as connection:
+        location_owners = connection.execute(
+            select(LocationRow.account_username).order_by(LocationRow.account_username)
+        ).scalars().all()
+        conversation_owners = connection.execute(
+            select(ConversationRow.account_username).order_by(ConversationRow.account_username)
+        ).scalars().all()
+    assert location_owners == ["postgres-alice", "postgres-bob"]
+    assert conversation_owners == ["postgres-alice", "postgres-bob"]
+
+
+@pytest.mark.skipif(not POSTGRES_URL, reason="MSYNC_POSTGRES_URL is not configured")
+def test_postgres_v6_schema_upgrades_to_tenant_ownership(
+    tmp_path: Path,
+    postgres_url: str,
+) -> None:
+    root = (tmp_path / ".codex-postgres-migration").resolve()
+    transcript = root / "sessions" / "migration.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            {
+                "timestamp": "2026-07-14T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "postgres-migration-session", "cwd": "/tmp"},
+            }
+        ],
+    )
+    with Archive(postgres_url) as archive:
+        archive.upload(root=root, provider=get_provider("codex"), transcripts=[transcript])
+        hostname = archive.hostname
+
+    legacy_hash = hashlib.sha256(f"{hostname.casefold()}\0{root}".encode()).hexdigest()
+    engine = create_engine(postgres_url)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP INDEX conversations_logical_revision_uq")
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX conversations_logical_revision_uq "
+                "ON conversations(logical_session_id, chat_sha256)"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE conversations DROP COLUMN account_username"
+            )
+            connection.exec_driver_sql("ALTER TABLE locations DROP COLUMN account_username")
+            connection.exec_driver_sql(
+                "UPDATE locations SET root_path_hash = %s",
+                (legacy_hash,),
+            )
+            connection.exec_driver_sql(
+                "UPDATE schema_info SET value = '6' WHERE key = 'schema_version'"
+            )
+    finally:
+        engine.dispose()
+
+    upgrade_steps: list[tuple[int, int]] = []
+    with Archive(
+        postgres_url,
+        upgrade_reporter=lambda *step: upgrade_steps.append(step),
+    ) as archive:
+        assert archive.browse_conversations()[0].external_id == "postgres-migration-session"
+        with archive.engine.connect() as connection:
+            location_columns = {
+                column["name"] for column in inspect(connection).get_columns("locations")
+            }
+            revision_index = next(
+                index
+                for index in inspect(connection).get_indexes("conversations")
+                if index["name"] == "conversations_logical_revision_uq"
+            )
+
+    assert upgrade_steps == [(6, 7)]
+    assert "account_username" in location_columns
+    assert tuple(revision_index["column_names"]) == (
+        "account_username",
+        "logical_session_id",
+        "chat_sha256",
+    )
 
 
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:

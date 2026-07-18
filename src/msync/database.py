@@ -8,7 +8,7 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, Self
 
@@ -28,7 +28,7 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LEGACY_HOSTNAME = "unknown"
 
 SchemaUpgradeReporter = Callable[[int, int], None]
@@ -113,6 +113,15 @@ class UploadResult:
     duplicates: int = 0
     events: int = 0
     message_parts: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class RemoteTranscript:
+    """One native transcript supplied by an authenticated remote client."""
+
+    relative_path: str
+    content: bytes
+    source_mtime_ns: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -276,19 +285,104 @@ class Archive:
         root: Path,
         provider: HistoryProvider,
         transcripts: list[Path],
+        account_username: str = "",
     ) -> UploadResult:
         """Archive changed transcripts from a single source location."""
 
         root = root.resolve()
         with Session(self.engine) as session, session.begin():
-            location = self._upsert_location(session, root, provider.name, self.hostname)
+            location = self._upsert_location(
+                session,
+                root_path=str(root),
+                display_name=root.name or str(root),
+                provider=provider.name,
+                hostname=self.hostname,
+                account_username=account_username,
+            )
             result = UploadResult(location_id=location.id, scanned=len(transcripts))
             for path in transcripts:
                 for attempt in range(2):
                     file_result = UploadResult(location_id=location.id)
                     try:
                         with session.begin_nested():
-                            self._upload_file(session, file_result, root, provider, path)
+                            self._upload_file(
+                                session,
+                                file_result,
+                                root,
+                                provider,
+                                path,
+                                account_username=account_username,
+                            )
+                    except IntegrityError:
+                        if attempt:
+                            raise
+                        continue
+                    _accumulate_upload_result(result, file_result)
+                    break
+            location.last_scanned_at = datetime.now(UTC)
+        return result
+
+    def upload_remote(
+        self,
+        *,
+        root_path: str,
+        display_name: str,
+        provider: HistoryProvider,
+        hostname: str,
+        account_username: str,
+        transcripts: list[RemoteTranscript],
+    ) -> UploadResult:
+        """Archive native transcript bytes received from an authenticated client."""
+
+        if not root_path.strip():
+            raise ValueError("Remote root path must not be empty.")
+        if not display_name.strip():
+            raise ValueError("Remote location name must not be empty.")
+        if not account_username:
+            raise ValueError("Remote account username must not be empty.")
+        normalized_hostname = _normalize_hostname(hostname)
+        virtual_root = Path("/msync-remote-upload")
+
+        normalized: list[tuple[Path, RemoteTranscript]] = []
+        for transcript in transcripts:
+            relative_path = PurePosixPath(transcript.relative_path)
+            if (
+                not transcript.relative_path
+                or relative_path.is_absolute()
+                or relative_path == PurePosixPath(".")
+                or ".." in relative_path.parts
+            ):
+                raise ValueError(
+                    f"Remote transcript path must be relative and contained: "
+                    f"{transcript.relative_path!r}."
+                )
+            normalized.append((virtual_root.joinpath(*relative_path.parts), transcript))
+
+        with Session(self.engine) as session, session.begin():
+            location = self._upsert_location(
+                session,
+                root_path=root_path,
+                display_name=display_name,
+                provider=provider.name,
+                hostname=normalized_hostname,
+                account_username=account_username,
+            )
+            result = UploadResult(location_id=location.id, scanned=len(normalized))
+            for path, transcript in normalized:
+                for attempt in range(2):
+                    file_result = UploadResult(location_id=location.id)
+                    try:
+                        with session.begin_nested():
+                            self._upload_file(
+                                session,
+                                file_result,
+                                virtual_root,
+                                provider,
+                                path,
+                                account_username=account_username,
+                                transcript=transcript.content,
+                                source_mtime_ns=transcript.source_mtime_ns,
+                            )
                     except IntegrityError:
                         if attempt:
                             raise
@@ -344,7 +438,12 @@ class Archive:
         with Session(self.engine) as session:
             return [SearchResult(*row) for row in session.execute(statement)]
 
-    def browse_locations(self) -> list[ArchiveLocation]:
+    def browse_locations(
+        self,
+        *,
+        account_username: str | None = None,
+        include_legacy: bool = False,
+    ) -> list[ArchiveLocation]:
         """Return source locations and their conversation counts for the web UI."""
 
         statement = (
@@ -368,6 +467,9 @@ class Archive:
             )
             .order_by(LocationRow.display_name, LocationRow.id)
         )
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(LocationRow.account_username.in_(owners))
         with Session(self.engine) as session:
             return [ArchiveLocation(*row) for row in session.execute(statement)]
 
@@ -379,6 +481,8 @@ class Archive:
         order_by: str = "newest",
         limit: int = 200,
         offset: int = 0,
+        account_username: str | None = None,
+        include_legacy: bool = False,
     ) -> list[ConversationSummary]:
         """Return ordered conversations, optionally filtered by location and text."""
 
@@ -442,6 +546,9 @@ class Archive:
         )
         if location_id is not None:
             statement = statement.where(ConversationRow.location_id == location_id)
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(LocationRow.account_username.in_(owners))
         if query := search_text.strip():
             pattern = f"%{query}%"
             matching_event = (
@@ -493,6 +600,8 @@ class Archive:
         *,
         event_limit: int | None = None,
         event_offset: int = 0,
+        account_username: str | None = None,
+        include_legacy: bool = False,
     ) -> ConversationDetail | None:
         """Return conversation metadata and an optionally bounded event page."""
 
@@ -522,6 +631,9 @@ class Archive:
             .join(LocationRow, ConversationRow.location_id == LocationRow.id)
             .where(ConversationRow.id == conversation_id)
         )
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(LocationRow.account_username.in_(owners))
         with Session(self.engine) as session:
             row = session.execute(statement).one_or_none()
             if row is None:
@@ -841,17 +953,19 @@ class Archive:
     @staticmethod
     def _upsert_location(
         session: Session,
-        root: Path,
+        *,
+        root_path: str,
+        display_name: str,
         provider: str,
         hostname: str,
+        account_username: str,
     ) -> LocationRow:
-        root_path = str(root)
-        root_path_hash = _location_hash(hostname, root_path)
+        root_path_hash = _location_hash(account_username, hostname, root_path)
         location = session.scalar(
             select(LocationRow).where(LocationRow.root_path_hash == root_path_hash)
         )
         if location is None and hostname.casefold() != LEGACY_HOSTNAME:
-            legacy_hash = _location_hash(LEGACY_HOSTNAME, root_path)
+            legacy_hash = _location_hash(account_username, LEGACY_HOSTNAME, root_path)
             location = session.scalar(
                 select(LocationRow)
                 .where(LocationRow.root_path_hash == legacy_hash)
@@ -866,16 +980,21 @@ class Archive:
                 location.root_path_hash = root_path_hash
         if location is None:
             location = LocationRow(
+                account_username=account_username,
                 provider=provider,
                 hostname=hostname,
                 root_path=root_path,
                 root_path_hash=root_path_hash,
-                display_name=root.name or root_path,
+                display_name=display_name,
             )
             session.add(location)
             session.flush()
             return location
-        if location.root_path != root_path or location.hostname.casefold() != hostname.casefold():
+        if (
+            location.account_username != account_username
+            or location.root_path != root_path
+            or location.hostname.casefold() != hostname.casefold()
+        ):
             raise RuntimeError("A SHA-256 collision occurred while identifying a source location.")
         location.hostname = hostname
         if location.provider != provider:
@@ -883,7 +1002,7 @@ class Archive:
                 delete(ConversationRow).where(ConversationRow.location_id == location.id)
             )
             location.provider = provider
-        location.display_name = root.name or root_path
+        location.display_name = display_name
         return location
 
     @staticmethod
@@ -893,8 +1012,12 @@ class Archive:
         root: Path,
         provider: HistoryProvider,
         path: Path,
+        *,
+        account_username: str,
+        transcript: bytes | None = None,
+        source_mtime_ns: int | None = None,
     ) -> None:
-        transcript = path.read_bytes()
+        transcript = path.read_bytes() if transcript is None else transcript
         content_sha256 = hashlib.sha256(transcript).hexdigest()
         relative_path = path.relative_to(root).as_posix()
         relative_path_hash = _text_hash(relative_path)
@@ -919,6 +1042,7 @@ class Archive:
             duplicate = _find_duplicate_identity(
                 session,
                 identity,
+                account_username=account_username,
                 exclude_id=existing.id,
             )
             if duplicate is not None:
@@ -941,6 +1065,7 @@ class Archive:
         duplicate = _find_duplicate_conversation(
             session,
             conversation,
+            account_username=account_username,
             exclude_id=existing.id if existing is not None else None,
         )
         if duplicate is not None:
@@ -948,9 +1073,9 @@ class Archive:
                 session.delete(existing)
             result.duplicates += 1
             return
-        stat = path.stat()
         if existing is None:
             existing = ConversationRow(
+                account_username=account_username,
                 location_id=result.location_id,
                 external_id=conversation.external_id,
                 relative_path=relative_path,
@@ -962,7 +1087,8 @@ class Archive:
             session.execute(delete(EventRow).where(EventRow.conversation_id == existing.id))
             result.updated += 1
 
-        _update_conversation(existing, conversation, stat.st_mtime_ns)
+        mtime_ns = path.stat().st_mtime_ns if source_mtime_ns is None else source_mtime_ns
+        _update_conversation(existing, conversation, mtime_ns)
         session.flush()
         Archive._insert_events(session, existing.id, conversation, result)
 
@@ -1104,7 +1230,7 @@ def _migrate_v5_to_v6(
     connection.execute(
         update(SchemaInfoRow)
         .where(SchemaInfoRow.key == "schema_version")
-        .values(value=str(SCHEMA_VERSION))
+        .values(value="6")
     )
 
 
@@ -1147,8 +1273,81 @@ def _insert_migrated_events(
             )
 
 
+def _migrate_v6_to_v7(
+    connection: Connection,
+    progress_reporter: SchemaUpgradeProgressReporter | None = None,
+) -> None:
+    """Add tenant ownership to locations and logical conversation revisions."""
+
+    del progress_reporter
+    inspector = inspect(connection)
+    for table_name in ("locations", "conversations"):
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if "account_username" not in columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE {table_name} ADD COLUMN account_username "
+                "VARCHAR(255) NOT NULL DEFAULT ''"
+            )
+
+    # A location identity is tenant-local. Re-hash old rows so future uploads from a tenant with
+    # the same host and path cannot collide with a legacy location.
+    locations = connection.execute(
+        select(
+            LocationRow.id,
+            LocationRow.account_username,
+            LocationRow.hostname,
+            LocationRow.root_path,
+        )
+    )
+    for row in locations:
+        connection.execute(
+            update(LocationRow)
+            .where(LocationRow.id == row.id)
+            .values(
+                root_path_hash=_location_hash(
+                    row.account_username,
+                    row.hostname,
+                    row.root_path,
+                )
+            )
+        )
+
+    desired_columns = ("account_username", "logical_session_id", "chat_sha256")
+    revision_index = next(
+        index
+        for index in ConversationRow.__table__.indexes
+        if index.name == "conversations_logical_revision_uq"
+    )
+    actual_index = next(
+        (
+            index
+            for index in inspect(connection).get_indexes("conversations")
+            if index["name"] == revision_index.name
+        ),
+        None,
+    )
+    actual_columns = tuple(actual_index.get("column_names") or ()) if actual_index else ()
+    if actual_index is not None and actual_columns != desired_columns:
+        if connection.dialect.name == "mysql":
+            connection.exec_driver_sql(
+                "DROP INDEX conversations_logical_revision_uq ON conversations"
+            )
+        else:
+            connection.exec_driver_sql("DROP INDEX conversations_logical_revision_uq")
+        actual_index = None
+    if actual_index is None:
+        revision_index.create(connection)
+
+    connection.execute(
+        update(SchemaInfoRow)
+        .where(SchemaInfoRow.key == "schema_version")
+        .values(value="7")
+    )
+
+
 SCHEMA_MIGRATIONS: dict[int, SchemaMigration] = {
     5: SchemaMigration(target_version=6, upgrade=_migrate_v5_to_v6),
+    6: SchemaMigration(target_version=7, upgrade=_migrate_v6_to_v7),
 }
 
 
@@ -1179,11 +1378,13 @@ def _find_duplicate_conversation(
     session: Session,
     conversation: Conversation,
     *,
+    account_username: str,
     exclude_id: int | None,
 ) -> int | None:
     return _find_duplicate_identity(
         session,
         _conversation_identity(conversation),
+        account_username=account_username,
         exclude_id=exclude_id,
     )
 
@@ -1192,11 +1393,13 @@ def _find_duplicate_identity(
     session: Session,
     identity: tuple[str, str | None],
     *,
+    account_username: str,
     exclude_id: int | None,
 ) -> int | None:
     if identity[1] is None:
         return None
     statement = select(ConversationRow.id).where(
+        ConversationRow.account_username == account_username,
         ConversationRow.logical_session_id == identity[0],
         ConversationRow.chat_sha256 == identity[1],
     )
@@ -1311,8 +1514,8 @@ def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _location_hash(hostname: str, root_path: str) -> str:
-    return _text_hash(f"{hostname.casefold()}\0{root_path}")
+def _location_hash(account_username: str, hostname: str, root_path: str) -> str:
+    return _text_hash(f"{account_username}\0{hostname.casefold()}\0{root_path}")
 
 
 def _normalize_hostname(hostname: str | None) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 from pathlib import Path
@@ -11,7 +12,7 @@ from typer.testing import CliRunner
 from msync.cli import app
 from msync.database import Archive
 from msync.providers import get_provider
-from msync.server import create_app
+from msync.server import ServerAccount, create_app, parse_server_accounts
 
 
 def _archive_codex_conversation(
@@ -157,6 +158,164 @@ def test_server_requires_basic_auth_for_ui_and_api(tmp_path: Path) -> None:
     assert page.headers["www-authenticate"].startswith("Basic")
     assert api.status_code == 401
     assert wrong.status_code == 401
+
+
+def test_server_account_configuration_accepts_optional_tokens() -> None:
+    accounts = parse_server_accounts(
+        "user1,password1,token1;user2,password2;user3,password3,"
+    )
+
+    assert accounts == (
+        ServerAccount("user1", "password1", "token1"),
+        ServerAccount("user2", "password2"),
+        ServerAccount("user3", "password3"),
+    )
+
+
+def test_server_account_configuration_rejects_ambiguous_or_duplicate_credentials() -> None:
+    invalid = (
+        "user,name,password,token",
+        "user,password,token;user,password2,token2",
+        "user1,password1,token;user2,password2,token",
+        "user-only",
+    )
+
+    for value in invalid:
+        try:
+            parse_server_accounts(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Accepted invalid server accounts: {value}")
+
+
+def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_only(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "archive.sqlite"
+    accounts = (
+        ServerAccount("alice", "alice-password", "alice-token"),
+        ServerAccount("bob", "bob-password"),
+        ServerAccount("carol", "carol-password", "carol-token"),
+    )
+    web_app = create_app(database, accounts=accounts)
+    content = (
+        json.dumps(
+            {
+                "timestamp": "2026-07-14T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "shared-session", "cwd": "/tmp"},
+            }
+        )
+        + "\n"
+    ).encode()
+    payload = {
+        "version": 1,
+        "provider": "codex",
+        "hostname": "shared-hostname",
+        "root_path": "/home/client/.codex",
+        "display_name": ".codex",
+        "transcripts": [
+            {
+                "relative_path": "sessions/shared.jsonl",
+                "content_base64": base64.b64encode(content).decode(),
+                "source_mtime_ns": 123,
+            }
+        ],
+    }
+
+    with TestClient(web_app) as client:
+        no_token = client.post("/api/upload", json=payload)
+        bob_upload = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer bob-token"},
+        )
+        alice_upload = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        carol_upload = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer carol-token"},
+        )
+        repeated_alice_upload = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer alice-token"},
+        )
+
+        alice_locations = client.get("/api/locations", auth=("alice", "alice-password"))
+        bob_locations = client.get("/api/locations", auth=("bob", "bob-password"))
+        carol_locations = client.get("/api/locations", auth=("carol", "carol-password"))
+        alice_conversations = client.get(
+            "/api/conversations", auth=("alice", "alice-password")
+        )
+        carol_conversations = client.get(
+            "/api/conversations", auth=("carol", "carol-password")
+        )
+        carol_conversation_id = carol_conversations.json()[0]["id"]
+        cross_account_detail = client.get(
+            f"/api/conversations/{carol_conversation_id}",
+            auth=("alice", "alice-password"),
+        )
+
+    assert no_token.status_code == 401
+    assert no_token.headers["www-authenticate"] == "Bearer"
+    assert bob_upload.status_code == 401
+    assert alice_upload.status_code == 200
+    assert alice_upload.json()["imported"] == 1
+    assert carol_upload.status_code == 200
+    assert carol_upload.json()["imported"] == 1
+    assert repeated_alice_upload.status_code == 200
+    assert repeated_alice_upload.json()["unchanged"] == 1
+    assert len(alice_locations.json()) == 1
+    assert bob_locations.json() == []
+    assert len(carol_locations.json()) == 1
+    assert len(alice_conversations.json()) == 1
+    assert len(carol_conversations.json()) == 1
+    assert cross_account_detail.status_code == 404
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT account_username, count(*) FROM locations "
+            "GROUP BY account_username ORDER BY account_username"
+        ).fetchall() == [("alice", 1), ("carol", 1)]
+        assert connection.execute(
+            "SELECT account_username, count(*) FROM conversations "
+            "GROUP BY account_username ORDER BY account_username"
+        ).fetchall() == [("alice", 1), ("carol", 1)]
+
+
+def test_remote_upload_rejects_paths_outside_the_source_root(tmp_path: Path) -> None:
+    web_app = create_app(
+        tmp_path / "archive.sqlite",
+        accounts=(ServerAccount("alice", "password", "token"),),
+    )
+    payload = {
+        "provider": "codex",
+        "hostname": "laptop",
+        "root_path": "/home/alice/.codex",
+        "display_name": ".codex",
+        "transcripts": [
+            {
+                "relative_path": "../escape.jsonl",
+                "content_base64": base64.b64encode(b"{}\n").decode(),
+            }
+        ],
+    }
+
+    with TestClient(web_app) as client:
+        response = client.post(
+            "/api/upload",
+            json=payload,
+            headers={"Authorization": "Bearer token"},
+        )
+
+    assert response.status_code == 400
+    assert "relative and contained" in response.json()["detail"]
 
 
 def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
@@ -373,6 +532,33 @@ def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None
     assert "http://127.0.0.1:8765" in result.output
 
 
+def test_server_command_accepts_multi_account_configuration(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(web_app: Any, *, host: str, port: int) -> None:
+        captured.update(app=web_app, host=host, port=port)
+        web_app.state.archive.close()
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    result = CliRunner().invoke(
+        app,
+        [
+            "server",
+            "--accounts",
+            "alice,alice-password,alice-token;bob,bob-password",
+            "--database",
+            str(tmp_path / "server.sqlite"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "one of 2 configured accounts" in result.output
+    assert captured["app"].title == "msync history browser"
+
+
 def test_server_command_leaves_old_schema_unchanged_when_upgrade_declined(
     tmp_path: Path,
 ) -> None:
@@ -424,12 +610,12 @@ def test_server_command_upgrades_old_schema_when_confirmed(
 
     assert result.exit_code == 0, result.output
     assert "Upgrade the database now? [y/N]" in result.output
-    assert "Database schema upgrade complete: 5 → 6" in result.output
+    assert "Database schema upgrade complete: 5 → 7" in result.output
     assert captured["app"].title == "msync history browser"
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("6",)
+        ).fetchone() == ("7",)
 
 
 def test_server_rejects_empty_credentials(tmp_path: Path) -> None:

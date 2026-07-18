@@ -49,9 +49,10 @@ $ msync upload --dir ~/.claude
 $ msync upload --dir ~/.codex_another
 ```
 
-Locations are identified by both hostname and directory path, so machines that use the same path
-remain distinct in a shared PostgreSQL archive. Both `upload` and `sync` default to the local
-machine name; override it with `--hostname` or `MSYNC_HOSTNAME` when a stable alias is preferable:
+Locations are identified by account, hostname, and directory path, so users or machines that use
+the same path remain distinct in a shared archive. Direct database uploads use the legacy local
+account. Both `upload` and `sync` default to the local machine name; override it with `--hostname`
+or `MSYNC_HOSTNAME` when a stable alias is preferable:
 
 ```console
 $ msync upload --dir ~/.codex --hostname workstation-a
@@ -76,15 +77,29 @@ An explicitly selected SQLAlchemy driver works too, such as `postgresql+psycopg:
 `mysql+pymysql://...`. Passwords are masked in command output. The target database must already
 exist; `msync` creates and versions its tables automatically.
 
+To upload through a running msync server instead of connecting directly to its database, pass the
+server's base URL and an account upload token:
+
+```console
+$ msync upload --dir ~/.codex --url https://history.example.com --token "$MSYNC_UPLOAD_TOKEN"
+```
+
+`MSYNC_UPLOAD_TOKEN` can supply the token without putting it in shell history. `--url` and
+`--database` are mutually exclusive. The client detects and reads native transcripts locally,
+sends their byte-exact contents over the authenticated API, and records the client's hostname and
+source path on the server. Remote uploads have the same hash-based update, duplicate, and schema
+checks as direct database uploads. Treat an upload token like a password and use HTTPS whenever the
+server is reached over a network.
+
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,
 unique indexes, and foreign keys. SQLite additionally validates its FTS5 table and synchronization
 triggers. Existing schemas are migrated by the explicit `msync upgrade` maintenance command.
 During the development phase, version 5 is the oldest supported upgrade baseline; earlier
 development schemas should be recreated or exported with their compatible msync release. Known
-migrations are registered as sequential steps, so future releases can add a `6 → 7` step without
-changing the CLI workflow. Partial or otherwise incompatible schemas fail before any transcript is
-uploaded.
+migrations are registered as sequential steps. Schema v7 adds account ownership and tenant-local
+revision uniqueness. Future migrations can extend the same chain without changing the CLI
+workflow. Partial or otherwise incompatible schemas fail before any transcript is uploaded.
 
 For a shared or large archive, stop uploads and run the schema upgrade explicitly before starting
 the web server:
@@ -109,9 +124,9 @@ The raw SHA-256 identifies an exact provider transcript. A canonical chat SHA-25
 ordered visible `(role, text)` turns, while a stable logical session UUID follows the conversation
 through provider conversions and location changes. Both have indexed columns on `conversations`
 and are also stored under `metadata_json._msync`. A database unique index on
-`(logical_session_id, chat_sha256)` prevents concurrent or sequential uploads of an exported Claude
-or Codex copy from creating another conversation row. A changed chat hash distinguishes a new
-revision of the same logical session.
+`(account_username, logical_session_id, chat_sha256)` prevents concurrent or sequential uploads of
+an exported Claude or Codex copy from creating another conversation row within the same account. A
+changed chat hash distinguishes a new revision of the same logical session.
 
 `upload` only reads the source directory. Use `sync` when native history files should also be
 written.
@@ -224,6 +239,28 @@ the command prompts without echoing the password. The default loopback address k
 local. HTTP Basic credentials are not encrypted in transit, so put msync behind an HTTPS reverse
 proxy before binding it to a network-accessible address.
 
+For a shared server, configure multiple accounts in `username,password[,token]` format, separated
+by semicolons:
+
+```console
+$ MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web-password' \
+    msync server --database ./history.sqlite --host 0.0.0.0
+```
+
+The same value can be passed with `--accounts`. Commas and semicolons are delimiters and therefore
+cannot appear inside usernames, passwords, or tokens; usernames and tokens must also be unique.
+Every account can sign in to the browser with HTTP Basic authentication. The optional third field
+enables Bearer-token uploads for that account. An entry with only username and password, such as
+`bob` above, is browser-only and cannot upload remotely. The username is also the persistent tenant
+identifier in the archive, so keep it stable; passwords and tokens can be rotated independently.
+
+Locations, conversations, duplicate detection, list results, and conversation-detail lookups are
+isolated by account. A user cannot discover or fetch another user's conversation by guessing its
+numeric ID. After upgrading an existing single-user archive, its legacy unowned records are visible
+only to the first configured account; new token uploads are owned directly by the token's account.
+The original `MSYNC_SERVER_USERNAME`/`MSYNC_SERVER_PASSWORD` and `--username`/`--password` options
+remain available for single-user browsing, but that compatibility account has no upload token.
+
 ## Storage model
 
 The database is deliberately split into distinct storage and indexing layers:
@@ -231,8 +268,8 @@ The database is deliberately split into distinct storage and indexing layers:
 | Table | Purpose |
 | --- | --- |
 | `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
-| `locations` | One hostname and Claude/Codex data-directory pair, allowing multiple machines and installations. |
-| `conversations` | Session metadata, unique logical revision identity, and a zlib-compressed byte-exact source JSONL. |
+| `locations` | One account, hostname, and Claude/Codex data-directory tuple, allowing isolated users, machines, and installations. |
+| `conversations` | Account-owned session metadata, tenant-local logical revision identity, and a zlib-compressed byte-exact source JSONL. |
 | `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
 | `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |

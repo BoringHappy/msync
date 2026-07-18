@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
@@ -38,7 +39,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("6",)
+        ).fetchone() == ("7",)
         primary_keys = {
             table: tuple(
                 row[1] for row in connection.execute(f"PRAGMA table_info({table})") if row[5]
@@ -132,12 +133,75 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
     assert detail.events[1].text == "command\N{REPLACEMENT CHARACTER}output"
     assert [match.role for match in matches] == ["tool"]
     assert stored == source
-    assert upgrade_steps == [(5, 6)]
+    assert upgrade_steps == [(5, 6), (6, 7)]
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("6",)
+        ).fetchone() == ("7",)
+
+
+def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -> None:
+    database = tmp_path / "archive.sqlite"
+    root = (tmp_path / ".codex").resolve()
+    transcript = root / "sessions" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-14T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "migration-session", "cwd": "/tmp"},
+            }
+        )
+        + "\n"
+    )
+    with Archive(database) as archive:
+        archive.upload(root=root, provider=get_provider("codex"), transcripts=[transcript])
+
+    legacy_hash = hashlib.sha256(f"{archive.hostname.casefold()}\0{root}".encode()).hexdigest()
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("DROP INDEX conversations_logical_revision_uq")
+        connection.execute(
+            "CREATE UNIQUE INDEX conversations_logical_revision_uq "
+            "ON conversations(logical_session_id, chat_sha256)"
+        )
+        connection.execute("ALTER TABLE conversations DROP COLUMN account_username")
+        connection.execute("ALTER TABLE locations DROP COLUMN account_username")
+        connection.execute("UPDATE locations SET root_path_hash = ?", (legacy_hash,))
+        connection.execute("UPDATE schema_info SET value = '6' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 6")
+        connection.commit()
+
+    upgrade_steps: list[tuple[int, int]] = []
+    with Archive(database, upgrade_reporter=lambda *step: upgrade_steps.append(step)) as archive:
+        assert archive.browse_conversations()[0].external_id == "migration-session"
+
+    expected_hash = hashlib.sha256(
+        f"\0{archive.hostname.casefold()}\0{root}".encode()
+    ).hexdigest()
+    with closing(sqlite3.connect(database)) as connection:
+        location_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(locations)")
+        }
+        conversation_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(conversations)")
+        }
+        revision_columns = tuple(
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(conversations_logical_revision_uq)"
+            )
+        )
+        stored_location = connection.execute(
+            "SELECT account_username, root_path_hash FROM locations"
+        ).fetchone()
+
+    assert upgrade_steps == [(6, 7)]
+    assert "account_username" in location_columns
+    assert "account_username" in conversation_columns
+    assert revision_columns == ("account_username", "logical_session_id", "chat_sha256")
+    assert stored_location == ("", expected_hash)
 
 
 def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None:
@@ -154,7 +218,7 @@ def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None
         Archive(database, auto_upgrade=False)
 
     assert captured.value.current_version == 5
-    assert captured.value.target_version == 6
+    assert captured.value.target_version == 7
 
 
 def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:
@@ -212,8 +276,8 @@ def test_newer_schema_version_requires_newer_msync(tmp_path: Path) -> None:
         pass
 
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute("UPDATE schema_info SET value = '7' WHERE key = 'schema_version'")
-        connection.execute("PRAGMA user_version = 7")
+        connection.execute("UPDATE schema_info SET value = '8' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 8")
         connection.commit()
 
     with pytest.raises(RuntimeError, match="upgrade msync"):
