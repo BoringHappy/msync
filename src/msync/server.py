@@ -661,6 +661,14 @@ def create_app(
     def javascript() -> Response:
         return Response(_web_asset("app.js"), media_type="text/javascript")
 
+    @app.get("/assets/logo.png", include_in_schema=False)
+    def logo() -> Response:
+        return Response(
+            _web_binary_asset("logo.png"),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     @app.get("/api/locations", response_model=list[LocationResponse])
     def locations(
         account: ServerAccount = Depends(require_auth),  # noqa: B008
@@ -889,6 +897,10 @@ def _validate_accounts(accounts: Sequence[ServerAccount]) -> None:
 
 def _web_asset(name: str) -> str:
     return files("msync.web").joinpath(name).read_text(encoding="utf-8")
+
+
+def _web_binary_asset(name: str) -> bytes:
+    return files("msync.web").joinpath(name).read_bytes()
 
 
 def _base64url_encode(value: bytes) -> str:

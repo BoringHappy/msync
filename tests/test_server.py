@@ -816,6 +816,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
         revision_response = client.get("/api/metrics/revision")
         script = client.get("/assets/app.js")
         styles = client.get("/assets/styles.css")
+        logo = client.get("/assets/logo.png")
 
     assert response.status_code == 200
     detail = response.json()
@@ -863,6 +864,8 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert metrics["recent_uploads"] == []
     assert metrics["revision"] == revision_response.json()["revision"] == 1
     assert "<title>AI Coding Sessions · msync</title>" in page.text
+    assert '<link rel="icon" type="image/png" href="/assets/logo.png">' in page.text
+    assert 'class="brand-logo" src="/assets/logo.png"' in page.text
     assert 'id="dashboard"' in page.text
     assert 'id="insights"' in page.text
     assert 'id="recent-uploads"' in page.text
@@ -938,6 +941,9 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert ".metric-grid" in styles.text
     assert ".activity-chart" in styles.text
     assert ".insights-grid" in styles.text
+    assert logo.status_code == 200
+    assert logo.headers["content-type"] == "image/png"
+    assert logo.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
 

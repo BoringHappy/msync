@@ -73,7 +73,20 @@ button:focus-visible, input:focus-visible, select:focus-visible, .event:focus-vi
   letter-spacing: .04em;
 }
 
-.brand-mark { color: var(--accent); font-size: 19px; line-height: 1; }
+.brand-mark,
+.login-logo {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid #ffffff26;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 12px #0caee333;
+}
+.brand-mark { width: 27px; height: 27px; }
+.brand-logo,
+.login-logo img { display: block; width: 132%; height: 132%; max-width: none; }
 .primary-nav { display: flex; align-self: stretch; align-items: center; gap: 4px; margin-left: 16px; }
 .primary-nav a {
   position: relative;
@@ -154,7 +167,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, .event:focus-vi
   letter-spacing: .11em;
 }
 .login-card-body { padding: 31px 34px 35px; }
-.login-glyph { color: var(--accent); font-size: 35px; line-height: 1; }
+.login-logo { width: 58px; height: 58px; box-shadow: 0 0 24px #0caee344; }
 .login-card h1 { margin: 13px 0 5px; font-size: 19px; line-height: 1.35; letter-spacing: -.02em; }
 .login-intro { margin: 0 0 26px; color: var(--muted); font-size: 11px; }
 .login-form { display: grid; gap: 7px; }
