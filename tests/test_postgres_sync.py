@@ -379,7 +379,7 @@ def test_postgres_v6_schema_upgrades_to_tenant_ownership(
                 if index["name"] == "conversations_logical_revision_uq"
             )
 
-    assert upgrade_steps == [(6, 7)]
+    assert upgrade_steps == [(6, 7), (7, 8)]
     assert "account_username" in location_columns
     assert tuple(revision_index["column_names"]) == (
         "account_username",

@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 import zlib
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from types import TracebackType
 from typing import Any, Self
 
 from sqlalchemy import URL, case, create_engine, delete, event, func, inspect, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
@@ -20,7 +25,9 @@ from sqlalchemy.orm import Session
 from msync.models import Conversation
 from msync.providers import HistoryProvider, get_provider
 from msync.tables import (
+    ArchiveRevisionRow,
     Base,
+    ConversationMetricRow,
     ConversationRow,
     EventRow,
     LocationRow,
@@ -28,7 +35,7 @@ from msync.tables import (
     SchemaInfoRow,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 LEGACY_HOSTNAME = "unknown"
 
 SchemaUpgradeReporter = Callable[[int, int], None]
@@ -182,6 +189,68 @@ class ConversationSummary:
 
 
 @dataclass(slots=True, frozen=True)
+class SummaryTotals:
+    """Headline archive counts and averages shown on the overview."""
+
+    sessions: int
+    messages: int
+    events: int
+    tool_calls: int
+    reasoning_events: int
+    locations: int
+    active_days: int
+    latest_streak_days: int
+    longest_streak_days: int
+    average_messages_per_session: float
+    average_session_minutes: float
+
+
+@dataclass(slots=True, frozen=True)
+class BreakdownMetric:
+    """Session and message totals for one provider, model, or project."""
+
+    label: str
+    sessions: int
+    messages: int
+
+
+@dataclass(slots=True, frozen=True)
+class CountMetric:
+    """A labeled count used by compact dashboard visualizations."""
+
+    label: str
+    count: int
+
+
+@dataclass(slots=True, frozen=True)
+class DailyActivity:
+    """Conversation activity assigned to a calendar day."""
+
+    date: str
+    sessions: int
+    messages: int
+    events: int
+
+
+@dataclass(slots=True, frozen=True)
+class ArchiveMetrics:
+    """Aggregate archive signals used by the overview and insights pages."""
+
+    totals: SummaryTotals
+    activity: tuple[DailyActivity, ...]
+    providers: tuple[BreakdownMetric, ...]
+    models: tuple[BreakdownMetric, ...]
+    projects: tuple[BreakdownMetric, ...]
+    tools: tuple[CountMetric, ...]
+    weekdays: tuple[CountMetric, ...]
+    hours: tuple[CountMetric, ...]
+    session_depth: tuple[CountMetric, ...]
+    recent_sessions: tuple[ConversationSummary, ...]
+    latest_activity_at: str | None
+    revision: int
+
+
+@dataclass(slots=True, frozen=True)
 class ArchivedMessagePart:
     """One structured content block displayed in expanded event details."""
 
@@ -220,6 +289,170 @@ class ConversationDetail:
     events: tuple[ArchivedEvent, ...]
 
 
+def _archive_datetime(value: str | None) -> datetime | None:
+    """Parse provider ISO timestamps and normalize them to UTC for aggregation."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _session_depth_label(messages: int) -> str:
+    if messages < 5:
+        return "0–4"
+    if messages < 10:
+        return "5–9"
+    if messages < 25:
+        return "10–24"
+    return "25+"
+
+
+def _is_tool_call_type(content_type: str) -> bool:
+    normalized = content_type.casefold()
+    if any(
+        marker in normalized
+        for marker in ("output", "result", "response", "approval", "list_tools")
+    ):
+        return False
+    return normalized.endswith(("tool_use", "_tool", "_call")) or normalized in {
+        "tool_use",
+        "mcp_call",
+    }
+
+
+def _is_reasoning_part_type(content_type: str) -> bool:
+    return content_type.casefold() in {
+        "reasoning",
+        "summary_text",
+        "thinking",
+        "redacted_thinking",
+    }
+
+
+def _tool_metric_name(content_type: str, raw_json: str) -> str:
+    try:
+        value = json.loads(raw_json)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        for key in ("name", "tool_name", "server_name"):
+            name = value.get(key)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    normalized = content_type.casefold()
+    for suffix in ("_call", "_tool", "_use"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.replace("_", " ").strip() or "tool"
+
+
+def _activity_streaks(activity_dates: set[date]) -> tuple[int, int]:
+    if not activity_dates:
+        return 0, 0
+    ordered = sorted(activity_dates)
+    longest = 1
+    current = 1
+    latest = 1
+    for previous, active_day in zip(ordered, ordered[1:], strict=False):
+        if active_day == previous + timedelta(days=1):
+            current += 1
+        else:
+            current = 1
+        longest = max(longest, current)
+        latest = current
+    return latest, longest
+
+
+def _breakdown_metrics(
+    sessions: Counter[str],
+    messages: Counter[str],
+    *,
+    limit: int | None = None,
+) -> tuple[BreakdownMetric, ...]:
+    values = sorted(sessions.items(), key=lambda item: (-item[1], item[0].casefold()))
+    if limit is not None:
+        values = values[:limit]
+    return tuple(
+        BreakdownMetric(label=label, sessions=count, messages=messages[label])
+        for label, count in values
+    )
+
+
+def _metric_values(
+    *,
+    started_at: str | None,
+    ended_at: str | None,
+    events: list[tuple[int, str | None, str]],
+    parts: list[tuple[int, str | None, str, str]],
+) -> dict[str, Any]:
+    """Build the persisted dashboard facts for one conversation."""
+
+    message_count = sum(
+        role in {"user", "assistant"} and bool(text) for _, role, text in events
+    )
+    preview = next(
+        (_portable_text(text) for _, role, text in events if role == "user" and text),
+        None,
+    )
+    reasoning_event_count = sum(role == "reasoning" for _, role, _ in events)
+    mixed_reasoning_events: set[int] = set()
+    tool_counts: Counter[str] = Counter()
+    for event_id, event_role, content_type, raw_json in parts:
+        if _is_tool_call_type(content_type):
+            tool_name = _portable_text(_tool_metric_name(content_type, raw_json)) or "tool"
+            tool_counts[tool_name] += 1
+        elif _is_reasoning_part_type(content_type) and event_role != "reasoning":
+            mixed_reasoning_events.add(event_id)
+    reasoning_event_count += len(mixed_reasoning_events)
+
+    started = _archive_datetime(started_at)
+    ended = _archive_datetime(ended_at)
+    activity_start = started or ended
+    activity_at = ended or started
+    duration = (
+        (ended - started).total_seconds() / 60
+        if started is not None and ended is not None and ended >= started
+        else None
+    )
+    return {
+        "event_count": len(events),
+        "message_count": message_count,
+        "tool_call_count": sum(tool_counts.values()),
+        "reasoning_event_count": reasoning_event_count,
+        "preview": preview,
+        "activity_at": activity_at,
+        "activity_day": activity_start.date() if activity_start is not None else None,
+        "activity_hour": activity_start.hour if activity_start is not None else None,
+        "activity_weekday": activity_start.weekday() if activity_start is not None else None,
+        "duration_minutes": duration,
+        "tool_counts_json": dict(tool_counts),
+    }
+
+
+def _conversation_metric_values(conversation: Conversation) -> dict[str, Any]:
+    events = [
+        (event.sequence, event.role, event.searchable_text) for event in conversation.events
+    ]
+    parts = [
+        (event.sequence, event.role, part.content_type, part.raw_json)
+        for event in conversation.events
+        for part in event.parts
+    ]
+    return _metric_values(
+        started_at=conversation.started_at,
+        ended_at=conversation.ended_at,
+        events=events,
+        parts=parts,
+    )
+
+
 class Archive:
     """A durable archive that supports SQLite and PostgreSQL."""
 
@@ -244,6 +477,10 @@ class Archive:
         self.initialized_new_database = False
         self.schema_version_before: int | None = None
         self.schema_version = SCHEMA_VERSION
+        self._metrics_cache: dict[
+            tuple[str | None, bool], tuple[int, ArchiveMetrics]
+        ] = {}
+        self._metrics_cache_lock = Lock()
         if self.sqlite_path is not None:
             self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(self.url, pool_pre_ping=True)
@@ -279,6 +516,59 @@ class Archive:
 
         self.engine.dispose()
 
+    def archive_revision(
+        self,
+        *,
+        account_username: str | None = None,
+        include_legacy: bool = False,
+    ) -> int:
+        """Return the combined revision visible to one archive account."""
+
+        statement = select(func.coalesce(func.sum(ArchiveRevisionRow.revision), 0))
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(ArchiveRevisionRow.account_username.in_(owners))
+        with Session(self.engine) as session:
+            return int(session.scalar(statement) or 0)
+
+    @staticmethod
+    def _bump_archive_revision(session: Session, account_username: str) -> None:
+        """Atomically increment an owner's revision inside the upload transaction."""
+
+        values = {
+            "account_username": account_username,
+            "revision": 1,
+            "updated_at": datetime.now(UTC),
+        }
+        update_values = {
+            "revision": ArchiveRevisionRow.revision + 1,
+            "updated_at": datetime.now(UTC),
+        }
+        dialect = session.get_bind().dialect.name
+        if dialect == "sqlite":
+            statement = sqlite_insert(ArchiveRevisionRow).values(**values)
+        elif dialect == "postgresql":
+            statement = postgresql_insert(ArchiveRevisionRow).values(**values)
+        else:  # pragma: no cover - database URL validation rejects other backends.
+            raise RuntimeError(f"Unsupported database backend for archive revision: {dialect}.")
+        session.execute(
+            statement.on_conflict_do_update(
+                index_elements=[ArchiveRevisionRow.account_username],
+                set_=update_values,
+            )
+        )
+
+    def _invalidate_metrics_cache(self, account_username: str) -> None:
+        with self._metrics_cache_lock:
+            for key in tuple(self._metrics_cache):
+                requested_username, include_legacy = key
+                if (
+                    requested_username is None
+                    or requested_username == account_username
+                    or (include_legacy and account_username == "")
+                ):
+                    self._metrics_cache.pop(key, None)
+
     def upload(
         self,
         *,
@@ -290,6 +580,7 @@ class Archive:
         """Archive changed transcripts from a single source location."""
 
         root = root.resolve()
+        changed = False
         with Session(self.engine) as session, session.begin():
             location = self._upsert_location(
                 session,
@@ -320,6 +611,11 @@ class Archive:
                     _accumulate_upload_result(result, file_result)
                     break
             location.last_scanned_at = datetime.now(UTC)
+            changed = bool(session.info.get("archive_changed"))
+            if changed:
+                self._bump_archive_revision(session, account_username)
+        if changed:
+            self._invalidate_metrics_cache(account_username)
         return result
 
     def upload_remote(
@@ -358,6 +654,7 @@ class Archive:
                 )
             normalized.append((virtual_root.joinpath(*relative_path.parts), transcript))
 
+        changed = False
         with Session(self.engine) as session, session.begin():
             location = self._upsert_location(
                 session,
@@ -390,6 +687,11 @@ class Archive:
                     _accumulate_upload_result(result, file_result)
                     break
             location.last_scanned_at = datetime.now(UTC)
+            changed = bool(session.info.get("archive_changed"))
+            if changed:
+                self._bump_archive_revision(session, account_username)
+        if changed:
+            self._invalidate_metrics_cache(account_username)
         return result
 
     def search(self, search_text: str) -> list[SearchResult]:
@@ -593,6 +895,207 @@ class Archive:
         statement = statement.order_by(*order_columns[order_by]).limit(limit).offset(offset)
         with Session(self.engine) as session:
             return [ConversationSummary(*row) for row in session.execute(statement)]
+
+    def browse_metrics(
+        self,
+        *,
+        account_username: str | None = None,
+        include_legacy: bool = False,
+    ) -> ArchiveMetrics:
+        """Return tenant-scoped aggregate signals for the web dashboard."""
+
+        revision = self.archive_revision(
+            account_username=account_username,
+            include_legacy=include_legacy,
+        )
+        cache_key = (account_username, include_legacy)
+        with self._metrics_cache_lock:
+            cached = self._metrics_cache.get(cache_key)
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+
+        statement = (
+            select(
+                ConversationRow.id,
+                ConversationRow.location_id,
+                LocationRow.provider,
+                LocationRow.hostname,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.conversation_kind,
+                ConversationRow.cwd,
+                ConversationRow.model,
+                ConversationRow.git_branch,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+                ConversationMetricRow.event_count,
+                ConversationMetricRow.message_count,
+                ConversationMetricRow.preview,
+                ConversationMetricRow.reasoning_event_count,
+                ConversationMetricRow.tool_call_count,
+                ConversationMetricRow.tool_counts_json,
+                ConversationMetricRow.activity_at,
+                ConversationMetricRow.activity_day,
+                ConversationMetricRow.activity_hour,
+                ConversationMetricRow.activity_weekday,
+                ConversationMetricRow.duration_minutes,
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .join(
+                ConversationMetricRow,
+                ConversationMetricRow.conversation_id == ConversationRow.id,
+            )
+        )
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(LocationRow.account_username.in_(owners))
+
+        with Session(self.engine) as session:
+            rows = list(session.execute(statement))
+
+        provider_counts: Counter[str] = Counter()
+        provider_messages: Counter[str] = Counter()
+        model_counts: Counter[str] = Counter()
+        model_messages: Counter[str] = Counter()
+        project_counts: Counter[str] = Counter()
+        project_messages: Counter[str] = Counter()
+        activity: dict[date, list[int]] = {}
+        weekday_counts: Counter[int] = Counter()
+        hour_counts: Counter[int] = Counter()
+        depth_counts: Counter[str] = Counter()
+        activity_dates: set[date] = set()
+        durations: list[float] = []
+        latest_activity: tuple[datetime, str] | None = None
+        total_messages = 0
+        total_events = 0
+        tool_calls = 0
+        reasoning_events = 0
+        tool_counts: Counter[str] = Counter()
+
+        recent: list[tuple[datetime | None, ConversationSummary]] = []
+        for row in rows:
+            messages = int(row.message_count or 0)
+            events = int(row.event_count or 0)
+            total_messages += messages
+            total_events += events
+            tool_calls += int(row.tool_call_count or 0)
+            reasoning_events += int(row.reasoning_event_count or 0)
+            tool_counts.update(row.tool_counts_json or {})
+            provider_counts[row.provider] += 1
+            provider_messages[row.provider] += messages
+
+            model = (row.model or "").strip() or "Unknown model"
+            model_counts[model] += 1
+            model_messages[model] += messages
+            project = (row.cwd or "").strip() or "Unknown project"
+            project_counts[project] += 1
+            project_messages[project] += messages
+
+            activity_at = row.activity_at
+            if activity_at is not None and activity_at.tzinfo is None:
+                activity_at = activity_at.replace(tzinfo=UTC)
+            if row.activity_day is not None:
+                activity_day = row.activity_day
+                activity_dates.add(activity_day)
+                day_counts = activity.setdefault(activity_day, [0, 0, 0])
+                day_counts[0] += 1
+                day_counts[1] += messages
+                day_counts[2] += events
+            if row.activity_weekday is not None:
+                weekday_counts[row.activity_weekday] += 1
+            if row.activity_hour is not None:
+                hour_counts[row.activity_hour] += 1
+            if row.duration_minutes is not None:
+                durations.append(row.duration_minutes)
+            if activity_at is not None:
+                activity_value = (
+                    row.ended_at if _archive_datetime(row.ended_at) is not None else row.started_at
+                )
+                if latest_activity is None or activity_at > latest_activity[0]:
+                    latest_activity = (activity_at, activity_value)
+
+            depth_counts[_session_depth_label(messages)] += 1
+            recent.append(
+                (
+                    activity_at,
+                    ConversationSummary(
+                        id=row.id,
+                        location_id=row.location_id,
+                        provider=row.provider,
+                        hostname=row.hostname,
+                        external_id=row.external_id,
+                        title=row.title,
+                        conversation_kind=row.conversation_kind,
+                        cwd=row.cwd,
+                        model=row.model,
+                        git_branch=row.git_branch,
+                        started_at=row.started_at,
+                        ended_at=row.ended_at,
+                        event_count=events,
+                        message_count=messages,
+                        preview=row.preview,
+                    ),
+                )
+            )
+
+        streaks = _activity_streaks(activity_dates)
+        session_count = len(rows)
+        latest_day = max(activity_dates, default=datetime.now(UTC).date())
+        range_end = max(datetime.now(UTC).date(), latest_day)
+        range_start = range_end - timedelta(days=29)
+        daily_activity = tuple(
+            DailyActivity(
+                date=(day := range_start + timedelta(days=offset)).isoformat(),
+                sessions=activity.get(day, [0, 0, 0])[0],
+                messages=activity.get(day, [0, 0, 0])[1],
+                events=activity.get(day, [0, 0, 0])[2],
+            )
+            for offset in range(30)
+        )
+        recent.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC), reverse=True)
+
+        metrics = ArchiveMetrics(
+            totals=SummaryTotals(
+                sessions=session_count,
+                messages=total_messages,
+                events=total_events,
+                tool_calls=tool_calls,
+                reasoning_events=reasoning_events,
+                locations=len({row.location_id for row in rows}),
+                active_days=len(activity_dates),
+                latest_streak_days=streaks[0],
+                longest_streak_days=streaks[1],
+                average_messages_per_session=(
+                    total_messages / session_count if session_count else 0
+                ),
+                average_session_minutes=(sum(durations) / len(durations) if durations else 0),
+            ),
+            activity=daily_activity,
+            providers=_breakdown_metrics(provider_counts, provider_messages),
+            models=_breakdown_metrics(model_counts, model_messages, limit=6),
+            projects=_breakdown_metrics(project_counts, project_messages, limit=6),
+            tools=tuple(
+                CountMetric(label=label, count=count)
+                for label, count in tool_counts.most_common(6)
+            ),
+            weekdays=tuple(
+                CountMetric(label=label, count=weekday_counts[index])
+                for index, label in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+            ),
+            hours=tuple(
+                CountMetric(label=f"{hour:02d}", count=hour_counts[hour]) for hour in range(24)
+            ),
+            session_depth=tuple(
+                CountMetric(label=label, count=depth_counts[label])
+                for label in ("0–4", "5–9", "10–24", "25+")
+            ),
+            recent_sessions=tuple(summary for _, summary in recent[:5]),
+            latest_activity_at=latest_activity[1] if latest_activity else None,
+            revision=revision,
+        )
+        with self._metrics_cache_lock:
+            self._metrics_cache[cache_key] = (revision, metrics)
+        return metrics
 
     def browse_conversation(
         self,
@@ -1001,6 +1504,7 @@ class Archive:
             session.execute(
                 delete(ConversationRow).where(ConversationRow.location_id == location.id)
             )
+            session.info["archive_changed"] = True
             location.provider = provider
         location.display_name = display_name
         return location
@@ -1048,9 +1552,11 @@ class Archive:
             if duplicate is not None:
                 if duplicate < existing.id:
                     session.delete(existing)
+                    session.info["archive_changed"] = True
                     result.duplicates += 1
                     return
                 session.execute(delete(ConversationRow).where(ConversationRow.id == duplicate))
+                session.info["archive_changed"] = True
                 result.duplicates += 1
             if conversation is not None:
                 existing.logical_session_id = conversation.logical_session_id
@@ -1071,6 +1577,7 @@ class Archive:
         if duplicate is not None:
             if existing is not None:
                 session.delete(existing)
+                session.info["archive_changed"] = True
             result.duplicates += 1
             return
         if existing is None:
@@ -1082,15 +1589,18 @@ class Archive:
                 relative_path_hash=relative_path_hash,
             )
             session.add(existing)
+            session.info["archive_changed"] = True
             result.imported += 1
         else:
             session.execute(delete(EventRow).where(EventRow.conversation_id == existing.id))
+            session.info["archive_changed"] = True
             result.updated += 1
 
         mtime_ns = path.stat().st_mtime_ns if source_mtime_ns is None else source_mtime_ns
         _update_conversation(existing, conversation, mtime_ns)
         session.flush()
         Archive._insert_events(session, existing.id, conversation, result)
+        Archive._upsert_conversation_metric(session, existing.id, conversation)
 
     @staticmethod
     def _insert_events(
@@ -1132,6 +1642,20 @@ class Archive:
         session.add_all(parts)
         result.events += len(rows)
         result.message_parts += len(parts)
+
+    @staticmethod
+    def _upsert_conversation_metric(
+        session: Session,
+        conversation_id: int,
+        conversation: Conversation,
+    ) -> None:
+        values = _conversation_metric_values(conversation)
+        metric = session.get(ConversationMetricRow, conversation_id)
+        if metric is None:
+            session.add(ConversationMetricRow(conversation_id=conversation_id, **values))
+            return
+        for field_name, value in values.items():
+            setattr(metric, field_name, value)
 
 
 def _accumulate_upload_result(result: UploadResult, file_result: UploadResult) -> None:
@@ -1340,9 +1864,94 @@ def _migrate_v6_to_v7(
     )
 
 
+def _migrate_v7_to_v8(
+    connection: Connection,
+    progress_reporter: SchemaUpgradeProgressReporter | None = None,
+) -> None:
+    """Backfill upload-time dashboard summaries and owner revisions."""
+
+    ConversationMetricRow.__table__.create(connection, checkfirst=True)
+    ArchiveRevisionRow.__table__.create(connection, checkfirst=True)
+    connection.execute(delete(ConversationMetricRow))
+    connection.execute(delete(ArchiveRevisionRow))
+    conversations = list(
+        connection.execute(
+            select(
+                ConversationRow.id,
+                ConversationRow.account_username,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+            ).order_by(ConversationRow.id)
+        )
+    )
+    total = len(conversations)
+    if progress_reporter is not None:
+        progress_reporter(0, total)
+    owners: set[str] = set()
+    for completed, conversation in enumerate(conversations, start=1):
+        owners.add(conversation.account_username)
+        events = [
+            (row.id, row.role, row.searchable_text)
+            for row in connection.execute(
+                select(
+                    EventRow.id,
+                    EventRow.role,
+                    EventRow.searchable_text,
+                )
+                .where(EventRow.conversation_id == conversation.id)
+                .order_by(EventRow.sequence)
+            )
+        ]
+        parts = [
+            (row.event_id, row.role, row.content_type, row.raw_json)
+            for row in connection.execute(
+                select(
+                    MessagePartRow.event_id,
+                    EventRow.role,
+                    MessagePartRow.content_type,
+                    MessagePartRow.raw_json,
+                )
+                .join(EventRow, MessagePartRow.event_id == EventRow.id)
+                .where(EventRow.conversation_id == conversation.id)
+            )
+        ]
+        connection.execute(
+            ConversationMetricRow.__table__.insert().values(
+                conversation_id=conversation.id,
+                **_metric_values(
+                    started_at=conversation.started_at,
+                    ended_at=conversation.ended_at,
+                    events=events,
+                    parts=parts,
+                ),
+            )
+        )
+        if progress_reporter is not None:
+            progress_reporter(completed, total)
+
+    if owners:
+        connection.execute(
+            ArchiveRevisionRow.__table__.insert(),
+            [
+                {
+                    "account_username": owner,
+                    "revision": 1,
+                    "updated_at": datetime.now(UTC),
+                }
+                for owner in sorted(owners)
+            ],
+        )
+    connection.execute(
+        update(SchemaInfoRow)
+        .where(SchemaInfoRow.key == "schema_version")
+        .values(value="8")
+    )
+
+
 SCHEMA_MIGRATIONS: dict[int, SchemaMigration] = {
     5: SchemaMigration(target_version=6, upgrade=_migrate_v5_to_v6),
     6: SchemaMigration(target_version=7, upgrade=_migrate_v6_to_v7),
+    7: SchemaMigration(target_version=8, upgrade=_migrate_v7_to_v8),
 }
 
 

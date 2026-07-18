@@ -14,8 +14,13 @@
       <button class="icon-button mobile-only" id="sessions-button" type="button" aria-label="Open sessions" aria-controls="sidebar" aria-expanded="false">☰</button>
       <a class="brand" href="/" aria-label="msync history home">
         <span class="brand-mark">◇</span>
-        <span>msync</span><span class="brand-dim">// history</span>
+        <span>msync</span>
       </a>
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <a href="/" data-page="overview">Overview</a>
+        <a href="/insights" data-page="insights">Insights</a>
+        <a href="/sessions" data-page="sessions">Sessions</a>
+      </nav>
       <div class="top-status" id="archive-status"><span class="status-light"></span> archive online</div>
       <button class="top-action" id="reload-button" type="button" title="Refresh archive" aria-label="Refresh archive">↻</button>
       <form class="logout-form" action="/logout" method="post">
@@ -24,7 +29,7 @@
       </form>
     </header>
 
-    <div class="workspace">
+    <div class="workspace dashboard-mode" id="workspace">
       <aside class="sidebar" id="sidebar" aria-label="Conversation navigation">
         <div class="sidebar-heading">
           <span>SESSIONS</span>
@@ -59,7 +64,128 @@
       <button class="sidebar-scrim hidden" id="sidebar-scrim" type="button" aria-label="Close sessions"></button>
 
       <main class="content" id="content">
-        <section class="empty-state" id="empty-state">
+        <section class="dashboard-page" id="dashboard" aria-labelledby="dashboard-title">
+          <header class="page-heading">
+            <div>
+              <p class="eyebrow"><span>●</span> ARCHIVE OVERVIEW</p>
+              <h1 id="dashboard-title">Your work, at a glance.</h1>
+              <p id="dashboard-intro">A living summary of your AI coding sessions.</p>
+            </div>
+            <a class="page-action" href="/insights"><span>↗</span> Explore insights</a>
+          </header>
+
+          <div class="metric-grid" id="overview-metrics" aria-live="polite">
+            <div class="dashboard-skeleton metric-skeleton"></div>
+            <div class="dashboard-skeleton metric-skeleton"></div>
+            <div class="dashboard-skeleton metric-skeleton"></div>
+            <div class="dashboard-skeleton metric-skeleton"></div>
+          </div>
+
+          <div class="overview-grid">
+            <article class="dashboard-panel activity-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">LAST 30 DAYS</span><h2>Activity pulse</h2></div>
+                <div class="chart-legend"><span class="legend-sessions"></span> sessions <span class="legend-messages"></span> messages</div>
+              </header>
+              <div class="activity-chart dashboard-skeleton" id="overview-activity" aria-label="Daily archive activity"></div>
+            </article>
+
+            <article class="dashboard-panel signal-panel" id="overview-signal">
+              <span class="panel-kicker">QUICK SIGNAL</span>
+              <div class="dashboard-skeleton signal-skeleton"></div>
+            </article>
+
+            <article class="dashboard-panel recent-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">PICK UP WHERE YOU LEFT OFF</span><h2>Recent sessions</h2></div>
+                <a href="/sessions">View all <span>→</span></a>
+              </header>
+              <div class="recent-session-list" id="recent-sessions" aria-live="polite">
+                <div class="dashboard-skeleton recent-skeleton"></div>
+                <div class="dashboard-skeleton recent-skeleton"></div>
+              </div>
+            </article>
+
+            <article class="dashboard-panel mix-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">ARCHIVE MIX</span><h2>Providers</h2></div>
+              </header>
+              <div id="provider-overview" class="dashboard-skeleton provider-skeleton"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="dashboard-page hidden" id="insights" aria-labelledby="insights-title">
+          <header class="page-heading insights-heading">
+            <div>
+              <p class="eyebrow"><span>◆</span> WORK PATTERNS</p>
+              <h1 id="insights-title">Signals behind the sessions.</h1>
+              <p>See when you work, how deep sessions go, and where your archive is growing.</p>
+            </div>
+            <a class="page-action secondary" href="/sessions"><span>⌕</span> Browse sessions</a>
+          </header>
+
+          <div class="metric-grid insight-metrics" id="insight-metrics" aria-live="polite">
+            <div class="dashboard-skeleton metric-skeleton"></div>
+            <div class="dashboard-skeleton metric-skeleton"></div>
+            <div class="dashboard-skeleton metric-skeleton"></div>
+            <div class="dashboard-skeleton metric-skeleton"></div>
+          </div>
+
+          <div class="insights-grid">
+            <article class="dashboard-panel insight-activity-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">MOMENTUM</span><h2>30-day activity</h2></div>
+                <span class="panel-note" id="activity-total"></span>
+              </header>
+              <div class="activity-chart large dashboard-skeleton" id="insights-activity" aria-label="Daily sessions and messages"></div>
+            </article>
+
+            <article class="dashboard-panel rhythm-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">WEEKLY RHYTHM</span><h2>Your active days</h2></div>
+              </header>
+              <div class="weekday-chart dashboard-skeleton" id="weekday-chart"></div>
+            </article>
+
+            <article class="dashboard-panel clock-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">FOCUS CLOCK · UTC</span><h2>When sessions start</h2></div>
+              </header>
+              <div class="hour-chart-shell dashboard-skeleton" id="hour-chart"></div>
+            </article>
+
+            <article class="dashboard-panel ranking-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">WORKSPACES</span><h2>Top projects</h2></div>
+              </header>
+              <div class="ranking-list dashboard-skeleton" id="project-ranking"></div>
+            </article>
+
+            <article class="dashboard-panel ranking-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">EXECUTION</span><h2>Most-used tools</h2></div>
+              </header>
+              <div class="ranking-list dashboard-skeleton" id="tool-ranking"></div>
+            </article>
+
+            <article class="dashboard-panel ranking-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">MODEL MIX</span><h2>Sessions by model</h2></div>
+              </header>
+              <div class="ranking-list dashboard-skeleton" id="model-ranking"></div>
+            </article>
+
+            <article class="dashboard-panel depth-panel">
+              <header class="panel-heading">
+                <div><span class="panel-kicker">SESSION DEPTH</span><h2>Messages per session</h2></div>
+              </header>
+              <div class="depth-chart dashboard-skeleton" id="depth-chart"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="empty-state hidden" id="empty-state">
           <div class="empty-glyph">◇</div>
           <h1>Conversation archive</h1>
           <p>Select a session to browse Claude and Codex history.</p>
@@ -118,9 +244,10 @@
     </div>
 
     <footer class="command-bar">
-      <button id="footer-sessions" type="button"><span>☰</span> Sessions</button>
-      <button id="footer-details" type="button"><span>⊕</span> Raw events</button>
-      <button id="scroll-top" type="button"><span>↑</span> Top</button>
+      <button id="footer-sessions" type="button"><span>⌕</span> Sessions</button>
+      <button id="footer-insights" type="button"><span>◆</span> Insights</button>
+      <button class="session-command" id="footer-details" type="button"><span>⊕</span> Raw events</button>
+      <button class="session-command" id="scroll-top" type="button"><span>↑</span> Top</button>
       <span class="command-spacer"></span>
       <span id="footer-status" role="status" aria-live="polite">Ready</span>
     </footer>

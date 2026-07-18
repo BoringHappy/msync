@@ -3,9 +3,13 @@
 const SESSION_PAGE_SIZE = 50;
 const EVENT_PAGE_SIZE = 100;
 const LAYOUT_STORAGE_KEY = "msync:fit-width";
+const METRICS_REVISION_POLL_MS = 15000;
 
 const state = {
   locations: [],
+  metrics: null,
+  metricsController: null,
+  metricsPollTimer: null,
   conversations: [],
   activeConversation: null,
   conversationEntries: [],
@@ -26,6 +30,7 @@ const state = {
   fitWidth: false,
   transcriptFilter: "all",
   transcriptQuery: "",
+  currentView: "overview",
 };
 
 const elements = {
@@ -37,6 +42,9 @@ const elements = {
   clearSearch: document.querySelector("#clear-search"),
   clearTranscriptSearch: document.querySelector("#clear-transcript-search"),
   empty: document.querySelector("#empty-state"),
+  dashboard: document.querySelector("#dashboard"),
+  insights: document.querySelector("#insights"),
+  workspace: document.querySelector("#workspace"),
   archiveStatus: document.querySelector("#archive-status"),
   location: document.querySelector("#location-select"),
   loadMore: document.querySelector("#load-more"),
@@ -66,6 +74,21 @@ const elements = {
   transcriptMatchCount: document.querySelector("#transcript-match-count"),
   toast: document.querySelector("#toast"),
   widthLabel: document.querySelector("#width-button-label"),
+  navigation: [...document.querySelectorAll("[data-page]")],
+  overviewMetrics: document.querySelector("#overview-metrics"),
+  insightMetrics: document.querySelector("#insight-metrics"),
+  overviewActivity: document.querySelector("#overview-activity"),
+  insightsActivity: document.querySelector("#insights-activity"),
+  overviewSignal: document.querySelector("#overview-signal"),
+  recentSessions: document.querySelector("#recent-sessions"),
+  providerOverview: document.querySelector("#provider-overview"),
+  weekdayChart: document.querySelector("#weekday-chart"),
+  hourChart: document.querySelector("#hour-chart"),
+  projectRanking: document.querySelector("#project-ranking"),
+  toolRanking: document.querySelector("#tool-ranking"),
+  modelRanking: document.querySelector("#model-ranking"),
+  depthChart: document.querySelector("#depth-chart"),
+  activityTotal: document.querySelector("#activity-total"),
 };
 
 const sessionLoaderObserver = typeof IntersectionObserver === "undefined"
@@ -155,6 +178,422 @@ function oneLine(value, fallback = "Untitled session") {
   return normalized || fallback;
 }
 
+function viewFromPath() {
+  if (window.location.pathname === "/insights") return "insights";
+  if (window.location.pathname === "/sessions" || selectedConversationId()) return "sessions";
+  return "overview";
+}
+
+function showView(view) {
+  state.currentView = view;
+  const sessions = view === "sessions";
+  elements.dashboard.classList.toggle("hidden", view !== "overview");
+  elements.insights.classList.toggle("hidden", view !== "insights");
+  elements.workspace.classList.toggle("dashboard-mode", !sessions);
+  elements.empty.classList.toggle("hidden", !sessions || Boolean(state.activeConversation));
+  elements.conversation.classList.toggle("hidden", !sessions || !state.activeConversation);
+  elements.sessionsButton.classList.toggle("hidden", !sessions);
+  document.querySelectorAll(".session-command").forEach((button) => {
+    button.classList.toggle("hidden", !sessions);
+  });
+  for (const link of elements.navigation) {
+    if (link.dataset.page === view) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  if (!sessions) {
+    setSidebar(false);
+    elements.footerStatus.textContent = state.metrics
+      ? `${state.metrics.totals.sessions.toLocaleString()} sessions archived`
+      : "Loading archive summary…";
+  }
+}
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function formatDuration(minutes) {
+  if (!minutes) return "—";
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const hours = minutes / 60;
+  return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)}h`;
+}
+
+function relativeDate(value) {
+  if (!value) return "unknown time";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return formatDate(value);
+  const elapsed = Date.now() - date.valueOf();
+  const days = Math.floor(elapsed / 86400000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 7) return `${days} days ago`;
+  return formatDate(value);
+}
+
+function metricCard({ accent = false, icon, label, note, value }) {
+  const card = node("article", `metric-card${accent ? " accent" : ""}`);
+  const top = node("div", "metric-top");
+  top.append(node("span", "", label), node("span", "metric-icon", icon));
+  card.append(top, node("div", "metric-value", value), node("div", "metric-note", note));
+  return card;
+}
+
+function svgNode(tag, attributes = {}, textContent = null) {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [name, value] of Object.entries(attributes)) {
+    element.setAttribute(name, String(value));
+  }
+  if (textContent !== null) element.textContent = textContent;
+  return element;
+}
+
+let chartId = 0;
+
+function renderActivityChart(element, activity, { large = false } = {}) {
+  element.classList.remove("dashboard-skeleton");
+  const width = 760;
+  const height = large ? 250 : 195;
+  const bounds = { top: 10, right: 10, bottom: 25, left: 26 };
+  const chartWidth = width - bounds.left - bounds.right;
+  const chartHeight = height - bounds.top - bounds.bottom;
+  const maxSessions = Math.max(1, ...activity.map((point) => point.sessions));
+  const maxMessages = Math.max(1, ...activity.map((point) => point.messages));
+  const step = chartWidth / Math.max(1, activity.length);
+  const svg = svgNode("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    role: "img",
+    "aria-label": "Sessions and messages by day over the last 30 days",
+  });
+  svg.append(svgNode("title", {}, "Daily sessions shown as bars and messages shown as a line"));
+  for (let grid = 0; grid <= 4; grid += 1) {
+    const y = bounds.top + chartHeight * (grid / 4);
+    svg.append(svgNode("line", {
+      x1: bounds.left,
+      y1: y,
+      x2: width - bounds.right,
+      y2: y,
+      class: "chart-grid-line",
+    }));
+  }
+
+  const currentChart = ++chartId;
+  const gradientId = `message-area-${currentChart}`;
+  const gradient = svgNode("linearGradient", { id: gradientId, x1: "0", y1: "0", x2: "0", y2: "1" });
+  gradient.append(
+    svgNode("stop", { offset: "0%", "stop-color": "#c5a3e6", "stop-opacity": ".44" }),
+    svgNode("stop", { offset: "100%", "stop-color": "#c5a3e6", "stop-opacity": "0" }),
+  );
+  const defs = svgNode("defs");
+  defs.append(gradient);
+  svg.append(defs);
+
+  const points = [];
+  activity.forEach((point, index) => {
+    const x = bounds.left + (index * step) + (step / 2);
+    const sessionHeight = (point.sessions / maxSessions) * chartHeight * .9;
+    const bar = svgNode("rect", {
+      x: x - Math.max(2, step * .24),
+      y: bounds.top + chartHeight - sessionHeight,
+      width: Math.max(4, step * .48),
+      height: Math.max(point.sessions ? 2 : 0, sessionHeight),
+      rx: 1.5,
+      class: "chart-bar",
+    });
+    bar.append(svgNode("title", {}, `${point.date}: ${point.sessions} sessions, ${point.messages} messages`));
+    svg.append(bar);
+    const messageY = bounds.top + chartHeight - ((point.messages / maxMessages) * chartHeight * .82);
+    points.push([x, messageY]);
+  });
+  if (points.length) {
+    const linePath = points.map(([x, y], index) => `${index ? "L" : "M"}${x},${y}`).join(" ");
+    const areaPath = `${linePath} L${points.at(-1)[0]},${bounds.top + chartHeight} L${points[0][0]},${bounds.top + chartHeight} Z`;
+    svg.append(
+      svgNode("path", { d: areaPath, class: "chart-area", fill: `url(#${gradientId})` }),
+      svgNode("path", { d: linePath, class: "chart-line" }),
+    );
+    points.forEach(([x, y], index) => {
+      if (!activity[index].messages) return;
+      const dot = svgNode("circle", { cx: x, cy: y, r: large ? 2 : 1.6, class: "chart-dot" });
+      dot.append(svgNode("title", {}, `${activity[index].messages} messages on ${activity[index].date}`));
+      svg.append(dot);
+    });
+  }
+  activity.forEach((point, index) => {
+    if (index % 7 !== 0 && index !== activity.length - 1) return;
+    const date = new Date(`${point.date}T00:00:00Z`);
+    const label = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    }).format(date);
+    svg.append(svgNode("text", {
+      x: bounds.left + (index * step) + (step / 2),
+      y: height - 5,
+      "text-anchor": index === activity.length - 1 ? "end" : "middle",
+      class: "chart-axis-label",
+    }, label));
+  });
+  element.replaceChildren(svg);
+}
+
+function segmentMeter(active, total = 12, className = "segment-meter") {
+  const meter = node("div", className);
+  for (let index = 0; index < total; index += 1) {
+    meter.append(node("span", index < active ? "active" : ""));
+  }
+  return meter;
+}
+
+function renderRecentSessions(sessions) {
+  elements.recentSessions.replaceChildren();
+  if (!sessions.length) {
+    elements.recentSessions.append(node("div", "empty-metric", "Your latest sessions will appear here."));
+    return;
+  }
+  for (const session of sessions) {
+    const link = node("a", "recent-session");
+    link.href = `/sessions?${new URLSearchParams({ conversation: String(session.id) })}`;
+    const title = oneLine(session.title || session.preview || session.external_id);
+    const titleNode = node("span", "recent-title", title);
+    titleNode.title = title;
+    link.append(
+      titleNode,
+      node("span", "recent-time", relativeDate(session.ended_at || session.started_at)),
+      node("span", "recent-meta", `${session.provider} · ${session.message_count} messages · ${oneLine(session.cwd, session.hostname)}`),
+      node("span", "recent-arrow", "→"),
+    );
+    elements.recentSessions.append(link);
+  }
+}
+
+function renderProviderOverview(providers, totalSessions) {
+  elements.providerOverview.classList.remove("dashboard-skeleton");
+  elements.providerOverview.replaceChildren();
+  if (!providers.length) {
+    elements.providerOverview.append(node("div", "empty-metric", "Provider mix appears after your first upload."));
+    return;
+  }
+  const layout = node("div", "provider-layout");
+  const ring = node("div", "provider-ring");
+  const svg = svgNode("svg", { viewBox: "0 0 120 120", role: "img", "aria-label": "Provider session share" });
+  svg.append(svgNode("circle", { cx: 60, cy: 60, r: 45, class: "provider-track" }));
+  let offset = 0;
+  providers.forEach((provider) => {
+    const share = totalSessions ? (provider.sessions / totalSessions) * 100 : 0;
+    const kind = ["codex", "claude"].includes(provider.label.toLowerCase())
+      ? provider.label.toLowerCase()
+      : "other";
+    const circle = svgNode("circle", {
+      cx: 60,
+      cy: 60,
+      r: 45,
+      pathLength: 100,
+      "stroke-dasharray": `${share} ${100 - share}`,
+      "stroke-dashoffset": -offset,
+      class: `provider-segment ${kind}`,
+    });
+    circle.append(svgNode("title", {}, `${provider.label}: ${provider.sessions} sessions`));
+    svg.append(circle);
+    offset += share;
+  });
+  const label = node("div", "provider-ring-label", "sessions");
+  label.prepend(node("strong", "", formatCount(totalSessions)));
+  ring.append(svg, label);
+  const list = node("div", "provider-list");
+  providers.forEach((provider) => {
+    const kind = ["codex", "claude"].includes(provider.label.toLowerCase())
+      ? provider.label.toLowerCase()
+      : "other";
+    const row = node("div", "provider-row");
+    const share = totalSessions ? provider.sessions / totalSessions : 0;
+    row.append(
+      node("span", `provider-swatch ${kind}`),
+      node("span", "provider-name", provider.label),
+      node("span", "provider-count", `${Math.round(share * 100)}%`),
+      segmentMeter(Math.round(share * 10), 10, "provider-share"),
+    );
+    list.append(row);
+  });
+  layout.append(ring, list);
+  elements.providerOverview.append(layout);
+}
+
+function renderSignal(metrics) {
+  const { totals, weekdays, providers } = metrics;
+  const signal = elements.overviewSignal;
+  signal.querySelector(".signal-skeleton")?.remove();
+  signal.querySelector(".signal-copy")?.remove();
+  const wrapper = node("div", "signal-copy");
+  if (!totals.sessions) {
+    wrapper.append(
+      node("div", "signal-glyph", "◇"),
+      node("h2", "", "Your archive is ready for its first signal."),
+      node("p", "", "Upload a Claude or Codex history to reveal work patterns here."),
+      node("div", "signal-detail", "Waiting for activity"),
+    );
+  } else {
+    const busiest = weekdays.reduce((best, item) => item.count > best.count ? item : best, weekdays[0]);
+    const topProvider = providers[0];
+    wrapper.append(
+      node("div", "signal-glyph", "↗"),
+      node("h2", "", `${busiest.label} is your most active day.`),
+      node("p", "", `${formatCount(busiest.count)} sessions started then. ${topProvider.label} holds ${Math.round((topProvider.sessions / totals.sessions) * 100)}% of your archive.`),
+      node("div", "signal-detail", `${totals.latest_streak_days}-day latest streak · ${totals.longest_streak_days}-day best`),
+    );
+  }
+  signal.append(wrapper);
+}
+
+function renderWeekdayChart(items) {
+  elements.weekdayChart.classList.remove("dashboard-skeleton");
+  elements.weekdayChart.replaceChildren();
+  const max = Math.max(1, ...items.map((item) => item.count));
+  for (const item of items) {
+    const column = node("div", "weekday-column");
+    column.append(
+      segmentMeter(Math.round((item.count / max) * 10), 10, "weekday-bar"),
+      node("span", "weekday-value", formatCount(item.count)),
+      node("span", "weekday-label", item.label),
+    );
+    elements.weekdayChart.append(column);
+  }
+}
+
+function renderHourChart(items) {
+  elements.hourChart.classList.remove("dashboard-skeleton");
+  elements.hourChart.replaceChildren();
+  const grid = node("div", "hour-chart");
+  const max = Math.max(1, ...items.map((item) => item.count));
+  for (const item of items) {
+    const level = item.count ? Math.max(1, Math.ceil((item.count / max) * 4)) : 0;
+    const cell = node("div", `hour-cell level-${level}`, item.label);
+    cell.title = `${item.label}:00 UTC · ${item.count} sessions`;
+    grid.append(cell);
+  }
+  const scale = node("div", "hour-scale");
+  scale.append(node("span", "", "00:00"), node("span", "", "06:00"), node("span", "", "12:00"), node("span", "", "18:00"), node("span", "", "23:00"));
+  elements.hourChart.append(grid, scale);
+}
+
+function projectName(value) {
+  if (value === "Unknown project") return value;
+  const parts = value.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts.at(-1) || value;
+}
+
+function renderRanking(element, items, { countKey = "sessions", project = false } = {}) {
+  element.classList.remove("dashboard-skeleton");
+  element.replaceChildren();
+  if (!items.length) {
+    element.append(node("div", "empty-metric", "No structured activity yet."));
+    return;
+  }
+  const max = Math.max(1, ...items.map((item) => item[countKey]));
+  items.forEach((item, index) => {
+    const row = node("div", "ranking-row");
+    const label = node("span", "ranking-label");
+    label.append(node("strong", "", String(index + 1).padStart(2, "0")));
+    label.append(document.createTextNode(project ? projectName(item.label) : item.label));
+    label.title = item.label;
+    const count = item[countKey];
+    const suffix = countKey === "count" ? "calls" : "sessions";
+    row.append(
+      label,
+      node("span", "ranking-value", `${formatCount(count)} ${suffix}`),
+      segmentMeter(Math.max(count ? 1 : 0, Math.round((count / max) * 12))),
+    );
+    element.append(row);
+  });
+}
+
+function renderDepthChart(items) {
+  elements.depthChart.classList.remove("dashboard-skeleton");
+  elements.depthChart.replaceChildren();
+  const max = Math.max(1, ...items.map((item) => item.count));
+  for (const item of items) {
+    const column = node("div", "depth-column");
+    const bar = segmentMeter(Math.round((item.count / max) * 10), 10, "depth-bar");
+    column.append(
+      bar,
+      node("span", "depth-value", formatCount(item.count)),
+      node("span", "depth-label", item.label),
+    );
+    elements.depthChart.append(column);
+  }
+}
+
+function renderDashboard(metrics) {
+  const totals = metrics.totals;
+  elements.overviewMetrics.replaceChildren(
+    metricCard({ label: "Sessions", value: formatCount(totals.sessions), icon: "◇", accent: true, note: `${formatCount(totals.active_days)} active archive days` }),
+    metricCard({ label: "Messages", value: formatCount(totals.messages), icon: "↕", note: `${totals.average_messages_per_session.toFixed(1)} average per session` }),
+    metricCard({ label: "Tool calls", value: formatCount(totals.tool_calls), icon: "⌘", note: `${formatCount(totals.reasoning_events)} reasoning events` }),
+    metricCard({ label: "Latest streak", value: `${formatCount(totals.latest_streak_days)}d`, icon: "↗", note: `${formatCount(totals.longest_streak_days)} days at your best` }),
+  );
+  elements.insightMetrics.replaceChildren(
+    metricCard({ label: "Average session", value: formatDuration(totals.average_session_minutes), icon: "◷", accent: true, note: "elapsed time where available" }),
+    metricCard({ label: "Session depth", value: totals.average_messages_per_session.toFixed(1), icon: "≋", note: "messages per session" }),
+    metricCard({ label: "Active days", value: formatCount(totals.active_days), icon: "▦", note: `${formatCount(totals.sessions)} sessions in total` }),
+    metricCard({ label: "Archive sources", value: formatCount(totals.locations), icon: "⌁", note: `${formatCount(metrics.providers.length)} connected providers` }),
+  );
+  renderActivityChart(elements.overviewActivity, metrics.activity);
+  renderActivityChart(elements.insightsActivity, metrics.activity, { large: true });
+  const recentActivity = metrics.activity.reduce((sum, point) => sum + point.sessions, 0);
+  elements.activityTotal.textContent = `${formatCount(recentActivity)} sessions in range`;
+  renderRecentSessions(metrics.recent_sessions);
+  renderProviderOverview(metrics.providers, totals.sessions);
+  renderSignal(metrics);
+  renderWeekdayChart(metrics.weekdays);
+  renderHourChart(metrics.hours);
+  renderRanking(elements.projectRanking, metrics.projects, { project: true });
+  renderRanking(elements.toolRanking, metrics.tools, { countKey: "count" });
+  renderRanking(elements.modelRanking, metrics.models);
+  renderDepthChart(metrics.session_depth);
+}
+
+async function loadMetrics() {
+  state.metricsController?.abort();
+  const controller = new AbortController();
+  state.metricsController = controller;
+  const metrics = await request("/api/metrics", { signal: controller.signal });
+  state.metrics = metrics;
+  renderDashboard(metrics);
+  elements.archiveStatus.replaceChildren(
+    node("span", "status-light"),
+    document.createTextNode(
+      `${formatCount(metrics.totals.sessions)} sessions · ${formatCount(metrics.totals.locations)} ${metrics.totals.locations === 1 ? "location" : "locations"}`,
+    ),
+  );
+  if (state.currentView !== "sessions") {
+    elements.footerStatus.textContent = `${formatCount(metrics.totals.sessions)} sessions archived`;
+  }
+}
+
+function scheduleMetricsRevisionCheck(delay = METRICS_REVISION_POLL_MS) {
+  window.clearTimeout(state.metricsPollTimer);
+  if (state.currentView === "sessions" || document.visibilityState !== "visible") return;
+  state.metricsPollTimer = window.setTimeout(() => {
+    checkMetricsRevision().catch(() => {
+      // A later poll will retry without disrupting the current dashboard.
+    });
+  }, delay);
+}
+
+async function checkMetricsRevision() {
+  try {
+    if (document.visibilityState !== "visible") return;
+    const current = await request("/api/metrics/revision");
+    if (state.metrics && current.revision !== state.metrics.revision) {
+      elements.footerStatus.textContent = "Archive changed · refreshing metrics…";
+      await loadMetrics();
+      showToast("Archive updated · dashboard refreshed");
+    }
+  } finally {
+    scheduleMetricsRevisionCheck();
+  }
+}
+
 function updateTitleOverflow() {
   const truncated = elements.title.scrollWidth > elements.title.clientWidth + 1;
   elements.titleWrap.classList.toggle("is-truncated", truncated);
@@ -206,7 +645,7 @@ function updateUrl(conversationId = state.activeConversation?.summary.id || null
   if (elements.order.value !== "newest") params.set("order", elements.order.value);
   if (conversationId) params.set("conversation", String(conversationId));
   const query = params.toString();
-  history.replaceState(null, "", query ? `?${query}` : window.location.pathname);
+  history.replaceState(null, "", query ? `/sessions?${query}` : "/sessions");
 }
 
 function showToast(message) {
@@ -327,6 +766,11 @@ async function loadConversations({ append = false, keepSelection = false } = {})
     updateUrl(requestedId);
     return;
   }
+  if (state.currentView !== "sessions" && !requestedId) {
+    state.conversationLoading = false;
+    updateConversationBottom();
+    return;
+  }
   const nextId = available ? requestedId : state.conversations[0]?.id;
   if (nextId) {
     await openConversation(nextId);
@@ -406,6 +850,7 @@ async function openConversation(id) {
     state.transcriptQuery = "";
     elements.transcriptSearch.value = "";
     elements.clearTranscriptSearch.classList.add("hidden");
+    showView("sessions");
     renderConversation();
     updateUrl(id);
     document.querySelectorAll(".session-card").forEach((card) => {
@@ -441,6 +886,7 @@ function addMetadata(label, value, title = value) {
 function renderConversation() {
   const detail = state.activeConversation;
   const summary = detail.summary;
+  showView("sessions");
   elements.empty.classList.add("hidden");
   elements.conversation.classList.remove("hidden");
   elements.provider.textContent = summary.provider;
@@ -1452,8 +1898,13 @@ async function reloadArchive() {
   elements.reload.classList.add("spinning");
   elements.footerStatus.textContent = "Refreshing archive…";
   try {
-    await loadLocations();
-    await loadConversations({ keepSelection: true });
+    if (state.currentView === "sessions") {
+      await loadLocations();
+      await loadConversations({ keepSelection: true });
+    } else {
+      await loadMetrics();
+      scheduleMetricsRevisionCheck();
+    }
   } finally {
     elements.reload.disabled = false;
     elements.reload.classList.remove("spinning");
@@ -1501,10 +1952,21 @@ elements.copyLink.addEventListener("click", copyConversationLink);
 elements.reload.addEventListener("click", () => reloadArchive().catch(handleError));
 document.querySelector("#footer-details").addEventListener("click", toggleAllDetails);
 elements.sessionsButton.addEventListener("click", toggleSidebar);
-document.querySelector("#footer-sessions").addEventListener("click", toggleSidebar);
+document.querySelector("#footer-sessions").addEventListener("click", () => {
+  if (state.currentView === "sessions") toggleSidebar();
+  else window.location.assign("/sessions");
+});
+document.querySelector("#footer-insights").addEventListener("click", () => {
+  window.location.assign("/insights");
+});
 elements.sidebarScrim.addEventListener("click", () => setSidebar(false));
 document.querySelector("#scroll-top").addEventListener("click", scrollConversationTop);
 window.addEventListener("resize", updateTitleOverflow);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state.currentView !== "sessions") {
+    scheduleMetricsRevisionCheck(0);
+  }
+});
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(updateTitleOverflow).observe(elements.titleWrap);
 }
@@ -1553,13 +2015,22 @@ function handleError(error) {
 }
 
 async function start() {
+  state.currentView = viewFromPath();
+  showView(state.currentView);
   loadWidthPreference();
   try {
-    await loadLocations();
-    await loadConversations();
+    if (state.currentView === "sessions") {
+      await loadLocations();
+      await loadConversations();
+    } else {
+      await loadMetrics();
+      scheduleMetricsRevisionCheck();
+    }
   } catch (error) {
     handleError(error);
-    elements.sessionList.replaceChildren(node("div", "no-results", "Could not load archive"));
+    if (state.currentView === "sessions") {
+      elements.sessionList.replaceChildren(node("div", "no-results", "Could not load archive"));
+    }
   }
 }
 
