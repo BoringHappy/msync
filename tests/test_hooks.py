@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from msync.hooks import queue_session_upload
+from msync.hooks import queue_session_upload, wait_for_transcript_stable
 
 
 @pytest.mark.parametrize(
@@ -69,6 +69,7 @@ def test_hook_queues_one_native_transcript_without_credentials_in_arguments(
         str(root.resolve()),
         "--transcript",
         str(transcript.resolve()),
+        "--wait-for-transcript",
         "--provider",
         provider,
     ]
@@ -137,3 +138,33 @@ def test_hook_rejects_transcript_without_native_or_configured_root(tmp_path: Pat
                 "MSYNC_UPLOAD_TOKEN": "secret-token",
             },
         )
+
+
+def test_detached_upload_waits_for_delayed_transcript_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("first\n")
+    clock = {"now": 0.0}
+    final_write = {"done": False}
+
+    def fake_sleep(seconds: float) -> None:
+        clock["now"] += seconds
+        if clock["now"] >= 0.2 and not final_write["done"]:
+            transcript.write_text("first\nfinal assistant message\n")
+            final_write["done"] = True
+
+    monkeypatch.setattr("msync.hooks.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("msync.hooks.time.sleep", fake_sleep)
+
+    wait_for_transcript_stable(
+        transcript,
+        quiet_seconds=0.3,
+        timeout_seconds=2.0,
+        poll_seconds=0.1,
+    )
+
+    assert final_write["done"] is True
+    assert clock["now"] >= 0.5
+    assert transcript.read_text().endswith("final assistant message\n")

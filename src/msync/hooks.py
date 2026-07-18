@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TextIO
@@ -20,6 +21,9 @@ _PROVIDER_TRANSCRIPT_DIRECTORIES = {
     "claude": frozenset({"projects"}),
     "codex": frozenset({"sessions", "archived_sessions"}),
 }
+_TRANSCRIPT_QUIET_SECONDS = 2.0
+_TRANSCRIPT_WAIT_TIMEOUT_SECONDS = 10.0
+_TRANSCRIPT_POLL_SECONDS = 0.1
 
 
 def queue_session_upload(
@@ -60,11 +64,46 @@ def queue_session_upload(
         str(root),
         "--transcript",
         str(transcript),
+        "--wait-for-transcript",
         "--provider",
         provider.name,
     ]
     _spawn_detached(command, environment)
     return True
+
+
+def wait_for_transcript_stable(
+    transcript: Path,
+    *,
+    quiet_seconds: float = _TRANSCRIPT_QUIET_SECONDS,
+    timeout_seconds: float = _TRANSCRIPT_WAIT_TIMEOUT_SECONDS,
+    poll_seconds: float = _TRANSCRIPT_POLL_SECONDS,
+) -> None:
+    """Wait in the detached worker until a transcript has stopped changing."""
+
+    if quiet_seconds <= 0 or timeout_seconds <= 0 or poll_seconds <= 0:
+        raise ValueError("Transcript wait intervals must be greater than zero.")
+
+    signature = _transcript_signature(transcript)
+    started_at = time.monotonic()
+    unchanged_since = started_at
+    while True:
+        now = time.monotonic()
+        quiet_remaining = quiet_seconds - (now - unchanged_since)
+        timeout_remaining = timeout_seconds - (now - started_at)
+        if quiet_remaining <= 0 or timeout_remaining <= 0:
+            return
+
+        time.sleep(min(poll_seconds, quiet_remaining, timeout_remaining))
+        current_signature = _transcript_signature(transcript)
+        if current_signature != signature:
+            signature = current_signature
+            unchanged_since = time.monotonic()
+
+
+def _transcript_signature(transcript: Path) -> tuple[int, int]:
+    stat = transcript.stat()
+    return stat.st_size, stat.st_mtime_ns
 
 
 def _history_location(

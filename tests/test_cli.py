@@ -245,6 +245,7 @@ def test_upload_sends_native_transcripts_to_remote_server(
     )
 
     assert result.exit_code == 0, result.output
+    assert "Session pre-check: 2 passed, 0 failed." in result.output
     assert "Upload complete" in result.output
     assert "Server" in result.output
     assert "https://history.example/msync" in result.output
@@ -334,11 +335,73 @@ def test_upload_sends_only_selected_transcript_with_environment_credentials(
     assert re.search(r"Updated\s+1", result.output)
     assert len(captured_bodies) == 1
     metadata_length = int.from_bytes(captured_bodies[0][:4], byteorder="big")
-    metadata = RemoteUploadMetadata.model_validate_json(
-        captured_bodies[0][4 : 4 + metadata_length]
-    )
+    metadata = RemoteUploadMetadata.model_validate_json(captured_bodies[0][4 : 4 + metadata_length])
     assert metadata.relative_path == "sessions/selected.jsonl"
     assert captured_bodies[0][4 + metadata_length :] == selected.read_bytes()
+
+
+def test_hook_upload_waits_for_selected_transcript_before_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    transcript = root / "sessions/rollout.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+    calls: list[str] = []
+
+    def fake_wait(path: Path) -> None:
+        assert path == transcript.resolve()
+        calls.append("wait")
+        _write_codex_transcript(root)
+
+    def fake_post(
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: Iterator[bytes],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del headers, content, timeout
+        calls.append("post")
+        return httpx.Response(
+            200,
+            json={
+                "location_id": 1,
+                "scanned": 1,
+                "imported": 1,
+                "updated": 0,
+                "unchanged": 0,
+                "duplicates": 0,
+                "events": 1,
+                "message_parts": 0,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("msync.cli.wait_for_transcript_stable", fake_wait)
+    monkeypatch.setattr("msync.cli.httpx.post", fake_post)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--transcript",
+            str(transcript),
+            "--wait-for-transcript",
+            "--provider",
+            "codex",
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["wait", "post"]
 
 
 def test_upload_rejects_selected_transcript_outside_history_root(
@@ -373,6 +436,117 @@ def test_upload_rejects_selected_transcript_outside_history_root(
 
     assert result.exit_code == 1
     assert "Transcript must be contained in --dir" in result.output
+
+
+def test_upload_reports_failed_session_prechecks_and_uploads_verified_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    valid = _write_codex_transcript(root)
+    malformed = root / "sessions/malformed.jsonl"
+    malformed.write_text('{"type": "session_meta"\n')
+    empty = root / "sessions/empty.jsonl"
+    empty.touch()
+    missing_timestamp = root / "sessions/missing-timestamp.jsonl"
+    missing_timestamp.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "missing-timestamp", "cwd": "/tmp"},
+            }
+        )
+        + "\n"
+    )
+    uploaded_paths: list[str] = []
+
+    def fake_post(
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: Iterator[bytes],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del headers, timeout
+        body = b"".join(content)
+        metadata_length = int.from_bytes(body[:4], byteorder="big")
+        metadata = RemoteUploadMetadata.model_validate_json(body[4 : 4 + metadata_length])
+        uploaded_paths.append(metadata.relative_path)
+        return httpx.Response(
+            200,
+            json={
+                "location_id": 1,
+                "scanned": 1,
+                "imported": 1,
+                "updated": 0,
+                "unchanged": 0,
+                "duplicates": 0,
+                "events": 1,
+                "message_parts": 0,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("msync.cli.httpx.post", fake_post)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Session pre-check: 1 passed, 3 failed." in result.output
+    assert "sessions/empty.jsonl" in result.output
+    assert "transcript contains no JSON records" in result.output
+    assert "sessions/malformed.jsonl" in result.output
+    assert "line 1:" in result.output
+    assert "sessions/missing-timestamp.jsonl" in result.output
+    assert "session contains no event timestamps" in result.output
+    assert "Upload incomplete" in result.output
+    assert re.search(r"Sessions failed\s+3", result.output)
+    assert uploaded_paths == [valid.relative_to(root).as_posix()]
+
+
+def test_upload_does_not_contact_server_when_no_session_passes_precheck(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    transcript = root / "sessions/empty.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+
+    def unexpected_post(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("failed pre-check reached the network")
+
+    monkeypatch.setattr("msync.cli.httpx.post", unexpected_post)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Session pre-check: 0 passed, 1 failed." in result.output
+    assert "Session not uploaded: sessions/empty.jsonl" in result.output
+    assert "No sessions passed the pre-upload verification" in result.output
 
 
 def test_upload_requires_token(tmp_path: Path) -> None:
