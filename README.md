@@ -28,6 +28,35 @@ $ uv tool install .
 
 Python 3.14 or newer is required.
 
+## Docker
+
+The published container image is available at `ghcr.io/boringhappy/msync`. To run msync with the
+bundled PostgreSQL service, set passwords and start the default Compose configuration:
+
+```console
+$ export MSYNC_SERVER_PASSWORD='choose-a-strong-web-password'
+$ export POSTGRES_PASSWORD='choose-a-url-safe-database-password'
+$ make docker-up-postgres
+```
+
+PostgreSQL data is retained in a named volume. The database password is included in a SQLAlchemy
+URL, so percent-encode URL-reserved characters or use a password containing only URL-safe
+characters.
+
+To connect only the msync container to an existing PostgreSQL database, use the external-database
+configuration and provide its SQLAlchemy URL:
+
+```console
+$ export MSYNC_SERVER_PASSWORD='choose-a-strong-web-password'
+$ export MSYNC_DATABASE_URL='postgresql+psycopg://msync:secret@database.example.com/msync'
+$ make docker-up-external-db
+```
+
+Use `host.docker.internal` as the database host when the database runs on the Docker host. Both
+configurations expose the browser on `http://localhost:8000`, use the `msync` login by default, and
+use `ghcr.io/boringhappy/msync:latest`. Override `MSYNC_PORT`, `MSYNC_SERVER_USERNAME`, or
+`MSYNC_IMAGE` when a different port, login, or pinned image tag is needed.
+
 ## Upload history
 
 Archive Codex history into the default `~/.msync/msync.sqlite` database:

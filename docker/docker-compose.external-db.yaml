@@ -1,0 +1,20 @@
+name: msync
+
+services:
+  msync:
+    image: "${MSYNC_IMAGE:-ghcr.io/boringhappy/msync:latest}"
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${MSYNC_PORT:-8000}:8000"
+    environment:
+      MSYNC_SERVER_PASSWORD: "${MSYNC_SERVER_PASSWORD:?Set MSYNC_SERVER_PASSWORD}"
+      MSYNC_SERVER_USERNAME: "${MSYNC_SERVER_USERNAME:-msync}"
+    command:
+      - server
+      - --host
+      - 0.0.0.0
+      - --database
+      - "${MSYNC_DATABASE_URL:?Set MSYNC_DATABASE_URL to a SQLAlchemy database URL}"
+    extra_hosts:
+      - host.docker.internal:host-gateway
