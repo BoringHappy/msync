@@ -187,6 +187,72 @@ class ConversationSummaryResponse(BaseModel):
     preview: str | None
 
 
+class SummaryTotalsResponse(BaseModel):
+    """Headline archive metrics shown on the dashboard."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    sessions: int
+    messages: int
+    events: int
+    tool_calls: int
+    reasoning_events: int
+    locations: int
+    active_days: int
+    latest_streak_days: int
+    longest_streak_days: int
+    average_messages_per_session: float
+    average_session_minutes: float
+
+
+class BreakdownMetricResponse(BaseModel):
+    """Session and message volume for a named archive dimension."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    label: str
+    sessions: int
+    messages: int
+
+
+class CountMetricResponse(BaseModel):
+    """A compact labeled count."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    label: str
+    count: int
+
+
+class DailyActivityResponse(BaseModel):
+    """Archive activity assigned to one day."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    date: str
+    sessions: int
+    messages: int
+    events: int
+
+
+class ArchiveMetricsResponse(BaseModel):
+    """Aggregate data for the overview and insights pages."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    totals: SummaryTotalsResponse
+    activity: list[DailyActivityResponse]
+    providers: list[BreakdownMetricResponse]
+    models: list[BreakdownMetricResponse]
+    projects: list[BreakdownMetricResponse]
+    tools: list[CountMetricResponse]
+    weekdays: list[CountMetricResponse]
+    hours: list[CountMetricResponse]
+    session_depth: list[CountMetricResponse]
+    recent_sessions: list[ConversationSummaryResponse]
+    latest_activity_at: str | None
+
+
 class MessagePartResponse(BaseModel):
     """Structured content included in an expanded event."""
 
@@ -502,6 +568,8 @@ def create_app(
         response.delete_cookie(_CSRF_COOKIE, httponly=True, samesite="strict")
         return response
 
+    @app.get("/sessions", response_class=HTMLResponse, include_in_schema=False)
+    @app.get("/insights", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def index(request: Request, credentials: _BasicCredentials) -> Response:
         if authenticated_account(request, credentials) is None:
@@ -528,6 +596,15 @@ def create_app(
         account: ServerAccount = Depends(require_auth),  # noqa: B008
     ) -> list[Any]:
         return archive.browse_locations(
+            account_username=account.username,
+            include_legacy=account.username == legacy_owner,
+        )
+
+    @app.get("/api/metrics", response_model=ArchiveMetricsResponse)
+    def metrics(
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
+    ) -> Any:
+        return archive.browse_metrics(
             account_username=account.username,
             include_legacy=account.username == legacy_owner,
         )

@@ -236,8 +236,12 @@ $ MSYNC_SERVER_PASSWORD='choose-a-strong-password' msync server
 ```
 
 Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a terminal-inspired
-Claude/Codex layout with a location picker, session search, chronological message rendering, and
-lossless event inspection. Tool calls and results share compact activity cards, while assistant
+Claude/Codex layout. The overview dashboard summarizes session, message, tool, streak, provider,
+and recent-work activity. The dedicated **Insights** page adds a 30-day activity pulse, weekly and
+hourly rhythms, session depth, plus top project, tool, and model breakdowns. Metrics are scoped to
+the signed-in archive account. The session browser includes a location picker, search,
+chronological message rendering, and lossless event inspection. Tool calls and results share
+compact activity cards, while assistant
 messages render common Markdown, GitHub-style tables, and fenced code blocks without accepting
 embedded HTML. Injected Claude skill/context records are kept out of the human conversation and
 remain available in **Raw events**. Order the session list by time, activity, or title. Long

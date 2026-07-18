@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 import zlib
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, Self
@@ -182,6 +184,67 @@ class ConversationSummary:
 
 
 @dataclass(slots=True, frozen=True)
+class SummaryTotals:
+    """Headline archive counts and averages shown on the overview."""
+
+    sessions: int
+    messages: int
+    events: int
+    tool_calls: int
+    reasoning_events: int
+    locations: int
+    active_days: int
+    latest_streak_days: int
+    longest_streak_days: int
+    average_messages_per_session: float
+    average_session_minutes: float
+
+
+@dataclass(slots=True, frozen=True)
+class BreakdownMetric:
+    """Session and message totals for one provider, model, or project."""
+
+    label: str
+    sessions: int
+    messages: int
+
+
+@dataclass(slots=True, frozen=True)
+class CountMetric:
+    """A labeled count used by compact dashboard visualizations."""
+
+    label: str
+    count: int
+
+
+@dataclass(slots=True, frozen=True)
+class DailyActivity:
+    """Conversation activity assigned to a calendar day."""
+
+    date: str
+    sessions: int
+    messages: int
+    events: int
+
+
+@dataclass(slots=True, frozen=True)
+class ArchiveMetrics:
+    """Aggregate archive signals used by the overview and insights pages."""
+
+    totals: SummaryTotals
+    activity: tuple[DailyActivity, ...]
+    providers: tuple[BreakdownMetric, ...]
+    models: tuple[BreakdownMetric, ...]
+    projects: tuple[BreakdownMetric, ...]
+    tools: tuple[CountMetric, ...]
+    weekdays: tuple[CountMetric, ...]
+    hours: tuple[CountMetric, ...]
+    session_depth: tuple[CountMetric, ...]
+    recent_sessions: tuple[ConversationSummary, ...]
+    latest_activity_at: str | None
+
+
+@dataclass(slots=True, frozen=True)
 class ArchivedMessagePart:
     """One structured content block displayed in expanded event details."""
 
@@ -218,6 +281,102 @@ class ConversationDetail:
     parent_external_id: str | None
     metadata: dict[str, Any]
     events: tuple[ArchivedEvent, ...]
+
+
+def _archive_datetime(value: str | None) -> datetime | None:
+    """Parse provider ISO timestamps and normalize them to UTC for aggregation."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _session_depth_label(messages: int) -> str:
+    if messages < 5:
+        return "0–4"
+    if messages < 10:
+        return "5–9"
+    if messages < 25:
+        return "10–24"
+    return "25+"
+
+
+def _is_tool_call_type(content_type: str) -> bool:
+    normalized = content_type.casefold()
+    if any(
+        marker in normalized
+        for marker in ("output", "result", "response", "approval", "list_tools")
+    ):
+        return False
+    return normalized.endswith(("tool_use", "_tool", "_call")) or normalized in {
+        "tool_use",
+        "mcp_call",
+    }
+
+
+def _is_reasoning_part_type(content_type: str) -> bool:
+    return content_type.casefold() in {
+        "reasoning",
+        "summary_text",
+        "thinking",
+        "redacted_thinking",
+    }
+
+
+def _tool_metric_name(content_type: str, raw_json: str) -> str:
+    try:
+        value = json.loads(raw_json)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        for key in ("name", "tool_name", "server_name"):
+            name = value.get(key)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    normalized = content_type.casefold()
+    for suffix in ("_call", "_tool", "_use"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.replace("_", " ").strip() or "tool"
+
+
+def _activity_streaks(activity_dates: set[date]) -> tuple[int, int]:
+    if not activity_dates:
+        return 0, 0
+    ordered = sorted(activity_dates)
+    longest = 1
+    current = 1
+    latest = 1
+    for previous, active_day in zip(ordered, ordered[1:], strict=False):
+        if active_day == previous + timedelta(days=1):
+            current += 1
+        else:
+            current = 1
+        longest = max(longest, current)
+        latest = current
+    return latest, longest
+
+
+def _breakdown_metrics(
+    sessions: Counter[str],
+    messages: Counter[str],
+    *,
+    limit: int | None = None,
+) -> tuple[BreakdownMetric, ...]:
+    values = sorted(sessions.items(), key=lambda item: (-item[1], item[0].casefold()))
+    if limit is not None:
+        values = values[:limit]
+    return tuple(
+        BreakdownMetric(label=label, sessions=count, messages=messages[label])
+        for label, count in values
+    )
 
 
 class Archive:
@@ -593,6 +752,241 @@ class Archive:
         statement = statement.order_by(*order_columns[order_by]).limit(limit).offset(offset)
         with Session(self.engine) as session:
             return [ConversationSummary(*row) for row in session.execute(statement)]
+
+    def browse_metrics(
+        self,
+        *,
+        account_username: str | None = None,
+        include_legacy: bool = False,
+    ) -> ArchiveMetrics:
+        """Return tenant-scoped aggregate signals for the web dashboard."""
+
+        event_stats = (
+            select(
+                EventRow.conversation_id.label("conversation_id"),
+                func.count(EventRow.id).label("event_count"),
+                func.sum(
+                    case(
+                        (
+                            EventRow.role.in_(("user", "assistant"))
+                            & (EventRow.searchable_text != ""),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("message_count"),
+                func.sum(case((EventRow.role == "reasoning", 1), else_=0)).label(
+                    "reasoning_count"
+                ),
+            )
+            .group_by(EventRow.conversation_id)
+            .subquery()
+        )
+        preview = (
+            select(EventRow.searchable_text)
+            .where(
+                EventRow.conversation_id == ConversationRow.id,
+                EventRow.role == "user",
+                EventRow.searchable_text != "",
+            )
+            .order_by(EventRow.sequence)
+            .limit(1)
+            .correlate(ConversationRow)
+            .scalar_subquery()
+        )
+        statement = (
+            select(
+                ConversationRow.id,
+                ConversationRow.location_id,
+                LocationRow.provider,
+                LocationRow.hostname,
+                ConversationRow.external_id,
+                ConversationRow.title,
+                ConversationRow.conversation_kind,
+                ConversationRow.cwd,
+                ConversationRow.model,
+                ConversationRow.git_branch,
+                ConversationRow.started_at,
+                ConversationRow.ended_at,
+                func.coalesce(event_stats.c.event_count, 0).label("event_count"),
+                func.coalesce(event_stats.c.message_count, 0).label("message_count"),
+                preview.label("preview"),
+                func.coalesce(event_stats.c.reasoning_count, 0).label("reasoning_count"),
+            )
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .outerjoin(event_stats, event_stats.c.conversation_id == ConversationRow.id)
+        )
+        structured_parts = (
+            select(
+                EventRow.id,
+                EventRow.role,
+                MessagePartRow.content_type,
+                MessagePartRow.raw_json,
+            )
+            .join(EventRow, MessagePartRow.event_id == EventRow.id)
+            .join(ConversationRow, EventRow.conversation_id == ConversationRow.id)
+            .join(LocationRow, ConversationRow.location_id == LocationRow.id)
+            .where(
+                or_(
+                    func.lower(MessagePartRow.content_type).like("%tool%"),
+                    func.lower(MessagePartRow.content_type).like("%call%"),
+                    func.lower(MessagePartRow.content_type).like("%thinking%"),
+                    func.lower(MessagePartRow.content_type).in_(("reasoning", "summary_text")),
+                )
+            )
+        )
+        if account_username is not None:
+            owners = (account_username, "") if include_legacy else (account_username,)
+            statement = statement.where(LocationRow.account_username.in_(owners))
+            structured_parts = structured_parts.where(LocationRow.account_username.in_(owners))
+
+        with Session(self.engine) as session:
+            rows = list(session.execute(statement))
+            part_rows = list(session.execute(structured_parts))
+
+        provider_counts: Counter[str] = Counter()
+        provider_messages: Counter[str] = Counter()
+        model_counts: Counter[str] = Counter()
+        model_messages: Counter[str] = Counter()
+        project_counts: Counter[str] = Counter()
+        project_messages: Counter[str] = Counter()
+        activity: dict[date, list[int]] = {}
+        weekday_counts: Counter[int] = Counter()
+        hour_counts: Counter[int] = Counter()
+        depth_counts: Counter[str] = Counter()
+        activity_dates: set[date] = set()
+        durations: list[float] = []
+        latest_activity: tuple[datetime, str] | None = None
+        total_messages = 0
+        total_events = 0
+        reasoning_events = 0
+
+        recent: list[tuple[datetime | None, ConversationSummary]] = []
+        for row in rows:
+            messages = int(row.message_count or 0)
+            events = int(row.event_count or 0)
+            total_messages += messages
+            total_events += events
+            reasoning_events += int(row.reasoning_count or 0)
+            provider_counts[row.provider] += 1
+            provider_messages[row.provider] += messages
+
+            model = (row.model or "").strip() or "Unknown model"
+            model_counts[model] += 1
+            model_messages[model] += messages
+            project = (row.cwd or "").strip() or "Unknown project"
+            project_counts[project] += 1
+            project_messages[project] += messages
+
+            started = _archive_datetime(row.started_at)
+            ended = _archive_datetime(row.ended_at)
+            activity_at = ended or started
+            started_for_activity = started or ended
+            if started_for_activity is not None:
+                activity_day = started_for_activity.date()
+                activity_dates.add(activity_day)
+                day_counts = activity.setdefault(activity_day, [0, 0, 0])
+                day_counts[0] += 1
+                day_counts[1] += messages
+                day_counts[2] += events
+                weekday_counts[started_for_activity.weekday()] += 1
+                hour_counts[started_for_activity.hour] += 1
+            if started is not None and ended is not None and ended >= started:
+                durations.append((ended - started).total_seconds() / 60)
+            if activity_at is not None:
+                activity_value = row.ended_at if ended is not None else row.started_at
+                if latest_activity is None or activity_at > latest_activity[0]:
+                    latest_activity = (activity_at, activity_value)
+
+            depth_counts[_session_depth_label(messages)] += 1
+            recent.append(
+                (
+                    activity_at,
+                    ConversationSummary(
+                        id=row.id,
+                        location_id=row.location_id,
+                        provider=row.provider,
+                        hostname=row.hostname,
+                        external_id=row.external_id,
+                        title=row.title,
+                        conversation_kind=row.conversation_kind,
+                        cwd=row.cwd,
+                        model=row.model,
+                        git_branch=row.git_branch,
+                        started_at=row.started_at,
+                        ended_at=row.ended_at,
+                        event_count=events,
+                        message_count=messages,
+                        preview=row.preview,
+                    ),
+                )
+            )
+
+        tool_counts: Counter[str] = Counter()
+        mixed_reasoning_events: set[int] = set()
+        tool_calls = 0
+        for event_id, event_role, content_type, raw_json in part_rows:
+            if _is_tool_call_type(content_type):
+                tool_calls += 1
+                tool_counts[_tool_metric_name(content_type, raw_json)] += 1
+            elif _is_reasoning_part_type(content_type) and event_role != "reasoning":
+                mixed_reasoning_events.add(event_id)
+        reasoning_events += len(mixed_reasoning_events)
+
+        streaks = _activity_streaks(activity_dates)
+        session_count = len(rows)
+        latest_day = max(activity_dates, default=datetime.now(UTC).date())
+        range_end = max(datetime.now(UTC).date(), latest_day)
+        range_start = range_end - timedelta(days=29)
+        daily_activity = tuple(
+            DailyActivity(
+                date=(day := range_start + timedelta(days=offset)).isoformat(),
+                sessions=activity.get(day, [0, 0, 0])[0],
+                messages=activity.get(day, [0, 0, 0])[1],
+                events=activity.get(day, [0, 0, 0])[2],
+            )
+            for offset in range(30)
+        )
+        recent.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=UTC), reverse=True)
+
+        return ArchiveMetrics(
+            totals=SummaryTotals(
+                sessions=session_count,
+                messages=total_messages,
+                events=total_events,
+                tool_calls=tool_calls,
+                reasoning_events=reasoning_events,
+                locations=len({row.location_id for row in rows}),
+                active_days=len(activity_dates),
+                latest_streak_days=streaks[0],
+                longest_streak_days=streaks[1],
+                average_messages_per_session=(
+                    total_messages / session_count if session_count else 0
+                ),
+                average_session_minutes=(sum(durations) / len(durations) if durations else 0),
+            ),
+            activity=daily_activity,
+            providers=_breakdown_metrics(provider_counts, provider_messages),
+            models=_breakdown_metrics(model_counts, model_messages, limit=6),
+            projects=_breakdown_metrics(project_counts, project_messages, limit=6),
+            tools=tuple(
+                CountMetric(label=label, count=count)
+                for label, count in tool_counts.most_common(6)
+            ),
+            weekdays=tuple(
+                CountMetric(label=label, count=weekday_counts[index])
+                for index, label in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+            ),
+            hours=tuple(
+                CountMetric(label=f"{hour:02d}", count=hour_counts[hour]) for hour in range(24)
+            ),
+            session_depth=tuple(
+                CountMetric(label=label, count=depth_counts[label])
+                for label in ("0–4", "5–9", "10–24", "25+")
+            ),
+            recent_sessions=tuple(summary for _, summary in recent[:5]),
+            latest_activity_at=latest_activity[1] if latest_activity else None,
+        )
 
     def browse_conversation(
         self,
