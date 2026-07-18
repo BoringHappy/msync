@@ -18,6 +18,10 @@
       </a>
       <div class="top-status" id="archive-status"><span class="status-light"></span> archive online</div>
       <button class="top-action" id="reload-button" type="button" title="Refresh archive" aria-label="Refresh archive">↻</button>
+      <form class="logout-form" action="/logout" method="post">
+        <input type="hidden" name="csrf_token" value="__MSYNC_CSRF__">
+        <button class="top-action top-logout" type="submit" title="Sign out of msync">sign out</button>
+      </form>
     </header>
 
     <div class="workspace">

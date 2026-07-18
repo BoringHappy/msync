@@ -116,9 +116,17 @@ function node(tag, className, text) {
 
 async function request(path, { signal } = {}) {
   const response = await fetch(path, {
-    headers: { Accept: "application/json" },
+    headers: {
+      Accept: "application/json",
+      "X-Msync-Browser-Request": "1",
+    },
     signal,
   });
+  if (response.status === 401) {
+    const next = `${window.location.pathname}${window.location.search}`;
+    window.location.assign(`/login?${new URLSearchParams({ next })}`);
+    throw new Error("Authentication required.");
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
