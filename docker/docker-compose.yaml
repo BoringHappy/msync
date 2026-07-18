@@ -1,0 +1,42 @@
+name: msync
+
+services:
+  msync:
+    image: "${MSYNC_IMAGE:-ghcr.io/boringhappy/msync:latest}"
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${MSYNC_PORT:-8000}:8000"
+    environment:
+      MSYNC_SERVER_PASSWORD: "${MSYNC_SERVER_PASSWORD:?Set MSYNC_SERVER_PASSWORD}"
+      MSYNC_SERVER_USERNAME: "${MSYNC_SERVER_USERNAME:-msync}"
+      MSYNC_DATABASE_HOST: postgres
+      POSTGRES_DB: "${POSTGRES_DB:-msync}"
+      POSTGRES_USER: "${POSTGRES_USER:-msync}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+    command:
+      - server
+      - --host
+      - 0.0.0.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-msync}"
+      POSTGRES_USER: "${POSTGRES_USER:-msync}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+volumes:
+  postgres-data:
