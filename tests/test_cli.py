@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from msync.cli import app
@@ -57,7 +58,7 @@ def test_upload_requires_url(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["upload", "--dir", str(root)])
 
     assert result.exit_code == 2
-    assert "Missing option '--url'" in result.output
+    assert "Missing option '--url'" in unstyle(result.output)
 
 
 def test_upload_rejects_empty_directory(tmp_path: Path) -> None:
@@ -308,7 +309,7 @@ def test_upload_no_longer_accepts_database(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2
-    assert "No such option: --database" in result.output
+    assert "No such option: --database" in unstyle(result.output)
 
 
 def test_upload_rejects_oversized_transcript_before_network_access(
