@@ -81,6 +81,21 @@ def _archive_claude_tool_conversation(database: Path, root: Path) -> None:
             "message": {"role": "user", "content": "Inspect the build log"},
         },
         {
+            "type": "user",
+            "uuid": "skill-context-1",
+            "sessionId": "tool-session",
+            "timestamp": "2026-07-14T12:00:00.500Z",
+            "isMeta": True,
+            "isSidechain": True,
+            "message": {
+                "role": "user",
+                "content": (
+                    "Base directory for this skill: /opt/skills/review"
+                    "\n\nLarge internal instructions"
+                ),
+            },
+        },
+        {
             "type": "assistant",
             "uuid": "assistant-1",
             "sessionId": "tool-session",
@@ -299,14 +314,20 @@ def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Pat
     assert summary["message_count"] == 3
     assert [event["role"] for event in detail["events"]] == [
         "user",
+        "metadata",
         "assistant",
         "tool",
         "assistant",
     ]
-    assert detail["events"][1]["text"] == "I will check it."
-    assert detail["events"][2]["event_subtype"] == "tool_result"
-    assert detail["events"][2]["text"] == "Build completed successfully"
+    assert detail["events"][1]["event_subtype"] == "skill_context"
+    assert detail["events"][1]["visibility"] == "metadata"
+    assert detail["events"][1]["text"] == ""
+    assert detail["events"][2]["text"] == "I will check it."
+    assert detail["events"][3]["event_subtype"] == "tool_result"
+    assert detail["events"][3]["text"] == "Build completed successfully"
     assert "conversationItems" in script
+    assert "isInjectedClaudeContext" in script
+    assert "Claude skill/context" in script
     assert "appendToolItem" in script
     assert "renderMarkdown" in script
     assert "hasEmbeddedOutput" in script
@@ -315,6 +336,7 @@ def test_server_separates_claude_tool_activity_from_human_messages(tmp_path: Pat
     assert "navigator.clipboard" in script
     assert "tool-output-disclosure" in styles
     assert ".tool-finished" in styles
+    assert ".context-notice" in styles
 
 
 def test_server_command_starts_uvicorn(monkeypatch: Any, tmp_path: Path) -> None:

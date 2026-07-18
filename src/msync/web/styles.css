@@ -315,6 +315,21 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 .control-hint { margin-left: 3px; color: var(--dim); font-size: 8px; }
 
 .transcript { padding: 27px 0 12px; }
+.context-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  margin: -10px 0 22px 30px;
+  padding: 5px 8px 5px 10px;
+  border: 1px dashed #39434a;
+  border-radius: 3px;
+  color: var(--dim);
+  background: #0c1114;
+  font-size: 9px;
+}
+.context-notice button { margin-left: auto; padding: 3px 6px; border: 0; color: var(--blue); background: transparent; font-size: 9px; }
+.context-notice button:hover { color: var(--text); }
 .transcript-load-more {
   width: calc(100% - 30px);
   min-height: 38px;

@@ -15,6 +15,7 @@ const state = {
   eventLoading: false,
   eventRequest: 0,
   hasMoreConversations: false,
+  hiddenContextCount: 0,
   humanCursorSequence: null,
   listController: null,
   listRequest: 0,
@@ -409,6 +410,33 @@ function parseJson(raw) {
   }
 }
 
+function isInjectedClaudeContext(event) {
+  if (
+    state.activeConversation?.summary.provider !== "claude"
+    || event.event_type !== "user"
+  ) return false;
+  if (event.injectedClaudeContext !== undefined) return event.injectedClaudeContext;
+
+  const record = parseJson(event.raw_json);
+  const content = record?.message?.content;
+  const blocks = Array.isArray(content) ? content : [content];
+  const onlyText = blocks.length > 0 && blocks.every((block) => (
+    typeof block === "string"
+    || (block && block.type === "text" && typeof block.text === "string")
+  ));
+  const text = onlyText
+    ? blocks.map((block) => typeof block === "string" ? block : block.text).join("\n").trimStart()
+    : "";
+  const markedContext = text.startsWith("Base directory for this skill:")
+    || text.startsWith("[SYSTEM NOTIFICATION - NOT USER INPUT]");
+  event.injectedClaudeContext = Boolean(
+    onlyText
+    && (record?.isMeta === true
+      || (markedContext && (record?.isSidechain === true || record?.sourceToolUseID))),
+  );
+  return event.injectedClaudeContext;
+}
+
 function isToolType(type = "") {
   return type.includes("tool")
     || type.endsWith("_call")
@@ -553,7 +581,12 @@ function appendToolItem(items, pendingTools, event, part) {
 function conversationItems() {
   const items = [];
   const pendingTools = new Map();
+  state.hiddenContextCount = 0;
   for (const event of state.activeConversation.events) {
+    if (isInjectedClaudeContext(event)) {
+      state.hiddenContextCount += 1;
+      continue;
+    }
     let added = false;
     for (const part of event.parts || []) {
       const role = partRole(event, part);
@@ -917,6 +950,22 @@ function appendTranscriptLoader() {
   elements.transcript.append(button);
 }
 
+function appendHiddenContextNotice() {
+  if (state.detailsExpanded || !state.hiddenContextCount) return;
+  const count = state.hiddenContextCount;
+  const notice = node("div", "context-notice");
+  notice.append(node(
+    "span",
+    "",
+    `${count} Claude skill/context ${count === 1 ? "record" : "records"} hidden from conversation`,
+  ));
+  const button = node("button", "", "View raw events");
+  button.type = "button";
+  button.addEventListener("click", toggleAllDetails);
+  notice.append(button);
+  elements.transcript.append(notice);
+}
+
 function renderEvents() {
   elements.transcript.replaceChildren();
   elements.transcript.classList.toggle("raw-mode", state.detailsExpanded);
@@ -943,6 +992,7 @@ function renderEvents() {
     "aria-label",
     hasQuery ? `Find in loaded events; ${entries.length} matches` : "Find in loaded events",
   );
+  appendHiddenContextNotice();
   if (!entries.length) {
     elements.transcript.append(node(
       "div",
@@ -952,7 +1002,8 @@ function renderEvents() {
     appendTranscriptLoader();
     const loaded = state.activeConversation.events.length;
     const total = state.activeConversation.summary.event_count;
-    elements.footerStatus.textContent = `0 visible · ${loaded}/${total} events loaded`;
+    const hidden = state.hiddenContextCount ? ` · ${state.hiddenContextCount} context hidden` : "";
+    elements.footerStatus.textContent = `0 visible · ${loaded}/${total} events loaded${hidden}`;
     return;
   }
   for (const entry of entries) elements.transcript.append(renderEvent(entry));
@@ -960,7 +1011,8 @@ function renderEvents() {
   const matchStatus = hasQuery ? ` · ${entries.length}/${visibleEntries.length} matches` : "";
   const loaded = state.activeConversation.events.length;
   const total = state.activeConversation.summary.event_count;
-  elements.footerStatus.textContent = `${entries.length} visible · ${loaded}/${total} events loaded${matchStatus}`;
+  const hidden = state.hiddenContextCount ? ` · ${state.hiddenContextCount} context hidden` : "";
+  elements.footerStatus.textContent = `${entries.length} visible · ${loaded}/${total} events loaded${matchStatus}${hidden}`;
 }
 
 function renderEvent(entry) {

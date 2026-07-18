@@ -196,8 +196,9 @@ Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a term
 Claude/Codex layout with a location picker, session search, chronological message rendering, and
 lossless event inspection. Tool calls and results share compact activity cards, while assistant
 messages render common Markdown, GitHub-style tables, and fenced code blocks without accepting
-embedded HTML. Order the session list by time, activity, or title. Long conversation titles stay
-on one line and expose their full value on hover or keyboard focus. Use the
+embedded HTML. Injected Claude skill/context records are kept out of the human conversation and
+remain available in **Raw events**. Order the session list by time, activity, or title. Long
+conversation titles stay on one line and expose their full value on hover or keyboard focus. Use the
 **Activity**, **Chat**, **Tools**, and **Reasoning** filters (or keys 1–4), navigate messages with
 J/K and sessions with `[`/`]`, or jump between human messages with the floating arrows (Alt+↑/↓).
 Find text within the currently loaded events from the toolbar. **Fit width** switches between the

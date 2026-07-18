@@ -78,6 +78,11 @@ class ClaudeRecord(NativeRecord):
     git_branch: str | None = Field(default=None, alias="gitBranch")
     version: str | None = None
     entrypoint: str | None = None
+    is_meta: bool | None = Field(default=None, alias="isMeta")
+    is_sidechain: bool | None = Field(default=None, alias="isSidechain")
+    user_type: str | None = Field(default=None, alias="userType")
+    source_tool_use_id: str | None = Field(default=None, alias="sourceToolUseID")
+    agent_id: str | None = Field(default=None, alias="agentId")
     message: ClaudeMessage | None = None
     content: Any = None
     summary: str | None = None
