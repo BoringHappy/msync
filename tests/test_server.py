@@ -200,6 +200,10 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
         client.auth = ("reader", "secret")
         summary = client.get("/api/conversations").json()[0]
         response = client.get(f"/api/conversations/{summary['id']}")
+        paged = client.get(
+            f"/api/conversations/{summary['id']}",
+            params={"event_limit": 2, "event_offset": 1},
+        )
         missing = client.get("/api/conversations/999999")
         page = client.get("/")
         script = client.get("/assets/app.js")
@@ -216,12 +220,19 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert detail["events"][1]["text"] == "Show all event detail"
     assert json.loads(detail["events"][1]["raw_json"])["type"] == "event_msg"
     assert any(event["visibility"] == "model" for event in detail["events"])
+    assert paged.status_code == 200
+    assert paged.json()["summary"]["event_count"] == 4
+    assert [event["sequence"] for event in paged.json()["events"]] == [1, 2]
     assert missing.status_code == 404
     assert "Raw events" in page.text
     assert "ctrlKey" in script.text
     assert "moveEventFocus" in script.text
     assert "location.hostname" in script.text
     assert "SESSION_PAGE_SIZE" in script.text
+    assert "EVENT_PAGE_SIZE" in script.text
+    assert "loadMoreEvents" in script.text
+    assert "ensureDetails" in script.text
+    assert "disclosure.children.length === 1" in script.text
     assert "matchesTranscriptQuery" in script.text
     assert "requestId !== state.listRequest" in script.text
     assert "reloadArchive" in script.text
@@ -237,6 +248,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "min-height: 0" in styles.text
     assert ".filter-count" in styles.text
     assert ".transcript-search" in styles.text
+    assert ".transcript-load-more" in styles.text
     assert ".sidebar-scrim:not(.hidden)" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 

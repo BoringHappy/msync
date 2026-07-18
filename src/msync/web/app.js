@@ -1,13 +1,20 @@
 "use strict";
 
 const SESSION_PAGE_SIZE = 50;
+const EVENT_PAGE_SIZE = 100;
 
 const state = {
   locations: [],
   conversations: [],
   activeConversation: null,
+  conversationEntries: [],
+  conversationController: null,
   detailsExpanded: false,
+  eventController: null,
+  eventLoading: false,
+  eventRequest: 0,
   hasMoreConversations: false,
+  listController: null,
   listRequest: 0,
   conversationRequest: 0,
   searchTimer: null,
@@ -53,8 +60,11 @@ function node(tag, className, text) {
   return element;
 }
 
-async function request(path) {
-  const response = await fetch(path, { headers: { Accept: "application/json" } });
+async function request(path, { signal } = {}) {
+  const response = await fetch(path, {
+    headers: { Accept: "application/json" },
+    signal,
+  });
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
@@ -140,8 +150,15 @@ async function loadLocations() {
 
 async function loadConversations({ append = false, keepSelection = false } = {}) {
   const requestId = ++state.listRequest;
+  state.listController?.abort();
+  const controller = new AbortController();
+  state.listController = controller;
   if (!append) {
     state.conversationRequest += 1;
+    state.conversationController?.abort();
+    state.eventRequest += 1;
+    state.eventController?.abort();
+    state.eventLoading = false;
     elements.sessionList.replaceChildren(node("div", "loading", "Loading sessions…"));
   }
   elements.sessionList.setAttribute("aria-busy", "true");
@@ -155,8 +172,9 @@ async function loadConversations({ append = false, keepSelection = false } = {})
   if (elements.search.value.trim()) params.set("search", elements.search.value.trim());
   let response;
   try {
-    response = await request(`/api/conversations?${params}`);
+    response = await request(`/api/conversations?${params}`, { signal: controller.signal });
   } catch (error) {
+    if (error.name === "AbortError") return;
     if (requestId !== state.listRequest) return;
     elements.sessionList.setAttribute("aria-busy", "false");
     elements.loadMore.disabled = false;
@@ -236,10 +254,19 @@ function renderConversationList() {
 async function openConversation(id) {
   if (!id) return;
   const requestId = ++state.conversationRequest;
+  state.conversationController?.abort();
+  state.eventRequest += 1;
+  state.eventController?.abort();
+  state.eventLoading = false;
+  const controller = new AbortController();
+  state.conversationController = controller;
   elements.footerStatus.textContent = "Loading transcript…";
   elements.conversation.setAttribute("aria-busy", "true");
   try {
-    const detail = await request(`/api/conversations/${id}`);
+    const params = new URLSearchParams({ event_limit: String(EVENT_PAGE_SIZE) });
+    const detail = await request(`/api/conversations/${id}?${params}`, {
+      signal: controller.signal,
+    });
     if (requestId !== state.conversationRequest) return;
     state.activeConversation = detail;
     state.detailsExpanded = false;
@@ -256,6 +283,7 @@ async function openConversation(id) {
     setSidebar(false);
     elements.conversation.setAttribute("aria-busy", "false");
   } catch (error) {
+    if (error.name === "AbortError") return;
     if (requestId !== state.conversationRequest) return;
     showToast(`Could not load session: ${error.message}`);
     elements.footerStatus.textContent = "Load failed";
@@ -290,6 +318,7 @@ function renderConversation() {
   addMetadata("branch", summary.git_branch);
   addMetadata("cwd", summary.cwd);
   addMetadata("events", `${summary.message_count} messages / ${summary.event_count} total`);
+  state.conversationEntries = conversationItems();
   updateDetailsButton();
   renderEvents();
   elements.content.scrollTo({ top: 0 });
@@ -507,6 +536,7 @@ function itemsForFilter(items, filter) {
 }
 
 function itemSearchText(entry) {
+  if (entry.searchText !== undefined) return entry.searchText;
   const event = entry.event;
   const values = [
     entry.text,
@@ -520,12 +550,12 @@ function itemSearchText(entry) {
     event?.event_type,
     event?.event_subtype,
   ];
-  if (entry.raw) values.push(event?.raw_json);
-  return values.filter(Boolean).join("\n").toLocaleLowerCase();
+  entry.searchText = values.filter(Boolean).join("\n").toLowerCase();
+  return entry.searchText;
 }
 
 function matchesTranscriptQuery(entry) {
-  const query = state.transcriptQuery.trim().toLocaleLowerCase();
+  const query = state.transcriptQuery.trim().toLowerCase();
   return !query || itemSearchText(entry).includes(query);
 }
 
@@ -683,16 +713,25 @@ function renderToolActivity(entry) {
   const card = node("div", "tool-card");
   if (entry.tool.call) card.append(toolSection("INPUT", entry.tool.call.body));
   if (entry.tool.result) {
-    const result = toolSection("OUTPUT", entry.tool.result.body);
     if ((entry.tool.result.body || "").length > 900) {
       const disclosure = node("details", "tool-output-disclosure");
-      disclosure.append(
-        node("summary", "", `Output · ${entry.tool.result.body.length.toLocaleString()} characters`),
-        result,
+      disclosure.append(node(
+        "summary",
+        "",
+        `Output · ${entry.tool.result.body.length.toLocaleString()} characters`,
+      ));
+      disclosure.addEventListener(
+        "toggle",
+        () => {
+          if (disclosure.open && disclosure.children.length === 1) {
+            disclosure.append(toolSection("OUTPUT", entry.tool.result.body));
+          }
+        },
+        { once: true },
       );
       card.append(disclosure);
     } else {
-      card.append(result);
+      card.append(toolSection("OUTPUT", entry.tool.result.body));
     }
   } else if (!entry.tool.complete) {
     card.append(node("div", "tool-pending", "Awaiting result"));
@@ -702,17 +741,39 @@ function renderToolActivity(entry) {
   return card;
 }
 
+function appendTranscriptLoader() {
+  const summary = state.activeConversation.summary;
+  const loaded = state.activeConversation.events.length;
+  const remaining = Math.max(0, summary.event_count - loaded);
+  if (!remaining) return;
+  const count = Math.min(EVENT_PAGE_SIZE, remaining);
+  const button = node(
+    "button",
+    "transcript-load-more",
+    state.eventLoading
+      ? "Loading more events…"
+      : `Load ${count} more events · ${remaining.toLocaleString()} remaining`,
+  );
+  button.type = "button";
+  button.disabled = state.eventLoading;
+  button.addEventListener("click", loadMoreEvents);
+  elements.transcript.append(button);
+}
+
 function renderEvents() {
   elements.transcript.replaceChildren();
   elements.transcript.classList.toggle("raw-mode", state.detailsExpanded);
-  const conversationEntries = conversationItems();
+  const conversationEntries = state.conversationEntries;
   for (const button of elements.filterButtons) {
     const filter = button.dataset.transcriptFilter;
     button.setAttribute("aria-pressed", String(filter === state.transcriptFilter));
     button.disabled = state.detailsExpanded;
     const count = itemsForFilter(conversationEntries, filter).length;
     button.querySelector(".filter-count").textContent = String(count);
-    button.setAttribute("aria-label", `${button.firstElementChild.textContent}: ${count} events`);
+    button.setAttribute(
+      "aria-label",
+      `${button.firstElementChild.textContent}: ${count} loaded events`,
+    );
   }
   const visibleEntries = state.detailsExpanded
     ? state.activeConversation.events.map((event) => ({ event, events: [event], raw: true }))
@@ -723,7 +784,7 @@ function renderEvents() {
   elements.transcriptMatchCount.textContent = hasQuery ? String(entries.length) : "";
   elements.transcriptSearch.setAttribute(
     "aria-label",
-    hasQuery ? `Find in transcript; ${entries.length} matches` : "Find in transcript",
+    hasQuery ? `Find in loaded events; ${entries.length} matches` : "Find in loaded events",
   );
   if (!entries.length) {
     elements.transcript.append(node(
@@ -731,12 +792,18 @@ function renderEvents() {
       "no-results transcript-empty",
       hasQuery ? `No events contain “${state.transcriptQuery.trim()}”.` : "No events match this view.",
     ));
-    elements.footerStatus.textContent = `0 visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}`;
+    appendTranscriptLoader();
+    const loaded = state.activeConversation.events.length;
+    const total = state.activeConversation.summary.event_count;
+    elements.footerStatus.textContent = `0 visible · ${loaded}/${total} events loaded`;
     return;
   }
   for (const entry of entries) elements.transcript.append(renderEvent(entry));
+  appendTranscriptLoader();
   const matchStatus = hasQuery ? ` · ${entries.length}/${visibleEntries.length} matches` : "";
-  elements.footerStatus.textContent = `${entries.length} visible · ${state.detailsExpanded ? "raw" : state.transcriptFilter}${matchStatus}`;
+  const loaded = state.activeConversation.events.length;
+  const total = state.activeConversation.summary.event_count;
+  elements.footerStatus.textContent = `${entries.length} visible · ${loaded}/${total} events loaded${matchStatus}`;
 }
 
 function renderEvent(entry) {
@@ -793,15 +860,24 @@ function renderEvent(entry) {
   }
 
   const details = node("div", "entry-details");
-  const seenSequences = new Set();
-  for (const detailEvent of entry.events || [event]) {
-    if (!seenSequences.has(detailEvent.sequence)) details.append(renderEventDetails(detailEvent));
-    seenSequences.add(detailEvent.sequence);
-  }
+  let detailsRendered = false;
+  const ensureDetails = () => {
+    if (detailsRendered) return;
+    const seenSequences = new Set();
+    for (const detailEvent of entry.events || [event]) {
+      if (!seenSequences.has(detailEvent.sequence)) {
+        details.append(renderEventDetails(detailEvent));
+      }
+      seenSequences.add(detailEvent.sequence);
+    }
+    detailsRendered = true;
+  };
+  if (entry.raw) ensureDetails();
   details.classList.toggle("hidden", !entry.raw);
   wrapper.append(details);
   toggle.addEventListener("click", () => {
     const expanded = toggle.getAttribute("aria-expanded") !== "true";
+    if (expanded) ensureDetails();
     toggle.setAttribute("aria-expanded", String(expanded));
     toggle.textContent = expanded ? "hide" : "raw";
     details.classList.toggle("hidden", !expanded);
@@ -903,6 +979,55 @@ function isTypingTarget(target) {
     || target instanceof HTMLSelectElement
     || target instanceof HTMLTextAreaElement
     || target?.isContentEditable;
+}
+
+async function loadMoreEvents() {
+  const detail = state.activeConversation;
+  if (!detail || state.eventLoading) return;
+  const loaded = detail.events.length;
+  if (loaded >= detail.summary.event_count) return;
+
+  const conversationId = detail.summary.id;
+  const requestId = ++state.eventRequest;
+  state.eventController?.abort();
+  const controller = new AbortController();
+  state.eventController = controller;
+  state.eventLoading = true;
+  const loadButton = elements.transcript.querySelector(".transcript-load-more");
+  if (loadButton) {
+    loadButton.disabled = true;
+    loadButton.textContent = "Loading more events…";
+  }
+
+  try {
+    const params = new URLSearchParams({
+      event_limit: String(EVENT_PAGE_SIZE),
+      event_offset: String(loaded),
+    });
+    const page = await request(`/api/conversations/${conversationId}?${params}`, {
+      signal: controller.signal,
+    });
+    if (
+      requestId !== state.eventRequest
+      || state.activeConversation?.summary.id !== conversationId
+    ) return;
+    const seen = new Set(detail.events.map((event) => event.sequence));
+    const newEvents = page.events.filter((event) => !seen.has(event.sequence));
+    detail.events.push(...newEvents);
+    if (!newEvents.length) detail.summary.event_count = detail.events.length;
+    state.conversationEntries = conversationItems();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    showToast(`Could not load more events: ${error.message}`);
+  } finally {
+    if (
+      requestId === state.eventRequest
+      && state.activeConversation?.summary.id === conversationId
+    ) {
+      state.eventLoading = false;
+      renderEvents();
+    }
+  }
 }
 
 async function copyConversationLink() {

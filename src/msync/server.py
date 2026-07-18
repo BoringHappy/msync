@@ -189,8 +189,16 @@ def create_app(
         )
 
     @app.get("/api/conversations/{conversation_id}", response_model=ConversationResponse)
-    def conversation(conversation_id: int) -> Any:
-        result = archive.browse_conversation(conversation_id)
+    def conversation(
+        conversation_id: int,
+        event_limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+        event_offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> Any:
+        result = archive.browse_conversation(
+            conversation_id,
+            event_limit=event_limit,
+            event_offset=event_offset,
+        )
         if result is None:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         return result

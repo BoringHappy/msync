@@ -468,8 +468,19 @@ class Archive:
         with Session(self.engine) as session:
             return [ConversationSummary(*row) for row in session.execute(statement)]
 
-    def browse_conversation(self, conversation_id: int) -> ConversationDetail | None:
-        """Return a conversation and every event needed for normal and expanded views."""
+    def browse_conversation(
+        self,
+        conversation_id: int,
+        *,
+        event_limit: int | None = None,
+        event_offset: int = 0,
+    ) -> ConversationDetail | None:
+        """Return conversation metadata and an optionally bounded event page."""
+
+        if event_limit is not None and (event_limit < 1 or event_limit > 500):
+            raise ValueError("Event limit must be between 1 and 500.")
+        if event_offset < 0:
+            raise ValueError("Event offset must not be negative.")
 
         statement = (
             select(
@@ -497,13 +508,43 @@ class Archive:
             if row is None:
                 return None
 
-            event_rows = list(
-                session.execute(
-                    select(EventRow)
-                    .where(EventRow.conversation_id == conversation_id)
-                    .order_by(EventRow.sequence)
-                ).scalars()
+            event_count, message_count = session.execute(
+                select(
+                    func.count(EventRow.id),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    EventRow.role.in_(("user", "assistant"))
+                                    & (EventRow.searchable_text != ""),
+                                    1,
+                                ),
+                                else_=0,
+                            )
+                        ),
+                        0,
+                    ),
+                ).where(EventRow.conversation_id == conversation_id)
+            ).one()
+            preview = session.scalar(
+                select(EventRow.searchable_text)
+                .where(
+                    EventRow.conversation_id == conversation_id,
+                    EventRow.role == "user",
+                    EventRow.searchable_text != "",
+                )
+                .order_by(EventRow.sequence)
+                .limit(1)
             )
+            event_statement = (
+                select(EventRow)
+                .where(EventRow.conversation_id == conversation_id)
+                .order_by(EventRow.sequence)
+                .offset(event_offset)
+            )
+            if event_limit is not None:
+                event_statement = event_statement.limit(event_limit)
+            event_rows = list(session.execute(event_statement).scalars())
             part_rows = (
                 list(
                     session.execute(
@@ -543,10 +584,6 @@ class Archive:
             )
             for event in event_rows
         )
-        event_count = len(events)
-        message_count = sum(
-            event.role in {"user", "assistant"} and bool(event.text) for event in events
-        )
         summary = ConversationSummary(
             id=row.id,
             location_id=row.location_id,
@@ -562,9 +599,7 @@ class Archive:
             ended_at=row.ended_at,
             event_count=event_count,
             message_count=message_count,
-            preview=next(
-                (event.text for event in events if event.role == "user" and event.text), None
-            ),
+            preview=preview,
         )
         return ConversationDetail(
             summary=summary,

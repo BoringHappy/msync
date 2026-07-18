@@ -288,6 +288,19 @@ kbd { padding: 0 4px; border: 1px solid #444b50; border-radius: 2px; color: var(
 .control-hint { margin-left: 3px; color: var(--dim); font-size: 8px; }
 
 .transcript { padding: 27px 0 12px; }
+.transcript-load-more {
+  width: calc(100% - 30px);
+  min-height: 38px;
+  margin: 8px 0 18px 30px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--accent);
+  background: linear-gradient(90deg, #17130f, var(--panel));
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.transcript-load-more:hover { border-color: #865b3b; background: var(--accent-soft); }
 .event { position: relative; margin: 0 0 22px; padding-left: 30px; }
 .event::before { content: ""; position: absolute; left: 7px; top: 24px; bottom: -25px; width: 1px; background: var(--line-soft); }
 .event:last-child::before { display: none; }
