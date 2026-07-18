@@ -132,6 +132,7 @@ class RemoteTranscript:
     relative_path: str
     content: bytes
     source_mtime_ns: int = 0
+    logical_session_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -664,6 +665,7 @@ class Archive:
         provider: HistoryProvider,
         transcripts: list[Path],
         account_username: str = "",
+        logical_session_ids: dict[str, str] | None = None,
     ) -> UploadResult:
         """Archive changed transcripts from a single source location."""
 
@@ -691,6 +693,11 @@ class Archive:
                                 provider,
                                 path,
                                 account_username=account_username,
+                                logical_session_id=(
+                                    logical_session_ids.get(path.relative_to(root).as_posix())
+                                    if logical_session_ids is not None
+                                    else None
+                                ),
                             )
                     except IntegrityError:
                         if attempt:
@@ -768,6 +775,7 @@ class Archive:
                                 account_username=account_username,
                                 transcript=transcript.content,
                                 source_mtime_ns=transcript.source_mtime_ns,
+                                logical_session_id=transcript.logical_session_id,
                             )
                     except IntegrityError:
                         if attempt:
@@ -1723,6 +1731,7 @@ class Archive:
         account_username: str,
         transcript: bytes | None = None,
         source_mtime_ns: int | None = None,
+        logical_session_id: str | None = None,
     ) -> None:
         transcript = path.read_bytes() if transcript is None else transcript
         content_sha256 = hashlib.sha256(transcript).hexdigest()
@@ -1745,14 +1754,22 @@ class Archive:
             result.unchanged += 1
             return
         if existing is not None and existing.content_sha256 == content_sha256:
+            sidecar_identity_changed = (
+                logical_session_id is not None and existing.logical_session_id != logical_session_id
+            )
             identity = (
                 (existing.logical_session_id, existing.chat_sha256)
-                if existing.logical_session_id is not None
+                if existing.logical_session_id is not None and not sidecar_identity_changed
                 else None
             )
             conversation = None
             if identity is None:
-                conversation = provider.read(path, root, transcript=transcript)
+                conversation = provider.read(
+                    path,
+                    root,
+                    transcript=transcript,
+                    logical_session_id=logical_session_id,
+                )
                 identity = _conversation_identity(conversation)
             duplicate = _find_duplicate_identity(
                 session,
@@ -1775,10 +1792,16 @@ class Archive:
                 existing.metadata_json = _metadata_with_identity(
                     existing.metadata_json, conversation
                 )
+                session.info["archive_changed"] = True
             result.unchanged += 1
             return
 
-        conversation = provider.read(path, root, transcript=transcript)
+        conversation = provider.read(
+            path,
+            root,
+            transcript=transcript,
+            logical_session_id=logical_session_id,
+        )
         duplicate = _find_duplicate_conversation(
             session,
             conversation,

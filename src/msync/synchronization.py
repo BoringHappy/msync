@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import tempfile
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,10 +15,28 @@ from typing import Any
 from uuid import UUID, uuid5
 
 from msync.database import ArchivedConversation
-from msync.providers import HistoryFormatError, HistoryProvider
+from msync.models import Conversation
+from msync.providers import (
+    HistoryFormatError,
+    HistoryProvider,
+    NoTransferableMessagesError,
+)
 
 MANIFEST_NAME = ".msync-manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+_READABLE_MANIFEST_VERSIONS = frozenset({1, MANIFEST_VERSION})
+LOCK_NAME = ".msync.lock"
+WRITER_SCHEMA_VERSION = 1
+
+try:
+    import fcntl as _posix_lock
+except ImportError:  # pragma: no cover - exercised on Windows.
+    _posix_lock = None
+
+try:
+    import msvcrt as _windows_lock
+except ImportError:  # pragma: no cover - exercised on POSIX.
+    _windows_lock = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -31,6 +50,24 @@ class SyncResult:
     skipped: int = 0
     equivalent: int = 0
     conflicts: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class _PendingWrite:
+    """One validated transcript that was absent while building the write plan."""
+
+    relative_key: str
+    output_path: Path
+    content: bytes
+    expected_hash: str
+    source_key: str
+    recognized_source_keys: frozenset[str]
+    sources: frozenset[str]
+    provider: str
+    external_id: str
+    logical_session_id: str
+    chat_sha256: str | None
+    generated: bool
 
 
 def unmanaged_transcripts(root: Path, transcripts: list[Path]) -> list[Path]:
@@ -47,6 +84,38 @@ def unmanaged_transcripts(root: Path, transcripts: list[Path]) -> list[Path]:
     return unmanaged
 
 
+def managed_transcript_logical_session_id(
+    root: Path,
+    path: Path,
+    *,
+    provider: HistoryProvider,
+) -> str | None:
+    """Return sidecar identity only while the path still represents the managed session."""
+
+    try:
+        manifest = _load_manifest(root)
+        relative_path = path.relative_to(root).as_posix()
+    except HistoryFormatError, ValueError:
+        return None
+    entry = manifest["files"].get(relative_path)
+    if not isinstance(entry, dict):
+        return None
+    expected_external_id = entry.get("external_id")
+    if entry.get("provider") != provider.name or not isinstance(expected_external_id, str):
+        return None
+    value = entry.get("logical_session_id")
+    if not isinstance(value, str):
+        return None
+    try:
+        logical_session_id = str(UUID(value))
+        conversation = provider.read(path, root)
+    except HistoryFormatError, OSError, ValueError:
+        return None
+    if conversation.external_id != expected_external_id:
+        return None
+    return logical_session_id
+
+
 def sync_conversations(
     conversations: list[ArchivedConversation],
     *,
@@ -58,6 +127,24 @@ def sync_conversations(
 
     destination = destination.expanduser().resolve()
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _destination_lock(destination):
+        return _sync_conversations_locked(
+            conversations,
+            destination=destination,
+            provider=provider,
+            current_hostname=current_hostname,
+        )
+
+
+def _sync_conversations_locked(
+    conversations: list[ArchivedConversation],
+    *,
+    destination: Path,
+    provider: HistoryProvider,
+    current_hostname: str,
+) -> SyncResult:
+    """Plan, validate, and commit one destination while holding its manifest lock."""
+
     manifest = _load_manifest(destination)
     files: dict[str, dict[str, Any]] = manifest["files"]
     existing_revisions = _manifest_revision_paths(destination, provider, files)
@@ -69,6 +156,7 @@ def sync_conversations(
     )
     written = unchanged = protected = skipped = 0
     conflicts: list[str] = []
+    pending: list[_PendingWrite] = []
 
     for archived in selected:
         conversation = archived.conversation
@@ -90,11 +178,21 @@ def sync_conversations(
             entry = files[legacy_path]
             sources = set(entry.get("sources", []))
             sources.add(source_key)
-            entry["sources"] = sorted(sources)
+            _update_manifest_entry(
+                entry,
+                expected_hash=entry.get("sha256"),
+                sources=sources,
+                provider=provider.name,
+                external_id=entry.get("external_id"),
+                logical_session_id=conversation.logical_session_id,
+                chat_sha256=conversation.chat_sha256,
+                generated=bool(entry.get("generated", True)),
+            )
             unchanged += 1
             continue
         session_id = str(uuid5(UUID(conversation.logical_session_id), revision_hash))
         started_at = _started_at(archived)
+        generated = False
         if conversation.provider == provider.name:
             relative_path = Path(conversation.relative_path)
             content = conversation.transcript
@@ -110,9 +208,10 @@ def sync_conversations(
                         started_at=started_at,
                         source_key=source_key,
                     )
-                except ValueError:
+                except NoTransferableMessagesError:
                     skipped += 1
                     continue
+                generated = True
                 relative_path = provider.export_relative_path(
                     conversation,
                     session_id=session_id,
@@ -126,9 +225,10 @@ def sync_conversations(
                     started_at=started_at,
                     source_key=source_key,
                 )
-            except ValueError:
+            except NoTransferableMessagesError:
                 skipped += 1
                 continue
+            generated = True
             relative_path = provider.export_relative_path(
                 conversation,
                 session_id=session_id,
@@ -136,6 +236,18 @@ def sync_conversations(
             )
 
         relative_key, output_path = _destination_path(destination, relative_path)
+        validated = provider.validate_transcript(
+            output_path,
+            destination,
+            transcript=content,
+            logical_session_id=conversation.logical_session_id,
+            strict_export=generated,
+        )
+        _verify_candidate_identity(
+            validated,
+            source=conversation,
+            expected_external_id=session_id if generated else conversation.external_id,
+        )
         expected_hash = hashlib.sha256(content).hexdigest()
         entry = files.get(relative_key)
         if not isinstance(entry, dict):
@@ -143,9 +255,22 @@ def sync_conversations(
         sources = set(entry.get("sources", [])) if entry else set()
 
         if output_path.exists():
+            if output_path.is_symlink() or not output_path.is_file():
+                conflicts.append(relative_key)
+                continue
             actual_hash = _file_hash(output_path)
             if actual_hash == expected_hash:
                 unchanged += 1
+                sources.add(source_key)
+                files[relative_key] = _new_manifest_entry(
+                    expected_hash=expected_hash,
+                    sources=sources,
+                    provider=provider.name,
+                    external_id=validated.external_id,
+                    logical_session_id=conversation.logical_session_id,
+                    chat_sha256=conversation.chat_sha256,
+                    generated=generated,
+                )
             elif recognized_source_keys.intersection(sources):
                 protected += 1
                 continue
@@ -153,13 +278,57 @@ def sync_conversations(
                 conflicts.append(relative_key)
                 continue
         else:
-            _atomic_write(output_path, content, destination=destination)
-            written += 1
+            pending.append(
+                _PendingWrite(
+                    relative_key=relative_key,
+                    output_path=output_path,
+                    content=content,
+                    expected_hash=expected_hash,
+                    source_key=source_key,
+                    recognized_source_keys=frozenset(recognized_source_keys),
+                    sources=frozenset(sources),
+                    provider=provider.name,
+                    external_id=validated.external_id,
+                    logical_session_id=conversation.logical_session_id,
+                    chat_sha256=conversation.chat_sha256,
+                    generated=generated,
+                )
+            )
 
-        sources.add(source_key)
-        files[relative_key] = {"sha256": expected_hash, "sources": sorted(sources)}
+    created: list[_PendingWrite] = []
+    try:
+        for candidate in pending:
+            if _atomic_create(
+                candidate.output_path,
+                candidate.content,
+                destination=destination,
+            ):
+                written += 1
+                created.append(candidate)
+                sources = set(candidate.sources)
+                sources.add(candidate.source_key)
+                files[candidate.relative_key] = _new_manifest_entry(
+                    expected_hash=candidate.expected_hash,
+                    sources=sources,
+                    provider=candidate.provider,
+                    external_id=candidate.external_id,
+                    logical_session_id=candidate.logical_session_id,
+                    chat_sha256=candidate.chat_sha256,
+                    generated=candidate.generated,
+                )
+                continue
 
-    _write_manifest(destination, manifest)
+            outcome = _classify_raced_target(candidate, files)
+            if outcome == "unchanged":
+                unchanged += 1
+            elif outcome == "protected":
+                protected += 1
+            else:
+                conflicts.append(candidate.relative_key)
+        _write_manifest(destination, manifest)
+    except BaseException:
+        _rollback_created_transcripts(created)
+        raise
     return SyncResult(
         current=current,
         written=written,
@@ -169,6 +338,115 @@ def sync_conversations(
         equivalent=equivalent,
         conflicts=tuple(conflicts),
     )
+
+
+def _verify_candidate_identity(
+    validated: Conversation,
+    *,
+    source: Conversation,
+    expected_external_id: str,
+) -> None:
+    """Ensure schema-valid bytes still represent exactly the intended chat revision."""
+
+    if validated.external_id != expected_external_id:
+        raise HistoryFormatError(
+            "Generated transcript session identity changed during provider round-trip."
+        )
+    if validated.logical_session_id != source.logical_session_id:
+        raise HistoryFormatError(
+            "Generated transcript logical identity changed during provider round-trip."
+        )
+    if validated.chat_sha256 != source.chat_sha256:
+        raise HistoryFormatError(
+            "Generated transcript message content changed during provider round-trip."
+        )
+
+
+def _new_manifest_entry(
+    *,
+    expected_hash: str,
+    sources: set[str],
+    provider: str,
+    external_id: str,
+    logical_session_id: str,
+    chat_sha256: str | None,
+    generated: bool,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {}
+    _update_manifest_entry(
+        entry,
+        expected_hash=expected_hash,
+        sources=sources,
+        provider=provider,
+        external_id=external_id,
+        logical_session_id=logical_session_id,
+        chat_sha256=chat_sha256,
+        generated=generated,
+    )
+    return entry
+
+
+def _update_manifest_entry(
+    entry: dict[str, Any],
+    *,
+    expected_hash: Any,
+    sources: set[str],
+    provider: str,
+    external_id: Any,
+    logical_session_id: str,
+    chat_sha256: str | None,
+    generated: bool,
+) -> None:
+    if isinstance(expected_hash, str):
+        entry["sha256"] = expected_hash
+    entry["sources"] = sorted(source for source in sources if isinstance(source, str))
+    entry["provider"] = provider
+    if isinstance(external_id, str):
+        entry["external_id"] = external_id
+    entry["logical_session_id"] = logical_session_id
+    entry["chat_sha256"] = chat_sha256
+    entry["generated"] = generated
+    if generated:
+        entry["writer_schema_version"] = WRITER_SCHEMA_VERSION
+    else:
+        entry.pop("writer_schema_version", None)
+
+
+def _classify_raced_target(
+    candidate: _PendingWrite,
+    files: dict[str, dict[str, Any]],
+) -> str:
+    """Classify a path that appeared after planning without ever replacing it."""
+
+    path = candidate.output_path
+    if path.is_symlink() or not path.is_file() or _file_hash(path) != candidate.expected_hash:
+        entry = files.get(candidate.relative_key)
+        sources = set(entry.get("sources", [])) if isinstance(entry, dict) else set()
+        if candidate.recognized_source_keys.intersection(sources):
+            return "protected"
+        return "conflict"
+    sources = set(candidate.sources)
+    sources.add(candidate.source_key)
+    files[candidate.relative_key] = _new_manifest_entry(
+        expected_hash=candidate.expected_hash,
+        sources=sources,
+        provider=candidate.provider,
+        external_id=candidate.external_id,
+        logical_session_id=candidate.logical_session_id,
+        chat_sha256=candidate.chat_sha256,
+        generated=candidate.generated,
+    )
+    return "unchanged"
+
+
+def _rollback_created_transcripts(created: list[_PendingWrite]) -> None:
+    """Remove only untouched files created by the failed manifest transaction."""
+
+    for candidate in reversed(created):
+        path = candidate.output_path
+        with suppress(OSError):
+            if path.is_file() and _file_hash(path) == candidate.expected_hash:
+                path.unlink()
 
 
 def _manifest_revision_paths(
@@ -189,10 +467,19 @@ def _manifest_revision_paths(
         if not path.is_file():
             continue
         try:
-            conversation = provider.read(path, destination)
+            logical_session_id = entry.get("logical_session_id")
+            conversation = provider.read(
+                path,
+                destination,
+                logical_session_id=(
+                    logical_session_id if isinstance(logical_session_id, str) else None
+                ),
+            )
         except HistoryFormatError, OSError:
             continue
         if conversation.chat_sha256 is not None:
+            entry["external_id"] = conversation.external_id
+            entry["provider"] = provider.name
             revisions.setdefault(
                 (conversation.logical_session_id, conversation.chat_sha256),
                 relative_key,
@@ -319,20 +606,32 @@ def _load_manifest(root: Path) -> dict[str, Any]:
         raise HistoryFormatError(f"Could not read sync manifest {path}: {error}") from error
     if (
         not isinstance(value, dict)
-        or value.get("version") != MANIFEST_VERSION
+        or value.get("version") not in _READABLE_MANIFEST_VERSIONS
         or not isinstance(value.get("files"), dict)
     ):
         raise HistoryFormatError(f"Unsupported or invalid sync manifest: {path}")
+    # Version 1 embedded msync identity in generated native records. Version 2
+    # keeps native records clean and carries that identity in the manifest.
+    # Read version 1 for migration, but always write version 2 so older clients
+    # fail safely instead of silently dropping the sidecar identity.
     return value
 
 
 def _write_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    manifest["version"] = MANIFEST_VERSION
     content = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    _atomic_write(root / MANIFEST_NAME, content, destination=root)
+    _atomic_replace(root / MANIFEST_NAME, content, destination=root)
 
 
-def _destination_path(destination: Path, relative_path: Path) -> tuple[str, Path]:
+def _destination_path(
+    destination: Path,
+    relative_path: Path,
+    *,
+    allow_reserved: bool = False,
+) -> tuple[str, Path]:
     relative_key = _safe_relative_path(relative_path)
+    if not allow_reserved and relative_key in {MANIFEST_NAME, LOCK_NAME}:
+        raise HistoryFormatError(f"Provider generated an unsafe transcript path: {relative_path}")
     path = destination
     for part in Path(relative_key).parts:
         path /= part
@@ -343,7 +642,41 @@ def _destination_path(destination: Path, relative_path: Path) -> tuple[str, Path
     return relative_key, path
 
 
-def _atomic_write(path: Path, content: bytes, *, destination: Path) -> None:
+@contextmanager
+def _destination_lock(destination: Path) -> Iterator[None]:
+    """Serialize msync writers so manifest updates cannot clobber each other."""
+
+    _, path = _destination_path(destination, Path(LOCK_NAME), allow_reserved=True)
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        if _posix_lock is not None:
+            _posix_lock.flock(descriptor, _posix_lock.LOCK_EX)
+        elif _windows_lock is not None:  # pragma: no cover - exercised on Windows.
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _windows_lock.locking(descriptor, _windows_lock.LK_LOCK, 1)
+        else:  # pragma: no cover - supported Python platforms provide one implementation.
+            raise RuntimeError("This platform does not provide a supported file lock.")
+        yield
+    finally:
+        if _posix_lock is not None:
+            with suppress(OSError):
+                _posix_lock.flock(descriptor, _posix_lock.LOCK_UN)
+        elif _windows_lock is not None:  # pragma: no cover - exercised on Windows.
+            with suppress(OSError):
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                _windows_lock.locking(descriptor, _windows_lock.LK_UNLCK, 1)
+        os.close(descriptor)
+
+
+def _atomic_create(path: Path, content: bytes, *, destination: Path) -> bool:
+    """Atomically create a transcript without replacing a path that appears concurrently."""
+
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _destination_path(destination, path.relative_to(destination))
     descriptor, temporary_name = tempfile.mkstemp(prefix=".msync-", dir=path.parent)
@@ -355,13 +688,40 @@ def _atomic_write(path: Path, content: bytes, *, destination: Path) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         _destination_path(destination, path.relative_to(destination))
-        os.replace(temporary_path, path)
-        os.chmod(path, 0o600)
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        return True
     except BaseException:
         with suppress(OSError):
             os.close(descriptor)
-        temporary_path.unlink(missing_ok=True)
         raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_replace(path: Path, content: bytes, *, destination: Path) -> None:
+    """Atomically replace an msync-owned metadata file."""
+
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _destination_path(destination, path.relative_to(destination), allow_reserved=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".msync-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _destination_path(destination, path.relative_to(destination), allow_reserved=True)
+        os.replace(temporary_path, path)
+    except BaseException:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _file_hash(path: Path) -> str:

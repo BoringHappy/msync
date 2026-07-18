@@ -4,6 +4,8 @@ from msync.schemas.claude import (
     ClaudeAssistantMessage,
     ClaudeAssistantRecord,
     ClaudeContentBlock,
+    ClaudeGeneratedContentBlock,
+    ClaudeGeneratedUsage,
     ClaudeMessage,
     ClaudeRecord,
     ClaudeSyncProvenance,
@@ -13,9 +15,12 @@ from msync.schemas.claude import (
 )
 from msync.schemas.codex import (
     CodexContentBlock,
+    CodexEventMessageLine,
     CodexEventMessagePayload,
+    CodexResponseMessageLine,
     CodexResponseMessagePayload,
     CodexRolloutLine,
+    CodexSessionMetaLine,
     CodexSessionMetaPayload,
     CodexSyncProvenance,
 )
@@ -24,6 +29,8 @@ __all__ = [
     "ClaudeAssistantMessage",
     "ClaudeAssistantRecord",
     "ClaudeContentBlock",
+    "ClaudeGeneratedContentBlock",
+    "ClaudeGeneratedUsage",
     "ClaudeMessage",
     "ClaudeRecord",
     "ClaudeSyncProvenance",
@@ -31,9 +38,12 @@ __all__ = [
     "ClaudeUserMessage",
     "ClaudeUserRecord",
     "CodexContentBlock",
+    "CodexEventMessageLine",
     "CodexEventMessagePayload",
     "CodexResponseMessagePayload",
+    "CodexResponseMessageLine",
     "CodexRolloutLine",
     "CodexSessionMetaPayload",
+    "CodexSessionMetaLine",
     "CodexSyncProvenance",
 ]

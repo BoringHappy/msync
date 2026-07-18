@@ -17,6 +17,7 @@ from msync.database import Archive
 from msync.providers import get_provider
 from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata
 from msync.server import ServerAccount, create_app
+from msync.synchronization import MANIFEST_NAME
 
 REMOTE_URL = "https://history.example"
 REMOTE_TOKEN = "cli-token"
@@ -236,6 +237,30 @@ def test_upload_sends_native_transcripts_to_remote_server(
         session_id="second-remote-session",
         filename="second.jsonl",
     )
+    managed_logical_session_id = "019f61a0-0000-7000-8000-000000000099"
+    (root / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "files": {
+                    transcript.relative_to(root).as_posix(): {
+                        "sha256": "continued-files-use-the-path-sidecar",
+                        "sources": [],
+                        "provider": "codex",
+                        "external_id": "remote-session",
+                        "logical_session_id": managed_logical_session_id,
+                    },
+                    second_transcript.relative_to(root).as_posix(): {
+                        "sha256": "a-replaced-path-must-not-use-the-sidecar",
+                        "sources": [],
+                        "provider": "codex",
+                        "external_id": "different-session-at-this-path",
+                        "logical_session_id": managed_logical_session_id,
+                    },
+                },
+            }
+        )
+    )
     captured: list[dict[str, Any]] = []
 
     def fake_post(
@@ -314,6 +339,9 @@ def test_upload_sends_native_transcripts_to_remote_server(
         assert metadata.hostname == "alice-laptop"
         assert metadata.root_path == str(root.resolve())
         assert metadata.relative_path == relative_path
+        assert (
+            str(metadata.logical_session_id) if metadata.logical_session_id is not None else None
+        ) == (managed_logical_session_id if relative_path == "sessions/rollout.jsonl" else None)
         assert request["body"][4 + metadata_length :] == transcript_content
 
 

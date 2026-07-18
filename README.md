@@ -114,8 +114,16 @@ results to the current repository and never passes the token on the command line
 3. Keeps sessions separate and resumable.
 
 Running it again is safe: unchanged and duplicate conversations are skipped, and existing native
-transcripts are not overwritten. Generated histories contain a `.msync-manifest.json` file so they
-are not imported again.
+transcripts are not overwritten. Before writing anything, generated transcripts are validated
+against msync's strict writer schema for the destination client and read back to verify their
+conversation identity and message content. Each history directory is locked while its sync plan is
+committed, and files are created with no-clobber semantics so a concurrent user or client write wins
+safely.
+
+Generated histories contain a `.msync-manifest.json` sidecar. It records hashes and msync's logical
+session identity without adding private fields to Claude or Codex records, keeping the generated
+JSONL within the native client schema. Do not delete the manifest if you want later uploads and
+cross-provider syncs to retain the same session identity.
 
 Use another server explicitly with `--url`; regular use should rely on `MSYNC_ENDPOINT` so secrets
 and server addresses do not need to be repeated:

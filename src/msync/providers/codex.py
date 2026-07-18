@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,9 @@ from pydantic import ValidationError
 from msync.models import Conversation, Event
 from msync.providers.base import (
     ConversationDetails,
+    HistoryFormatError,
     HistoryProvider,
+    NoTransferableMessagesError,
     as_string,
     canonical_session_id,
     display_events,
@@ -22,9 +25,12 @@ from msync.providers.base import (
 )
 from msync.schemas.codex import (
     CodexContentBlock,
+    CodexEventMessageLine,
     CodexEventMessagePayload,
+    CodexResponseMessageLine,
     CodexResponseMessagePayload,
     CodexRolloutLine,
+    CodexSessionMetaLine,
     CodexSessionMetaPayload,
 )
 
@@ -115,17 +121,19 @@ class CodexProvider(HistoryProvider):
         started_at: datetime,
         source_key: str,
     ) -> bytes:
+        del source_key
         events = display_events(conversation)
         if not events:
-            raise ValueError("conversation has no displayable user or assistant messages")
+            raise NoTransferableMessagesError(
+                "conversation has no displayable user or assistant messages"
+            )
 
         utc_started_at = started_at.astimezone(UTC)
         timestamp = utc_started_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
         git = {"branch": conversation.git_branch} if conversation.git_branch else None
-        records: list[CodexRolloutLine] = [
-            CodexRolloutLine(
+        records = [
+            CodexSessionMetaLine(
                 timestamp=timestamp,
-                type="session_meta",
                 payload=CodexSessionMetaPayload(
                     session_id=session_id,
                     id=session_id,
@@ -133,12 +141,6 @@ class CodexProvider(HistoryProvider):
                     cwd=conversation.cwd or str(Path.home()),
                     model_provider="openai",
                     git=git,
-                    msync={
-                        "source_provider": conversation.provider,
-                        "source_conversation_id": conversation.external_id,
-                        "source_key": source_key,
-                        "logical_session_id": conversation.logical_session_id,
-                    },
                 ),
             )
         ]
@@ -148,17 +150,15 @@ class CodexProvider(HistoryProvider):
             if event.role == "user":
                 records.extend(
                     [
-                        CodexRolloutLine(
+                        CodexResponseMessageLine(
                             timestamp=occurred_at,
-                            type="response_item",
                             payload=CodexResponseMessagePayload(
                                 role="user",
                                 content=[CodexContentBlock(type="input_text", text=text)],
                             ),
                         ),
-                        CodexRolloutLine(
+                        CodexEventMessageLine(
                             timestamp=occurred_at,
-                            type="event_msg",
                             payload=CodexEventMessagePayload(
                                 type="user_message",
                                 message=text,
@@ -172,18 +172,16 @@ class CodexProvider(HistoryProvider):
             else:
                 records.extend(
                     [
-                        CodexRolloutLine(
+                        CodexEventMessageLine(
                             timestamp=occurred_at,
-                            type="event_msg",
                             payload=CodexEventMessagePayload(
                                 type="agent_message",
                                 message=text,
                                 phase="final_answer",
                             ),
                         ),
-                        CodexRolloutLine(
+                        CodexResponseMessageLine(
                             timestamp=occurred_at,
-                            type="response_item",
                             payload=CodexResponseMessagePayload(
                                 role="assistant",
                                 content=[CodexContentBlock(type="output_text", text=text)],
@@ -192,6 +190,59 @@ class CodexProvider(HistoryProvider):
                     ]
                 )
         return encode_jsonl(records)
+
+    def validate_export_schema(self, transcript: bytes) -> None:
+        """Validate generated rollout envelopes and their discriminated payloads."""
+
+        record_count = 0
+        session_meta_count = 0
+        for line_number, raw_line in enumerate(transcript.splitlines(), start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                value = json.loads(raw_line)
+                if not isinstance(value, dict):
+                    raise ValueError("record is not a JSON object")
+                record_type = value.get("type")
+                payload = value.get("payload")
+                payload_type = payload.get("type") if isinstance(payload, dict) else None
+                if record_type == "session_meta":
+                    CodexSessionMetaLine.model_validate(value)
+                    session_meta_count += 1
+                    if record_count:
+                        raise ValueError("session_meta must be the first generated record")
+                    if payload.get("id") != payload.get("session_id"):
+                        raise ValueError("session_meta id and session_id must match")
+                elif record_type == "response_item" and payload_type == "message":
+                    line = CodexResponseMessageLine.model_validate(value)
+                    expected_content_type = (
+                        "input_text" if line.payload.role == "user" else "output_text"
+                    )
+                    if any(block.type != expected_content_type for block in line.payload.content):
+                        raise ValueError(
+                            f"{line.payload.role} messages require {expected_content_type} blocks"
+                        )
+                elif record_type == "event_msg" and payload_type in {
+                    "user_message",
+                    "agent_message",
+                }:
+                    line = CodexEventMessageLine.model_validate(value)
+                    if line.payload.type == "user_message" and line.payload.phase is not None:
+                        raise ValueError("user_message events cannot declare an assistant phase")
+                else:
+                    raise ValueError(
+                        f"unsupported generated Codex record {record_type!r}/{payload_type!r}"
+                    )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as error:
+                detail = " ".join(str(error).split())
+                raise HistoryFormatError(
+                    f"generated Codex transcript line {line_number} is invalid: {detail}"
+                ) from error
+            record_count += 1
+        if not record_count:
+            raise HistoryFormatError("generated Codex transcript contains no records")
+        if session_meta_count != 1:
+            raise HistoryFormatError("generated Codex transcript requires exactly one session_meta")
 
     def export_relative_path(
         self,

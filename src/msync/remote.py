@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from pydantic import BaseModel, ConfigDict, Field
 
 UPLOAD_CONTENT_TYPE = "application/vnd.msync.transcript"
@@ -23,12 +25,13 @@ class RemoteUploadMetadata(BaseModel):
     display_name: str = Field(min_length=1, max_length=255)
     relative_path: str = Field(min_length=1, max_length=4096)
     source_mtime_ns: int = Field(default=0, ge=0, le=2**63 - 1)
+    logical_session_id: UUID | None = None
 
 
 def encode_upload_prefix(metadata: RemoteUploadMetadata) -> bytes:
     """Encode the length-prefixed JSON metadata that starts an upload body."""
 
-    payload = metadata.model_dump_json().encode("utf-8")
+    payload = metadata.model_dump_json(exclude_none=True).encode("utf-8")
     if len(payload) > UPLOAD_METADATA_MAX_BYTES:
         raise ValueError("Remote upload metadata exceeds 64 KiB.")
     return len(payload).to_bytes(4, byteorder="big") + payload

@@ -21,6 +21,10 @@ class HistoryFormatError(ValueError):
     """Raised when a history provider cannot be identified or loaded."""
 
 
+class NoTransferableMessagesError(ValueError):
+    """Raised when a conversation cannot produce a useful native transcript."""
+
+
 @dataclass(slots=True)
 class ConversationDetails:
     """Provider-specific session fields normalized into the common schema."""
@@ -117,12 +121,18 @@ class HistoryProvider(ABC):
         del conversation, session_id, started_at
         raise HistoryFormatError(f"Provider {self.name!r} does not support transcript export.")
 
+    def validate_export_schema(self, transcript: bytes) -> None:
+        """Validate the strict record subset emitted by this provider."""
+
+        del transcript
+
     def read(
         self,
         path: Path,
         root: Path,
         *,
         transcript: bytes | None = None,
+        logical_session_id: str | None = None,
     ) -> Conversation:
         """Read one transcript while retaining its exact source bytes."""
 
@@ -131,7 +141,7 @@ class HistoryProvider(ABC):
         relative_path = path.relative_to(root).as_posix()
         details = self.conversation_details(events, path, relative_path)
         logical_session_id = normalized_session_id(
-            details.logical_session_id,
+            logical_session_id or details.logical_session_id,
             provider=self.name,
             external_id=details.external_id,
         )
@@ -156,6 +166,36 @@ class HistoryProvider(ABC):
             started_at=min(timestamps) if timestamps else None,
             ended_at=max(timestamps) if timestamps else None,
         )
+
+    def validate_transcript(
+        self,
+        path: Path,
+        root: Path,
+        *,
+        transcript: bytes,
+        logical_session_id: str | None = None,
+        strict_export: bool = False,
+    ) -> Conversation:
+        """Fail closed when candidate bytes cannot be read as a native transcript."""
+
+        if strict_export:
+            self.validate_export_schema(transcript)
+        conversation = self.read(
+            path,
+            root,
+            transcript=transcript,
+            logical_session_id=logical_session_id,
+        )
+        if not conversation.events:
+            raise HistoryFormatError("generated transcript contains no JSON records")
+        invalid_events = [event for event in conversation.events if event.parse_error]
+        if invalid_events:
+            first = invalid_events[0]
+            detail = " ".join((first.parse_error or "invalid record").split())
+            raise HistoryFormatError(
+                f"generated transcript line {first.sequence + 1} is invalid: {detail}"
+            )
+        return conversation
 
     def _decode_events(self, transcript: bytes) -> Iterable[Event]:
         for sequence, raw_line in enumerate(transcript.splitlines()):

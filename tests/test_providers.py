@@ -66,6 +66,19 @@ def test_provider_name_containment_is_checked_before_internal_layout(
     assert registry.detect(root).name == expected
 
 
+def test_provider_detection_rejects_conflicting_name_and_native_content(tmp_path: Path) -> None:
+    root = tmp_path / ".claude"
+    path = root / "sessions/2026/07/14/rollout.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "codex-session"}}) + "\n")
+    registry = ProviderRegistry((get_provider("claude"), get_provider("codex")))
+
+    with pytest.raises(
+        HistoryFormatError, match="name suggests claude, but its content matches codex"
+    ):
+        registry.detect(root)
+
+
 @pytest.mark.parametrize(
     ("subdirectory", "record", "expected"),
     [
