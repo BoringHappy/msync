@@ -264,8 +264,8 @@ $ MSYNC_SERVER_PASSWORD='secret' msync server \
 
 `MSYNC_SERVER_USERNAME` can also set the username. If the password environment variable is absent,
 the command prompts without echoing the password. The default loopback address keeps the browser
-local. HTTP Basic credentials are not encrypted in transit, so put msync behind an HTTPS reverse
-proxy before binding it to a network-accessible address.
+local. The sign-in form sends credentials to the server before creating an HTTP-only session
+cookie; put msync behind an HTTPS reverse proxy before binding it to a network-accessible address.
 
 For a shared server, configure multiple accounts in `username,password[,token]` format, separated
 by semicolons:
@@ -277,10 +277,12 @@ $ MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web
 
 The same value can be passed with `--accounts`. Commas and semicolons are delimiters and therefore
 cannot appear inside usernames, passwords, or tokens; usernames and tokens must also be unique.
-Every account can sign in to the browser with HTTP Basic authentication. The optional third field
-enables Bearer-token uploads for that account. An entry with only username and password, such as
-`bob` above, is browser-only and cannot upload remotely. The username is also the persistent tenant
+Every account can sign in through the browser login page. The optional third field enables
+Bearer-token uploads for that account. An entry with only username and password, such as `bob`
+above, is browser-only and cannot upload remotely. The username is also the persistent tenant
 identifier in the archive, so keep it stable; passwords and tokens can be rotated independently.
+Programmatic browser API clients can continue to send those credentials with HTTP Basic
+authentication.
 
 Locations, conversations, duplicate detection, list results, and conversation-detail lookups are
 isolated by account. A user cannot discover or fetch another user's conversation by guessing its

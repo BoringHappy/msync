@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Sign in · msync</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body class="login-page">
+    <div class="scanline" aria-hidden="true"></div>
+    <header class="topbar login-topbar">
+      <a class="brand" href="/login" aria-label="msync sign in">
+        <span class="brand-mark">◇</span>
+        <span>msync</span><span class="brand-dim">// history</span>
+      </a>
+      <div class="top-status"><span class="status-light login-status-light"></span> authentication required</div>
+    </header>
+
+    <main class="login-shell">
+      <section class="login-card" aria-labelledby="login-title">
+        <div class="login-card-heading">
+          <span class="prompt">›</span>
+          <span>msync / secure archive</span>
+        </div>
+        <div class="login-card-body">
+          <div class="login-glyph" aria-hidden="true">◇</div>
+          <h1 id="login-title">Sign in to your archive</h1>
+          <p class="login-intro">Enter your msync account credentials to browse coding sessions.</p>
+
+          <form class="login-form" action="/login" method="post">
+            <input type="hidden" name="next" value="__MSYNC_NEXT__">
+            <label for="username">USERNAME</label>
+            <div class="login-input">
+              <span aria-hidden="true">›</span>
+              <input id="username" name="username" type="text" autocomplete="username" maxlength="255" required autofocus spellcheck="false">
+            </div>
+            <label for="password">PASSWORD</label>
+            <div class="login-input">
+              <span aria-hidden="true">›</span>
+              <input id="password" name="password" type="password" autocomplete="current-password" required>
+            </div>
+            __MSYNC_LOGIN_ERROR__
+            <button class="terminal-button login-submit" type="submit">
+              <span>Unlock archive</span>
+              <span aria-hidden="true">→</span>
+            </button>
+          </form>
+        </div>
+        <footer class="login-card-footer">
+          <span><span class="status-light"></span> signed session cookie</span>
+          <span>Claude + Codex history</span>
+        </footer>
+      </section>
+    </main>
+  </body>
+</html>

@@ -158,24 +158,87 @@ def _archive_claude_tool_conversation(database: Path, root: Path) -> None:
         archive.upload(root=root, provider=get_provider("claude"), transcripts=[transcript])
 
 
-def test_server_requires_basic_auth_for_ui_and_api(tmp_path: Path) -> None:
+def test_server_uses_login_session_and_redirects_unauthenticated_pages(tmp_path: Path) -> None:
     web_app = create_app(tmp_path / "archive.sqlite", username="reader", password="secret")
 
     with TestClient(web_app) as client:
-        page = client.get("/")
+        page = client.get("/?conversation=42&order=oldest", follow_redirects=False)
+        login_page = client.get(page.headers["location"])
         api = client.get("/api/locations")
-        wrong = client.get("/", auth=("reader", "wrong"))
+        wrong = client.post(
+            "/login",
+            data={"username": "reader", "password": "wrong", "next": "/"},
+        )
+        signed_in = client.post(
+            "/login",
+            data={
+                "username": "reader",
+                "password": "secret",
+                "next": "/?conversation=42&order=oldest",
+            },
+            follow_redirects=False,
+        )
+        authenticated_page = client.get("/")
+        authenticated_api = client.get("/api/locations")
+        signed_out = client.post("/logout", follow_redirects=False)
+        page_after_logout = client.get("/", follow_redirects=False)
+        basic_api = client.get("/api/locations", auth=("reader", "secret"))
 
-    assert page.status_code == 401
-    assert page.headers["www-authenticate"].startswith("Basic")
+    assert page.status_code == 303
+    assert page.headers["location"] == ("/login?next=%2F%3Fconversation%3D42%26order%3Doldest")
+    assert login_page.status_code == 200
+    assert "Sign in to your archive" in login_page.text
+    assert 'value="/?conversation=42&amp;order=oldest"' in login_page.text
     assert api.status_code == 401
+    assert "www-authenticate" not in api.headers
     assert wrong.status_code == 401
+    assert "The username or password is incorrect." in wrong.text
+    assert signed_in.status_code == 303
+    assert signed_in.headers["location"] == "/?conversation=42&order=oldest"
+    assert "msync_session=" in signed_in.headers["set-cookie"]
+    assert "HttpOnly" in signed_in.headers["set-cookie"]
+    assert "SameSite=lax" in signed_in.headers["set-cookie"]
+    assert authenticated_page.status_code == 200
+    assert authenticated_api.status_code == 200
+    assert signed_out.status_code == 303
+    assert signed_out.headers["location"] == "/login"
+    assert page_after_logout.status_code == 303
+    assert basic_api.status_code == 200
+
+
+def test_server_login_rejects_unsafe_redirects_and_tampered_sessions(tmp_path: Path) -> None:
+    web_app = create_app(tmp_path / "archive.sqlite", username="reader", password="secret")
+
+    with TestClient(web_app) as client:
+        unsafe_page = client.get("/login", params={"next": "//example.com/archive"})
+        signed_in = client.post(
+            "/login",
+            data={
+                "username": "reader",
+                "password": "secret",
+                "next": "//example.com/archive",
+            },
+            follow_redirects=False,
+        )
+        session_cookie = client.cookies.get("msync_session")
+
+    with TestClient(web_app) as tampered_client:
+        tampered = tampered_client.get(
+            "/",
+            headers={"Cookie": f"msync_session={session_cookie}x"},
+            follow_redirects=False,
+        )
+
+    assert 'name="next" value="/"' in unsafe_page.text
+    assert signed_in.status_code == 303
+    assert signed_in.headers["location"] == "/"
+    assert session_cookie is not None
+    assert tampered.status_code == 303
+    assert tampered.headers["location"] == "/login?next=%2F"
 
 
 def test_server_account_configuration_accepts_optional_tokens() -> None:
-    accounts = parse_server_accounts(
-        "user1,password1,token1;user2,password2;user3,password3,"
-    )
+    accounts = parse_server_accounts("user1,password1,token1;user2,password2;user3,password3,")
 
     assert accounts == (
         ServerAccount("user1", "password1", "token1"),
@@ -262,12 +325,8 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
         alice_locations = client.get("/api/locations", auth=("alice", "alice-password"))
         bob_locations = client.get("/api/locations", auth=("bob", "bob-password"))
         carol_locations = client.get("/api/locations", auth=("carol", "carol-password"))
-        alice_conversations = client.get(
-            "/api/conversations", auth=("alice", "alice-password")
-        )
-        carol_conversations = client.get(
-            "/api/conversations", auth=("carol", "carol-password")
-        )
+        alice_conversations = client.get("/api/conversations", auth=("alice", "alice-password"))
+        carol_conversations = client.get("/api/conversations", auth=("carol", "carol-password"))
         carol_conversation_id = carol_conversations.json()[0]["id"]
         cross_account_detail = client.get(
             f"/api/conversations/{carol_conversation_id}",
@@ -478,9 +537,9 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
         "\n}", 1
     )[0]
     assert 'behavior: "smooth"' not in scroll_top_function
-    scroll_bottom_function = script.text.split("function scrollConversationBottom()", 1)[
-        1
-    ].split("\n}", 1)[0]
+    scroll_bottom_function = script.text.split("function scrollConversationBottom()", 1)[1].split(
+        "\n}", 1
+    )[0]
     assert "await loadMoreEvents()" in scroll_bottom_function
     assert "elements.content.scrollHeight" in scroll_bottom_function
     assert 'behavior: "smooth"' not in scroll_bottom_function
@@ -497,6 +556,8 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert 'id="next-human"' in page.text
     assert 'id="conversation-top"' in page.text
     assert 'id="conversation-bottom"' in page.text
+    assert 'action="/logout"' in page.text
+    assert 'class="top-action top-logout"' in page.text
     assert ".session-list" in styles.text
     assert "overflow-y: auto" in styles.text
     assert "min-height: 0" in styles.text
@@ -509,6 +570,8 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert ".human-nav" in styles.text
     assert ".human-nav .nav-top, .human-nav .nav-bottom" in styles.text
     assert ".markdown-table" in styles.text
+    assert ".login-card" in styles.text
+    assert ".login-input" in styles.text
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
 
 

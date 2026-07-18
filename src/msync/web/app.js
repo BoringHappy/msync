@@ -119,6 +119,11 @@ async function request(path, { signal } = {}) {
     headers: { Accept: "application/json" },
     signal,
   });
+  if (response.status === 401) {
+    const next = `${window.location.pathname}${window.location.search}`;
+    window.location.assign(`/login?${new URLSearchParams({ next })}`);
+    throw new Error("Authentication required.");
+  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {

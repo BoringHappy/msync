@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
 import secrets
 import tempfile
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import (
     HTTPAuthorizationCredentials,
     HTTPBasic,
@@ -42,6 +50,9 @@ _BearerCredentials = Annotated[
     HTTPAuthorizationCredentials | None,
     Depends(_BEARER_SECURITY),
 ]
+_SESSION_COOKIE = "msync_session"
+_SESSION_MAX_AGE_SECONDS = 60 * 60 * 12
+_LOGIN_BODY_MAX_BYTES = 64 * 1024
 
 
 @dataclass(slots=True, frozen=True)
@@ -224,31 +235,85 @@ def create_app(
     )
     _validate_accounts(configured_accounts)
     legacy_owner = configured_accounts[0].username
+    accounts_by_username = {account.username: account for account in configured_accounts}
+    session_secret = secrets.token_bytes(32)
 
     # Long-running schema migrations belong in the explicit CLI maintenance workflow. Starting
     # the web process against an old archive should fail quickly with upgrade instructions instead
     # of silently waiting for uploads or rewriting a large archive before Uvicorn can report ready.
     archive = Archive(database, auto_upgrade=False)
 
-    def require_auth(credentials: _BasicCredentials) -> ServerAccount:
+    def authenticate_credentials(username: str, password: str) -> ServerAccount | None:
+        supplied_username = username.encode("utf-8")
+        supplied_password = password.encode("utf-8")
+        for account in configured_accounts:
+            valid_username = secrets.compare_digest(
+                supplied_username,
+                account.username.encode("utf-8"),
+            )
+            valid_password = secrets.compare_digest(
+                supplied_password,
+                account.password.encode("utf-8"),
+            )
+            if valid_username and valid_password:
+                return account
+        return None
+
+    def session_cookie(account: ServerAccount) -> str:
+        payload = json.dumps(
+            {
+                "expires": int(time.time()) + _SESSION_MAX_AGE_SECONDS,
+                "username": account.username,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        signature = hmac.digest(session_secret, payload, hashlib.sha256)
+        return f"{_base64url_encode(payload)}.{_base64url_encode(signature)}"
+
+    def session_account(request: Request) -> ServerAccount | None:
+        value = request.cookies.get(_SESSION_COOKIE)
+        if value is None or len(value) > 4096:
+            return None
+        try:
+            encoded_payload, encoded_signature = value.split(".", maxsplit=1)
+            payload = _base64url_decode(encoded_payload)
+            supplied_signature = _base64url_decode(encoded_signature)
+        except ValueError, binascii.Error:
+            return None
+        expected_signature = hmac.digest(session_secret, payload, hashlib.sha256)
+        if not secrets.compare_digest(supplied_signature, expected_signature):
+            return None
+        try:
+            values = json.loads(payload)
+        except UnicodeDecodeError, json.JSONDecodeError:
+            return None
+        username = values.get("username") if isinstance(values, dict) else None
+        expires = values.get("expires") if isinstance(values, dict) else None
+        if not isinstance(username, str) or not isinstance(expires, int):
+            return None
+        if expires <= int(time.time()):
+            return None
+        return accounts_by_username.get(username)
+
+    def authenticated_account(
+        request: Request,
+        credentials: _BasicCredentials,
+    ) -> ServerAccount | None:
+        account = session_account(request)
+        if account is not None:
+            return account
         if credentials is not None:
-            supplied_username = credentials.username.encode("utf-8")
-            supplied_password = credentials.password.encode("utf-8")
-            for account in configured_accounts:
-                valid_username = secrets.compare_digest(
-                    supplied_username,
-                    account.username.encode("utf-8"),
-                )
-                valid_password = secrets.compare_digest(
-                    supplied_password,
-                    account.password.encode("utf-8"),
-                )
-                if valid_username and valid_password:
-                    return account
+            return authenticate_credentials(credentials.username, credentials.password)
+        return None
+
+    def require_auth(request: Request, credentials: _BasicCredentials) -> ServerAccount:
+        account = authenticated_account(request, credentials)
+        if account is not None:
+            return account
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required.",
-            headers={"WWW-Authenticate": 'Basic realm="msync", charset="UTF-8"'},
         )
 
     def require_upload_token(credentials: _BearerCredentials) -> ServerAccount:
@@ -295,19 +360,94 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
+    @app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+    def login_page(
+        request: Request,
+        credentials: _BasicCredentials,
+        next_path: Annotated[str, Query(alias="next", max_length=2048)] = "/",
+    ) -> Response:
+        destination = _safe_next_path(next_path)
+        if authenticated_account(request, credentials) is not None:
+            return RedirectResponse(destination, status_code=status.HTTP_303_SEE_OTHER)
+        return HTMLResponse(_login_page(destination))
+
+    @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
+    async def log_in(request: Request) -> Response:
+        content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0]
+        if content_type.casefold() != "application/x-www-form-urlencoded":
+            return HTMLResponse(
+                _login_page("/", "Submit the username and password form to sign in."),
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            )
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > _LOGIN_BODY_MAX_BYTES:
+                    return HTMLResponse(
+                        _login_page("/", "The sign-in request is too large."),
+                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    )
+            except ValueError:
+                pass
+        body = await request.body()
+        if len(body) > _LOGIN_BODY_MAX_BYTES:
+            return HTMLResponse(
+                _login_page("/", "The sign-in request is too large."),
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            )
+        try:
+            fields = parse_qs(
+                body.decode("utf-8"),
+                keep_blank_values=True,
+                max_num_fields=10,
+            )
+        except UnicodeDecodeError, ValueError:
+            return HTMLResponse(
+                _login_page("/", "The sign-in request is invalid."),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        username = _single_form_value(fields, "username")
+        password = _single_form_value(fields, "password")
+        destination = _safe_next_path(_single_form_value(fields, "next"))
+        account = authenticate_credentials(username, password)
+        if account is None:
+            return HTMLResponse(
+                _login_page(destination, "The username or password is incorrect."),
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+        response = RedirectResponse(destination, status_code=status.HTTP_303_SEE_OTHER)
+        response.set_cookie(
+            key=_SESSION_COOKIE,
+            value=session_cookie(account),
+            max_age=_SESSION_MAX_AGE_SECONDS,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="lax",
+        )
+        return response
+
+    @app.post("/logout", include_in_schema=False)
+    def log_out() -> Response:
+        response = RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
+        response.delete_cookie(_SESSION_COOKIE, httponly=True, samesite="lax")
+        return response
+
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    def index(account: ServerAccount = Depends(require_auth)) -> HTMLResponse:  # noqa: B008
-        del account
+    def index(request: Request, credentials: _BasicCredentials) -> Response:
+        if authenticated_account(request, credentials) is None:
+            destination = request.url.path
+            if request.url.query:
+                destination = f"{destination}?{request.url.query}"
+            location = f"/login?{urlencode({'next': destination})}"
+            return RedirectResponse(location, status_code=status.HTTP_303_SEE_OTHER)
         return HTMLResponse(_web_asset("index.html"))
 
     @app.get("/assets/styles.css", include_in_schema=False)
-    def styles(account: ServerAccount = Depends(require_auth)) -> Response:  # noqa: B008
-        del account
+    def styles() -> Response:
         return Response(_web_asset("styles.css"), media_type="text/css")
 
     @app.get("/assets/app.js", include_in_schema=False)
-    def javascript(account: ServerAccount = Depends(require_auth)) -> Response:  # noqa: B008
-        del account
+    def javascript() -> Response:
         return Response(_web_asset("app.js"), media_type="text/javascript")
 
     @app.get("/api/locations", response_model=list[LocationResponse])
@@ -478,9 +618,7 @@ def _validate_accounts(accounts: Sequence[ServerAccount]) -> None:
             ("token", account.token),
         ):
             if value is not None and any(delimiter in value for delimiter in (",", ";")):
-                raise ValueError(
-                    f"Server account {field_name} must not contain ',' or ';'."
-                )
+                raise ValueError(f"Server account {field_name} must not contain ',' or ';'.")
         if account.username in usernames:
             raise ValueError(f"Duplicate server username {account.username!r}.")
         usernames.add(account.username)
@@ -494,3 +632,44 @@ def _validate_accounts(accounts: Sequence[ServerAccount]) -> None:
 
 def _web_asset(name: str) -> str:
     return files("msync.web").joinpath(name).read_text(encoding="utf-8")
+
+
+def _base64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.b64decode(f"{value}{padding}", altchars=b"-_", validate=True)
+
+
+def _safe_next_path(value: str) -> str:
+    if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
+        return "/"
+    if any(ord(character) < 32 for character in value):
+        return "/"
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or parsed.path in {"/login", "/logout"}:
+        return "/"
+    return value
+
+
+def _single_form_value(fields: dict[str, list[str]], name: str) -> str:
+    values = fields.get(name, [])
+    return values[0] if len(values) == 1 else ""
+
+
+def _login_page(next_path: str, error: str | None = None) -> str:
+    error_markup = ""
+    if error is not None:
+        error_markup = (
+            '<div class="login-error" role="alert">'
+            '<span aria-hidden="true">!</span>'
+            f"<span>{escape(error)}</span>"
+            "</div>"
+        )
+    return (
+        _web_asset("login.html")
+        .replace("__MSYNC_NEXT__", escape(next_path, quote=True))
+        .replace("__MSYNC_LOGIN_ERROR__", error_markup)
+    )
