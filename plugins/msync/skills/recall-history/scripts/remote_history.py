@@ -110,7 +110,7 @@ def _base_url(override: str | None) -> str:
 
 
 def _token() -> str:
-    value = os.environ.get("MSYNC_TOKEN") or os.environ.get("MSYNC_UPLOAD_TOKEN")
+    value = os.environ.get("MSYNC_TOKEN")
     if not value:
         raise RecallError("Set MSYNC_TOKEN to an msync account access token.")
     return value

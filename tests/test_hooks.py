@@ -114,7 +114,7 @@ def test_hook_uses_configured_root_for_custom_claude_layout(
         environ={
             "CLAUDE_CONFIG_DIR": str(root),
             "MSYNC_UPLOAD_URL": "https://history.example",
-            "MSYNC_UPLOAD_TOKEN": "secret-token",
+            "MSYNC_TOKEN": "secret-token",
         },
     )
 
@@ -145,7 +145,7 @@ def test_hook_rejects_transcript_without_native_or_configured_root(tmp_path: Pat
             input_stream=io.StringIO(json.dumps({"transcript_path": str(transcript)})),
             environ={
                 "MSYNC_UPLOAD_URL": "https://history.example",
-                "MSYNC_UPLOAD_TOKEN": "secret-token",
+                "MSYNC_TOKEN": "secret-token",
             },
         )
 

@@ -116,9 +116,8 @@ $ msync upload --dir ~/.claude
 $ msync upload --dir ~/.codex
 ```
 
-The URL can also be passed with `--url` and the token with `--token`. `MSYNC_UPLOAD_TOKEN` is
-deprecated but remains available as a compatibility alias for `MSYNC_TOKEN`. Environment variables
-are recommended because they keep the token out of shell history.
+The URL can also be passed with `--url` and the token with `--token`. Environment variables are
+recommended because they keep the token out of shell history.
 
 `upload` is read-only for the source directory. It verifies transcripts before sending them and
 uploads only new or changed sessions. A failed transcript is reported without preventing other

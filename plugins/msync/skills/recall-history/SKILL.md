@@ -16,8 +16,8 @@ Require these environment variables:
 - `MSYNC_TOKEN`: API token configured as the account's third value in
   `MSYNC_SERVER_ACCOUNTS`.
 
-Accept `MSYNC_UPLOAD_TOKEN` only as a deprecated compatibility fallback. Never print, pass on the
-command line, or include the token in an answer. Prefer HTTPS for a non-local server.
+Never print, pass `MSYNC_TOKEN` on the command line, or include it in an answer. Prefer HTTPS for a
+non-local server.
 
 ## Recall relevant context
 

@@ -125,11 +125,8 @@ def upload(
     token: Annotated[
         str | None,
         typer.Option(
-            envvar=["MSYNC_TOKEN", "MSYNC_UPLOAD_TOKEN"],
-            help=(
-                "API access token for --url (set MSYNC_TOKEN; MSYNC_UPLOAD_TOKEN is a "
-                "deprecated alias)."
-            ),
+            envvar="MSYNC_TOKEN",
+            help="API access token for --url (or set MSYNC_TOKEN).",
         ),
     ] = None,
 ) -> None:
