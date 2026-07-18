@@ -12,7 +12,7 @@ retrieved context focused: search summaries first, then read only the strongest 
 
 Require these environment variables:
 
-- `MSYNC_UPLOAD_URL`: base URL of the remote msync server.
+- `MSYNC_ENDPOINT`: base URL of the remote msync server.
 - `MSYNC_TOKEN`: API token configured as the account's third value in
   `MSYNC_SERVER_ACCOUNTS`.
 

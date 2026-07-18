@@ -47,7 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--url",
-        help="msync server base URL (defaults to MSYNC_UPLOAD_URL).",
+        help="msync server base URL (defaults to MSYNC_ENDPOINT).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -98,14 +98,14 @@ def _bounded(minimum: int, maximum: int) -> Any:
 
 
 def _base_url(override: str | None) -> str:
-    value = (override or os.environ.get("MSYNC_UPLOAD_URL", "")).strip()
+    value = (override or os.environ.get("MSYNC_ENDPOINT", "")).strip()
     if not value:
-        raise RecallError("Set MSYNC_UPLOAD_URL to the remote msync server URL.")
+        raise RecallError("Set MSYNC_ENDPOINT to the remote msync server URL.")
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RecallError("MSYNC_UPLOAD_URL must be an absolute HTTP or HTTPS URL.")
+        raise RecallError("MSYNC_ENDPOINT must be an absolute HTTP or HTTPS URL.")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise RecallError("MSYNC_UPLOAD_URL must not contain credentials, a query, or a fragment.")
+        raise RecallError("MSYNC_ENDPOINT must not contain credentials, a query, or a fragment.")
     return value.rstrip("/")
 
 

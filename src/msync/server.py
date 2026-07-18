@@ -370,9 +370,8 @@ def create_app(
     accounts_by_username = {account.username: account for account in configured_accounts}
     session_secret = secrets.token_bytes(32)
 
-    # Long-running schema migrations belong in the explicit CLI maintenance workflow. Starting
-    # the web process against an old archive should fail quickly with upgrade instructions instead
-    # of silently waiting for uploads or rewriting a large archive before Uvicorn can report ready.
+    # The CLI server command owns schema migrations so embedded app construction never silently
+    # rewrites an archive. Fail quickly here and let `msync server` offer the startup upgrade.
     archive = Archive(database, auto_upgrade=False)
 
     def authenticate_credentials(username: str, password: str) -> ServerAccount | None:
