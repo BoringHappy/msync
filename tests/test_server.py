@@ -661,6 +661,62 @@ def test_remote_upload_upserts_changed_single_transcript(tmp_path: Path) -> None
     ]
 
 
+def test_remote_upload_uses_manifest_logical_session_identity(tmp_path: Path) -> None:
+    web_app = create_app(
+        tmp_path / "archive.sqlite",
+        accounts=(ServerAccount("alice", "alice-password", "alice-token"),),
+    )
+    logical_session_id = "019f61a0-0000-7000-8000-000000000088"
+    metadata = {
+        "version": 1,
+        "provider": "codex",
+        "hostname": "workstation",
+        "root_path": "/home/alice/.codex",
+        "display_name": ".codex",
+        "relative_path": "sessions/managed.jsonl",
+        "source_mtime_ns": 123,
+        "logical_session_id": logical_session_id,
+    }
+    content = (
+        json.dumps(
+            {
+                "timestamp": "2026-07-14T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "native-session-id", "cwd": "/tmp"},
+            }
+        )
+        + "\n"
+    ).encode()
+    native_metadata = dict(metadata)
+    native_metadata.pop("logical_session_id")
+
+    with TestClient(web_app) as client:
+        initial_upload = client.post(
+            "/api/upload",
+            content=_remote_upload_body(native_metadata, content),
+            headers=_upload_headers("alice-token"),
+        )
+        corrected_upload = client.post(
+            "/api/upload",
+            content=_remote_upload_body(metadata, content),
+            headers=_upload_headers("alice-token"),
+        )
+        summary = client.get(
+            "/api/conversations",
+            auth=("alice", "alice-password"),
+        ).json()[0]
+        detail = client.get(
+            f"/api/conversations/{summary['id']}",
+            auth=("alice", "alice-password"),
+        ).json()
+
+    assert initial_upload.status_code == 200
+    assert initial_upload.json()["imported"] == 1
+    assert corrected_upload.status_code == 200
+    assert corrected_upload.json()["unchanged"] == 1
+    assert detail["metadata"]["_msync"]["logical_session_id"] == logical_session_id
+
+
 def test_overview_returns_latest_five_uploads_for_current_account(tmp_path: Path) -> None:
     web_app = create_app(
         tmp_path / "archive.sqlite",

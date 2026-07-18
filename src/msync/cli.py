@@ -28,6 +28,7 @@ from msync.hooks import queue_session_upload, wait_for_transcript_stable
 from msync.providers import (
     HistoryFormatError,
     HistoryProvider,
+    detect_existing_provider,
     detect_provider,
     get_provider,
     provider_names,
@@ -39,7 +40,12 @@ from msync.remote import (
     RemoteUploadMetadata,
     encode_upload_prefix,
 )
-from msync.synchronization import SyncResult, sync_conversations, unmanaged_transcripts
+from msync.synchronization import (
+    SyncResult,
+    managed_transcript_logical_session_id,
+    sync_conversations,
+    unmanaged_transcripts,
+)
 
 DEFAULT_DATABASE = Path.home() / ".msync" / "msync.sqlite"
 
@@ -364,6 +370,8 @@ def sync(
             upload=upload_result,
             result=sync_result,
         )
+    if any(result.conflicts for result in sync_results):
+        raise typer.Exit(code=1)
 
 
 def _upgrade_server_database(database: str, *, lock_timeout: int = 10) -> None:
@@ -607,10 +615,20 @@ def _sync_providers(roots: list[Path], names: list[str]) -> list[HistoryProvider
     if names and len(names) != len(roots):
         raise HistoryFormatError("Pass exactly one --provider for each --dir, in the same order.")
     selections = names or ["auto"] * len(roots)
-    return [
-        detect_provider(root) if name == "auto" else get_provider(name)
-        for root, name in zip(roots, selections, strict=True)
-    ]
+    providers: list[HistoryProvider] = []
+    for root, name in zip(roots, selections, strict=True):
+        if name == "auto":
+            providers.append(detect_provider(root))
+            continue
+        selected = get_provider(name)
+        detected = detect_existing_provider(root) if root.exists() else None
+        if detected is not None and detected.name != selected.name:
+            raise HistoryFormatError(
+                f"Sync location {root} contains {detected.name} history, "
+                f"not the requested {selected.name} provider."
+            )
+        providers.append(selected)
+    return providers
 
 
 def _upload_hostname(hostname: str | None) -> str:
@@ -838,7 +856,19 @@ def _remote_conversations(
         source_hostname, source_root = location_details[location_id]
         root = Path(source_root)
         provider = get_provider(provider_name)
-        conversation = provider.read(root / relative, root, transcript=transcript)
+        metadata = detail.get("metadata")
+        identity = metadata.get("_msync") if isinstance(metadata, dict) else None
+        logical_session_id = (
+            identity.get("logical_session_id") if isinstance(identity, dict) else None
+        )
+        if logical_session_id is not None and not isinstance(logical_session_id, str):
+            raise RuntimeError("msync server returned an invalid conversation identity.")
+        conversation = provider.read(
+            root / relative,
+            root,
+            transcript=transcript,
+            logical_session_id=logical_session_id,
+        )
         conversations.append(
             ArchivedConversation(
                 location_id=location_id,
@@ -945,6 +975,11 @@ def _remote_upload(
             display_name=root.name or str(root),
             relative_path=path.relative_to(root).as_posix(),
             source_mtime_ns=stat.st_mtime_ns,
+            logical_session_id=managed_transcript_logical_session_id(
+                root,
+                path,
+                provider=provider,
+            ),
         )
         prefix = encode_upload_prefix(metadata)
         try:
@@ -1024,7 +1059,12 @@ def _print_sync_result(
     upload: UploadResult,
     result: SyncResult,
 ) -> None:
-    table = Table(title="Sync complete", show_header=False, box=None, pad_edge=False)
+    table = Table(
+        title="Sync incomplete" if result.conflicts else "Sync complete",
+        show_header=False,
+        box=None,
+        pad_edge=False,
+    )
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Provider", provider.name)

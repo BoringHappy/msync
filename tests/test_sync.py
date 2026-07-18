@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import stat
+import threading
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 
@@ -14,13 +18,14 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
+import msync.synchronization as synchronization
 from msync.cli import app
 from msync.database import Archive, RemoteTranscript, UploadResult
 from msync.providers import get_provider
 from msync.schemas.claude import ClaudeRecord
 from msync.schemas.codex import CodexRolloutLine
 from msync.server import ServerAccount, create_app
-from msync.synchronization import MANIFEST_NAME
+from msync.synchronization import MANIFEST_NAME, managed_transcript_logical_session_id
 
 REMOTE_URL = "https://history.example"
 REMOTE_TOKEN = "sync-token"
@@ -35,12 +40,26 @@ def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
 def _archive_transcripts(database: Path, root: Path, provider_name: str = "codex") -> UploadResult:
     provider = get_provider(provider_name)
     resolved_root = root.resolve()
+    transcripts = provider.discover(resolved_root)
+    logical_session_ids = {
+        path.relative_to(resolved_root).as_posix(): logical_session_id
+        for path in transcripts
+        if (
+            logical_session_id := managed_transcript_logical_session_id(
+                resolved_root,
+                path,
+                provider=provider,
+            )
+        )
+        is not None
+    }
     with Archive(database) as archive:
         return archive.upload(
             root=resolved_root,
             provider=provider,
-            transcripts=provider.discover(resolved_root),
+            transcripts=transcripts,
             account_username=REMOTE_ACCOUNT,
+            logical_session_ids=logical_session_ids,
         )
 
 
@@ -206,6 +225,24 @@ def test_sync_merges_both_platforms_into_native_resumable_histories(
     assert [record.type for record in claude_values] == ["user", "assistant"]
     assert codex_values[0].type == "session_meta"
     assert {record.type for record in codex_values[1:]} == {"response_item", "event_msg"}
+    assert all(
+        "msync" not in json.loads(line) for line in claude_generated[0].read_text().splitlines()
+    )
+    assert all(
+        "msync" not in json.loads(line).get("payload", {})
+        for line in codex_generated[0].read_text().splitlines()
+    )
+    for root, generated in (
+        (claude_root, claude_generated[0]),
+        (codex_root, codex_generated[0]),
+    ):
+        manifest = json.loads((root / MANIFEST_NAME).read_text())
+        assert manifest["version"] == 2
+        entry = manifest["files"][generated.relative_to(root).as_posix()]
+        assert entry["external_id"]
+        assert entry["logical_session_id"]
+        assert entry["chat_sha256"]
+        assert entry["writer_schema_version"] == 1
 
     claude_conversation = get_provider("claude").read(claude_generated[0], claude_root)
     codex_conversation = get_provider("codex").read(codex_generated[0], codex_root)
@@ -337,6 +374,7 @@ def test_sync_does_not_overwrite_a_continued_export(
     generated = _generated_paths(destination)[0]
     manifest_path = destination / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = 1
     generated_key = generated.relative_to(destination).as_posix()
     legacy_identity = json.dumps(
         ["codex", str(codex_root.resolve()), codex_path.relative_to(codex_root).as_posix()],
@@ -365,6 +403,7 @@ def test_sync_does_not_overwrite_a_continued_export(
     assert second.exit_code == 0, second.output
     assert re.search(r"Existing histories protected\s+1", second.output)
     assert generated.read_bytes() == continued
+    assert json.loads(manifest_path.read_text())["version"] == 2
 
 
 def test_changed_source_creates_new_session_without_overwriting_previous(
@@ -523,6 +562,338 @@ def test_sync_rejects_symlinked_destination_components(
     assert result.exit_code == 1
     assert "Refusing to write through a symlink" in result.output
     assert list(outside.rglob("*.jsonl")) == []
+
+
+def test_sync_never_replaces_an_unmanaged_path_collision(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    _write_jsonl(codex_root / "sessions/source.jsonl", _codex_records())
+    claude_root = tmp_path / ".claude"
+    arguments = [
+        "sync",
+        "--dir",
+        str(codex_root),
+        "--dir",
+        str(claude_root),
+        "--provider",
+        "codex",
+        "--provider",
+        "claude",
+        *_remote_options(),
+    ]
+    first = CliRunner().invoke(app, arguments)
+    assert first.exit_code == 0, first.output
+    collision = _generated_paths(claude_root)[0]
+    collision.write_text("".join(json.dumps(record) + "\n" for record in _claude_records()))
+    user_bytes = collision.read_bytes()
+    manifest_path = claude_root / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"].pop(collision.relative_to(claude_root).as_posix())
+    manifest_path.write_text(json.dumps(manifest))
+
+    second = CliRunner().invoke(app, arguments)
+
+    assert second.exit_code == 1
+    assert "Sync incomplete" in second.output
+    assert re.search(r"Path conflicts\s+1", second.output)
+    assert "Not overwritten" in second.output
+    assert collision.read_bytes() == user_bytes
+
+
+def test_sync_rejects_an_unsupported_manifest_before_network_or_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / ".claude"
+    destination.mkdir()
+    manifest_path = destination / MANIFEST_NAME
+    manifest_bytes = b'{"version":999,"files":{}}\n'
+    manifest_path.write_bytes(manifest_bytes)
+
+    def unexpected_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("network must not be opened for an unsupported manifest")
+
+    monkeypatch.setattr("msync.cli.httpx.get", unexpected_network)
+    monkeypatch.setattr("msync.cli.httpx.post", unexpected_network)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(destination),
+            "--provider",
+            "claude",
+            *_remote_options(),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Unsupported or invalid sync manifest" in result.output
+    assert manifest_path.read_bytes() == manifest_bytes
+    assert list(destination.rglob("*.jsonl")) == []
+
+
+def test_sync_uses_atomic_create_when_a_target_appears_during_commit(
+    tmp_path: Path,
+    remote_archive: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    _write_jsonl(codex_root / "sessions/source.jsonl", _codex_records())
+    destination = tmp_path / "claude-output"
+    user_bytes = b"concurrently-created user data\n"
+    real_link = os.link
+    raced_paths: list[Path] = []
+
+    def race_link(source: str | Path, target: str | Path, **options: object) -> None:
+        target_path = Path(target)
+        if not raced_paths:
+            target_path.write_bytes(user_bytes)
+            raced_paths.append(target_path)
+        real_link(source, target, **options)
+
+    monkeypatch.setattr("msync.synchronization.os.link", race_link)
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(codex_root),
+            "--dir",
+            str(destination),
+            "--provider",
+            "codex",
+            "--provider",
+            "claude",
+            *_remote_options(),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert raced_paths
+    assert raced_paths[0].read_bytes() == user_bytes
+    assert re.search(r"Path conflicts\s+1", result.output)
+
+
+def test_sync_validates_every_generated_candidate_before_writing_any(
+    tmp_path: Path,
+    remote_archive: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    first_records = _codex_records()
+    second_records = _codex_records()
+    second_session_id = "019f61a0-0000-7000-8000-000000000002"
+    second_records[0]["payload"] = {
+        **second_records[0]["payload"],
+        "session_id": second_session_id,
+        "id": second_session_id,
+    }
+    second_records[1]["payload"] = {
+        "type": "user_message",
+        "message": "A distinct second conversation",
+    }
+    _write_jsonl(codex_root / "sessions/first.jsonl", first_records)
+    _write_jsonl(codex_root / "sessions/second.jsonl", second_records)
+    destination = tmp_path / "claude-output"
+    provider = get_provider("claude")
+    real_encode = provider.encode_conversation
+    calls = 0
+
+    def encode_with_bad_second_identity(*args: object, **kwargs: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        content = real_encode(*args, **kwargs)
+        if calls == 2:
+            records = [json.loads(line) for line in content.splitlines()]
+            for record in records:
+                record["sessionId"] = "019f61a0-0000-7000-8000-ffffffffffff"
+            return ("".join(json.dumps(record) + "\n" for record in records)).encode()
+        return content
+
+    monkeypatch.setattr(provider, "encode_conversation", encode_with_bad_second_identity)
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(codex_root),
+            "--dir",
+            str(destination),
+            "--provider",
+            "codex",
+            "--provider",
+            "claude",
+            *_remote_options(),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "session identity changed" in result.output
+    assert list(destination.rglob("*.jsonl")) == []
+    assert not (destination / MANIFEST_NAME).exists()
+
+
+def test_sync_rolls_back_new_transcripts_when_manifest_commit_fails(
+    tmp_path: Path,
+    remote_archive: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    _write_jsonl(codex_root / "sessions/source.jsonl", _codex_records())
+    destination = tmp_path / "claude-output"
+    real_write_manifest = synchronization._write_manifest
+
+    def fail_destination_manifest(root: Path, manifest: dict[str, object]) -> None:
+        if root == destination.resolve():
+            raise OSError("simulated manifest failure")
+        real_write_manifest(root, manifest)
+
+    monkeypatch.setattr(synchronization, "_write_manifest", fail_destination_manifest)
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(codex_root),
+            "--dir",
+            str(destination),
+            "--provider",
+            "codex",
+            "--provider",
+            "claude",
+            *_remote_options(),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "simulated manifest failure" in result.output
+    assert list(destination.rglob("*.jsonl")) == []
+    assert list(destination.rglob(".msync-*")) == []
+
+
+@pytest.mark.parametrize("unsafe_path", [Path("../outside.jsonl"), Path(MANIFEST_NAME)])
+def test_sync_rejects_unsafe_provider_export_paths_before_writing(
+    tmp_path: Path,
+    remote_archive: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_path: Path,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    _write_jsonl(codex_root / "sessions/source.jsonl", _codex_records())
+    destination = tmp_path / "claude-output"
+    provider = get_provider("claude")
+    monkeypatch.setattr(
+        provider,
+        "export_relative_path",
+        lambda *args, **kwargs: unsafe_path,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            "--dir",
+            str(codex_root),
+            "--dir",
+            str(destination),
+            "--provider",
+            "codex",
+            "--provider",
+            "claude",
+            *_remote_options(),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "unsafe transcript path" in result.output
+    assert not (tmp_path / "outside.jsonl").exists()
+    assert list(destination.rglob("*.jsonl")) == []
+    assert not (destination / MANIFEST_NAME).exists()
+
+
+def test_sync_rejects_an_explicit_provider_that_conflicts_with_the_destination(
+    tmp_path: Path,
+    remote_archive: Path,
+) -> None:
+    root = tmp_path / ".claude"
+    _write_jsonl(root / "projects/-work/session.jsonl", _claude_records())
+
+    result = CliRunner().invoke(
+        app,
+        ["sync", "--dir", str(root), "--provider", "codex", *_remote_options()],
+    )
+
+    assert result.exit_code == 1
+    normalized_output = " ".join(result.output.split())
+    assert "contains claude history, not the requested codex provider" in normalized_output
+    assert not (root / "sessions").exists()
+
+
+def test_destination_lock_serializes_manifest_updates(
+    tmp_path: Path,
+    remote_archive: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_root = tmp_path / ".codex"
+    first_records = _codex_records()
+    second_records = _codex_records()
+    second_session_id = "019f61a0-0000-7000-8000-000000000003"
+    second_records[0]["payload"] = {
+        **second_records[0]["payload"],
+        "session_id": second_session_id,
+        "id": second_session_id,
+    }
+    second_records[1]["payload"] = {
+        "type": "user_message",
+        "message": "Concurrent second conversation",
+    }
+    _write_jsonl(codex_root / "sessions/first.jsonl", first_records)
+    _write_jsonl(codex_root / "sessions/second.jsonl", second_records)
+    _archive_transcripts(remote_archive, codex_root)
+    with Archive(remote_archive) as archive:
+        conversations = archive.conversations()
+    assert len(conversations) == 2
+
+    destination = tmp_path / "claude-output"
+    real_locked_sync = synchronization._sync_conversations_locked
+    counter_lock = threading.Lock()
+    active = maximum_active = 0
+
+    def observed_locked_sync(*args: object, **kwargs: object) -> object:
+        nonlocal active, maximum_active
+        with counter_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.05)
+            return real_locked_sync(*args, **kwargs)
+        finally:
+            with counter_lock:
+                active -= 1
+
+    monkeypatch.setattr(synchronization, "_sync_conversations_locked", observed_locked_sync)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                synchronization.sync_conversations,
+                [conversation],
+                destination=destination,
+                provider=get_provider("claude"),
+                current_hostname="local-host",
+            )
+            for conversation in conversations
+        ]
+        for future in futures:
+            future.result()
+
+    assert maximum_active == 1
+    manifest = json.loads((destination / MANIFEST_NAME).read_text())
+    assert len(manifest["files"]) == 2
+    assert all((destination / relative_path).is_file() for relative_path in manifest["files"])
 
 
 def test_logical_session_identity_prevents_cross_provider_upload_feedback(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,9 @@ from pydantic import ValidationError
 from msync.models import Conversation, Event
 from msync.providers.base import (
     ConversationDetails,
+    HistoryFormatError,
     HistoryProvider,
+    NoTransferableMessagesError,
     as_string,
     canonical_session_id,
     display_events,
@@ -24,9 +27,9 @@ from msync.providers.base import (
 from msync.schemas.claude import (
     ClaudeAssistantMessage,
     ClaudeAssistantRecord,
-    ClaudeContentBlock,
+    ClaudeGeneratedContentBlock,
+    ClaudeGeneratedUsage,
     ClaudeRecord,
-    ClaudeUsage,
     ClaudeUserMessage,
     ClaudeUserRecord,
 )
@@ -164,19 +167,16 @@ class ClaudeProvider(HistoryProvider):
         started_at: datetime,
         source_key: str,
     ) -> bytes:
+        del source_key
         events = display_events(conversation)
         if not events:
-            raise ValueError("conversation has no displayable user or assistant messages")
+            raise NoTransferableMessagesError(
+                "conversation has no displayable user or assistant messages"
+            )
 
         cwd = conversation.cwd or str(Path.home())
         records: list[ClaudeRecord] = []
         parent_uuid: str | None = None
-        provenance = {
-            "sourceProvider": conversation.provider,
-            "sourceConversationId": conversation.external_id,
-            "sourceKey": source_key,
-            "logicalSessionId": conversation.logical_session_id,
-        }
         for offset, event in enumerate(events, start=1):
             event_id = stable_event_id(session_id, event)
             common = {
@@ -186,9 +186,8 @@ class ClaudeProvider(HistoryProvider):
                 "timestamp": event_timestamp(event, started_at, offset),
                 "cwd": cwd,
                 "gitBranch": conversation.git_branch,
-                "version": "msync-0.1.0",
-                "entrypoint": "msync",
-                "msync": provenance,
+                "version": "0.1.0",
+                "entrypoint": "cli",
             }
             text = event.searchable_text
             if event.role == "user":
@@ -205,13 +204,50 @@ class ClaudeProvider(HistoryProvider):
                         message=ClaudeAssistantMessage(
                             id=f"msg_msync_{event_id.replace('-', '')}",
                             model=conversation.model or "imported",
-                            content=[ClaudeContentBlock(type="text", text=text)],
-                            usage=ClaudeUsage(),
+                            content=[ClaudeGeneratedContentBlock(text=text)],
+                            usage=ClaudeGeneratedUsage(),
                         ),
                     )
                 )
             parent_uuid = event_id
         return encode_jsonl(records)
+
+    def validate_export_schema(self, transcript: bytes) -> None:
+        """Accept only the two strict Claude record shapes emitted by msync."""
+
+        records = 0
+        session_id: str | None = None
+        parent_uuid: str | None = None
+        for line_number, raw_line in enumerate(transcript.splitlines(), start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                value = json.loads(raw_line)
+                if not isinstance(value, dict):
+                    raise ValueError("record is not a JSON object")
+                record_type = value.get("type")
+                if record_type == "user":
+                    ClaudeUserRecord.model_validate(value)
+                elif record_type == "assistant":
+                    ClaudeAssistantRecord.model_validate(value)
+                else:
+                    raise ValueError(f"unsupported generated Claude record type {record_type!r}")
+                current_session_id = value.get("sessionId")
+                if session_id is None:
+                    session_id = current_session_id
+                elif current_session_id != session_id:
+                    raise ValueError("all generated records must use the same sessionId")
+                if value.get("parentUuid") != parent_uuid:
+                    raise ValueError("generated parentUuid chain is not contiguous")
+                parent_uuid = value.get("uuid")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as error:
+                detail = " ".join(str(error).split())
+                raise HistoryFormatError(
+                    f"generated Claude transcript line {line_number} is invalid: {detail}"
+                ) from error
+            records += 1
+        if not records:
+            raise HistoryFormatError("generated Claude transcript contains no records")
 
     def export_relative_path(
         self,

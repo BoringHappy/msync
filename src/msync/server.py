@@ -762,6 +762,11 @@ def create_app(
                         relative_path=metadata.relative_path,
                         content=content,
                         source_mtime_ns=metadata.source_mtime_ns,
+                        logical_session_id=(
+                            str(metadata.logical_session_id)
+                            if metadata.logical_session_id is not None
+                            else None
+                        ),
                     )
                 ],
             )

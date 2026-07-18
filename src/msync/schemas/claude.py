@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import Field
 
-from msync.schemas.base import NativeRecord
+from msync.schemas.base import NativeRecord, StrictNativeRecord
 
 
 class ClaudeContentBlock(NativeRecord):
@@ -50,20 +51,40 @@ class ClaudeMessage(NativeRecord):
     usage: ClaudeUsage | None = None
 
 
-class ClaudeUserMessage(ClaudeMessage):
+class ClaudeUserMessage(StrictNativeRecord):
     """A user message generated for a resumable Claude session."""
 
     role: Literal["user"] = "user"
+    content: str
 
 
-class ClaudeAssistantMessage(ClaudeMessage):
+class ClaudeGeneratedContentBlock(StrictNativeRecord):
+    """A text block emitted in a generated Claude assistant message."""
+
+    type: Literal["text"] = "text"
+    text: str
+
+
+class ClaudeGeneratedUsage(StrictNativeRecord):
+    """Token accounting emitted for a generated Claude assistant message."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+
+class ClaudeAssistantMessage(StrictNativeRecord):
     """An assistant message generated for a resumable Claude session."""
 
     role: Literal["assistant"] = "assistant"
     type: Literal["message"] = "message"
-    content: list[ClaudeContentBlock]
+    id: str
+    model: str
+    content: list[ClaudeGeneratedContentBlock]
     stop_reason: str | None = "end_turn"
-    usage: ClaudeUsage = Field(default_factory=ClaudeUsage)
+    stop_sequence: str | None = None
+    usage: ClaudeGeneratedUsage = Field(default_factory=ClaudeGeneratedUsage)
 
 
 class ClaudeRecord(NativeRecord):
@@ -90,27 +111,30 @@ class ClaudeRecord(NativeRecord):
     msync: ClaudeSyncProvenance | None = None
 
 
-class ClaudeUserRecord(ClaudeRecord):
+class ClaudeGeneratedRecord(StrictNativeRecord):
+    """Fields shared by every transcript record emitted by msync."""
+
+    session_id: UUID = Field(alias="sessionId")
+    uuid: UUID
+    parent_uuid: UUID | None = Field(default=None, alias="parentUuid")
+    timestamp: str
+    cwd: str
+    git_branch: str | None = Field(default=None, alias="gitBranch")
+    version: str | None = Field(default=None, pattern=r"^\d+\.\d+\.\d+(?:[-+].+)?$")
+    entrypoint: Literal["cli"] | None = None
+    is_sidechain: bool = Field(default=False, alias="isSidechain")
+    user_type: Literal["external"] = Field(default="external", alias="userType")
+
+
+class ClaudeUserRecord(ClaudeGeneratedRecord):
     """Strict user record emitted by msync's Claude writer."""
 
     type: Literal["user"] = "user"
-    session_id: str = Field(alias="sessionId")
-    uuid: str
-    timestamp: str
-    cwd: str
     message: ClaudeUserMessage
-    is_sidechain: bool = Field(default=False, alias="isSidechain")
-    user_type: str = Field(default="external", alias="userType")
 
 
-class ClaudeAssistantRecord(ClaudeRecord):
+class ClaudeAssistantRecord(ClaudeGeneratedRecord):
     """Strict assistant record emitted by msync's Claude writer."""
 
     type: Literal["assistant"] = "assistant"
-    session_id: str = Field(alias="sessionId")
-    uuid: str
-    timestamp: str
-    cwd: str
     message: ClaudeAssistantMessage
-    is_sidechain: bool = Field(default=False, alias="isSidechain")
-    user_type: str = Field(default="external", alias="userType")

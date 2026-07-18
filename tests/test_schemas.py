@@ -3,9 +3,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from msync.schemas.claude import ClaudeRecord
+from msync.schemas.claude import ClaudeRecord, ClaudeUserMessage, ClaudeUserRecord
 from msync.schemas.codex import (
     CodexContentBlock,
+    CodexResponseMessageLine,
     CodexResponseMessagePayload,
     CodexRolloutLine,
 )
@@ -49,14 +50,12 @@ def test_claude_schema_rejects_malformed_understood_message_fields() -> None:
         )
 
 
-def test_codex_schema_serializes_typed_payload_without_losing_fields() -> None:
-    line = CodexRolloutLine(
+def test_codex_writer_schema_serializes_only_declared_payload_fields() -> None:
+    line = CodexResponseMessageLine(
         timestamp="2026-07-14T12:00:00Z",
-        type="response_item",
         payload=CodexResponseMessagePayload(
             role="assistant",
             content=[CodexContentBlock(type="output_text", text="answer")],
-            future_payload_field="retained",
         ),
     )
 
@@ -65,8 +64,26 @@ def test_codex_schema_serializes_typed_payload_without_losing_fields() -> None:
         "type": "message",
         "role": "assistant",
         "content": [{"type": "output_text", "text": "answer"}],
-        "future_payload_field": "retained",
     }
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        CodexResponseMessagePayload(
+            role="assistant",
+            content=[CodexContentBlock(type="output_text", text="answer")],
+            future_payload_field="rejected",
+        )
+
+
+def test_claude_writer_schema_rejects_unknown_record_fields() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ClaudeUserRecord(
+            sessionId="019f61a0-0000-7000-8000-000000000001",
+            uuid="019f61a0-0000-7000-8000-000000000002",
+            timestamp="2026-07-14T12:00:00Z",
+            cwd="/work",
+            message=ClaudeUserMessage(content="hello"),
+            futureRecordField=True,
+        )
 
 
 def test_codex_schema_accepts_unknown_rollout_types() -> None:
