@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -107,6 +109,42 @@ class ConversationRow(Base):
     transcript: Mapped[bytes] = mapped_column(LONG_BINARY, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     imported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ConversationMetricRow(Base):
+    """Precomputed dashboard facts for one archived conversation."""
+
+    __tablename__ = "conversation_metrics"
+    __table_args__ = (Index("conversation_metrics_activity_idx", "activity_at"),)
+
+    conversation_id: Mapped[int] = mapped_column(
+        ID_TYPE,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    reasoning_event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    preview: Mapped[str | None] = mapped_column(LONG_TEXT)
+    activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    activity_day: Mapped[date | None] = mapped_column(Date)
+    activity_hour: Mapped[int | None] = mapped_column(Integer)
+    activity_weekday: Mapped[int | None] = mapped_column(Integer)
+    duration_minutes: Mapped[float | None] = mapped_column(Float)
+    tool_counts_json: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class ArchiveRevisionRow(Base):
+    """Monotonic per-owner revision used to invalidate dashboard summaries."""
+
+    __tablename__ = "archive_revisions"
+
+    account_username: Mapped[str] = mapped_column(String(255), primary_key=True)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 

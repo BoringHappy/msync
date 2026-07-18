@@ -3,11 +3,13 @@
 const SESSION_PAGE_SIZE = 50;
 const EVENT_PAGE_SIZE = 100;
 const LAYOUT_STORAGE_KEY = "msync:fit-width";
+const METRICS_REVISION_POLL_MS = 15000;
 
 const state = {
   locations: [],
   metrics: null,
   metricsController: null,
+  metricsPollTimer: null,
   conversations: [],
   activeConversation: null,
   conversationEntries: [],
@@ -557,8 +559,38 @@ async function loadMetrics() {
   const metrics = await request("/api/metrics", { signal: controller.signal });
   state.metrics = metrics;
   renderDashboard(metrics);
+  elements.archiveStatus.replaceChildren(
+    node("span", "status-light"),
+    document.createTextNode(
+      `${formatCount(metrics.totals.sessions)} sessions · ${formatCount(metrics.totals.locations)} ${metrics.totals.locations === 1 ? "location" : "locations"}`,
+    ),
+  );
   if (state.currentView !== "sessions") {
     elements.footerStatus.textContent = `${formatCount(metrics.totals.sessions)} sessions archived`;
+  }
+}
+
+function scheduleMetricsRevisionCheck(delay = METRICS_REVISION_POLL_MS) {
+  window.clearTimeout(state.metricsPollTimer);
+  if (state.currentView === "sessions" || document.visibilityState !== "visible") return;
+  state.metricsPollTimer = window.setTimeout(() => {
+    checkMetricsRevision().catch(() => {
+      // A later poll will retry without disrupting the current dashboard.
+    });
+  }, delay);
+}
+
+async function checkMetricsRevision() {
+  try {
+    if (document.visibilityState !== "visible") return;
+    const current = await request("/api/metrics/revision");
+    if (state.metrics && current.revision !== state.metrics.revision) {
+      elements.footerStatus.textContent = "Archive changed · refreshing metrics…";
+      await loadMetrics();
+      showToast("Archive updated · dashboard refreshed");
+    }
+  } finally {
+    scheduleMetricsRevisionCheck();
   }
 }
 
@@ -1866,8 +1898,13 @@ async function reloadArchive() {
   elements.reload.classList.add("spinning");
   elements.footerStatus.textContent = "Refreshing archive…";
   try {
-    await Promise.all([loadLocations(), loadMetrics()]);
-    await loadConversations({ keepSelection: true });
+    if (state.currentView === "sessions") {
+      await loadLocations();
+      await loadConversations({ keepSelection: true });
+    } else {
+      await loadMetrics();
+      scheduleMetricsRevisionCheck();
+    }
   } finally {
     elements.reload.disabled = false;
     elements.reload.classList.remove("spinning");
@@ -1925,6 +1962,11 @@ document.querySelector("#footer-insights").addEventListener("click", () => {
 elements.sidebarScrim.addEventListener("click", () => setSidebar(false));
 document.querySelector("#scroll-top").addEventListener("click", scrollConversationTop);
 window.addEventListener("resize", updateTitleOverflow);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state.currentView !== "sessions") {
+    scheduleMetricsRevisionCheck(0);
+  }
+});
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(updateTitleOverflow).observe(elements.titleWrap);
 }
@@ -1977,18 +2019,18 @@ async function start() {
   showView(state.currentView);
   loadWidthPreference();
   try {
-    const [locationsResult, metricsResult] = await Promise.allSettled([
-      loadLocations(),
-      loadMetrics(),
-    ]);
-    if (locationsResult.status === "rejected") throw locationsResult.reason;
-    if (metricsResult.status === "rejected" && metricsResult.reason.name !== "AbortError") {
-      showToast(`Could not load archive summary: ${metricsResult.reason.message}`);
+    if (state.currentView === "sessions") {
+      await loadLocations();
+      await loadConversations();
+    } else {
+      await loadMetrics();
+      scheduleMetricsRevisionCheck();
     }
-    await loadConversations();
   } catch (error) {
     handleError(error);
-    elements.sessionList.replaceChildren(node("div", "no-results", "Could not load archive"));
+    if (state.currentView === "sessions") {
+      elements.sessionList.replaceChildren(node("div", "no-results", "Could not load archive"));
+    }
   }
 }
 

@@ -454,6 +454,10 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
         carol_conversations = client.get("/api/conversations", auth=("carol", "carol-password"))
         alice_metrics = client.get("/api/metrics", auth=("alice", "alice-password"))
         bob_metrics = client.get("/api/metrics", auth=("bob", "bob-password"))
+        alice_revision = client.get(
+            "/api/metrics/revision", auth=("alice", "alice-password")
+        )
+        bob_revision = client.get("/api/metrics/revision", auth=("bob", "bob-password"))
         carol_conversation_id = carol_conversations.json()[0]["id"]
         cross_account_detail = client.get(
             f"/api/conversations/{carol_conversation_id}",
@@ -480,6 +484,8 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
     assert len(carol_conversations.json()) == 1
     assert alice_metrics.json()["totals"]["sessions"] == 1
     assert bob_metrics.json()["totals"]["sessions"] == 0
+    assert alice_revision.json()["revision"] == 1
+    assert bob_revision.json()["revision"] == 0
     assert cross_account_detail.status_code == 404
 
     with sqlite3.connect(database) as connection:
@@ -629,6 +635,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
         insights_page = client.get("/insights")
         sessions_page = client.get("/sessions")
         metrics_response = client.get("/api/metrics")
+        revision_response = client.get("/api/metrics/revision")
         script = client.get("/assets/app.js")
         styles = client.get("/assets/styles.css")
 
@@ -650,6 +657,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert insights_page.status_code == 200
     assert sessions_page.status_code == 200
     assert metrics_response.status_code == 200
+    assert revision_response.status_code == 200
     metrics = metrics_response.json()
     assert metrics["totals"]["sessions"] == 1
     assert metrics["totals"]["messages"] == 2
@@ -659,6 +667,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert metrics["providers"] == [{"label": "codex", "sessions": 1, "messages": 2}]
     assert len(metrics["activity"]) == 30
     assert metrics["recent_sessions"][0]["external_id"] == "detail-session"
+    assert metrics["revision"] == revision_response.json()["revision"] == 1
     assert "<title>AI Coding Sessions · msync</title>" in page.text
     assert 'id="dashboard"' in page.text
     assert 'id="insights"' in page.text
@@ -688,6 +697,9 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "renderDashboard" in script.text
     assert 'request("/api/metrics"' in script.text
     assert "renderActivityChart" in script.text
+    assert "METRICS_REVISION_POLL_MS" in script.text
+    assert 'request("/api/metrics/revision")' in script.text
+    assert "scheduleMetricsRevisionCheck" in script.text
     scroll_top_function = script.text.split("function scrollConversationTop()", 1)[1].split(
         "\n}", 1
     )[0]
@@ -890,12 +902,12 @@ def test_server_command_upgrades_old_schema_when_confirmed(
 
     assert result.exit_code == 0, result.output
     assert "Upgrade the database now? [y/N]" in result.output
-    assert "Database schema upgrade complete: 5 → 7" in result.output
+    assert "Database schema upgrade complete: 5 → 8" in result.output
     assert captured["app"].title == "msync history browser"
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("7",)
+        ).fetchone() == ("8",)
 
 
 def test_server_rejects_empty_credentials(tmp_path: Path) -> None:

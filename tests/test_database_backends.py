@@ -39,7 +39,7 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
         } <= triggers
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("7",)
+        ).fetchone() == ("8",)
         primary_keys = {
             table: tuple(
                 row[1] for row in connection.execute(f"PRAGMA table_info({table})") if row[5]
@@ -50,6 +50,8 @@ def test_new_database_is_initialized_and_validated(tmp_path: Path) -> None:
             "schema_info": ("key",),
             "locations": ("id",),
             "conversations": ("id",),
+            "conversation_metrics": ("conversation_id",),
+            "archive_revisions": ("account_username",),
             "events": ("id",),
             "message_parts": ("id",),
         }
@@ -133,12 +135,12 @@ def test_v5_archive_reindexes_tool_results_from_lossless_transcript(tmp_path: Pa
     assert detail.events[1].text == "command\N{REPLACEMENT CHARACTER}output"
     assert [match.role for match in matches] == ["tool"]
     assert stored == source
-    assert upgrade_steps == [(5, 6), (6, 7)]
+    assert upgrade_steps == [(5, 6), (6, 7), (7, 8)]
     with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
         assert connection.execute(
             "SELECT value FROM schema_info WHERE key = 'schema_version'"
-        ).fetchone() == ("7",)
+        ).fetchone() == ("8",)
 
 
 def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -> None:
@@ -197,11 +199,18 @@ def test_v6_archive_migrates_tenant_columns_and_revision_index(tmp_path: Path) -
             "SELECT account_username, root_path_hash FROM locations"
         ).fetchone()
 
-    assert upgrade_steps == [(6, 7)]
+    assert upgrade_steps == [(6, 7), (7, 8)]
     assert "account_username" in location_columns
     assert "account_username" in conversation_columns
     assert revision_columns == ("account_username", "logical_session_id", "chat_sha256")
     assert stored_location == ("", expected_hash)
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT event_count, message_count FROM conversation_metrics"
+        ).fetchone() == (1, 0)
+        assert connection.execute(
+            "SELECT account_username, revision FROM archive_revisions"
+        ).fetchone() == ("", 1)
 
 
 def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None:
@@ -218,7 +227,7 @@ def test_old_archive_can_require_explicit_schema_upgrade(tmp_path: Path) -> None
         Archive(database, auto_upgrade=False)
 
     assert captured.value.current_version == 5
-    assert captured.value.target_version == 7
+    assert captured.value.target_version == 8
 
 
 def test_incompatible_existing_schema_is_rejected(tmp_path: Path) -> None:
@@ -272,8 +281,8 @@ def test_newer_schema_version_requires_newer_msync(tmp_path: Path) -> None:
         pass
 
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute("UPDATE schema_info SET value = '8' WHERE key = 'schema_version'")
-        connection.execute("PRAGMA user_version = 8")
+        connection.execute("UPDATE schema_info SET value = '9' WHERE key = 'schema_version'")
+        connection.execute("PRAGMA user_version = 9")
         connection.commit()
 
     with pytest.raises(RuntimeError, match="upgrade msync"):

@@ -61,14 +61,21 @@ def test_codex_upload_is_lossless_searchable_and_idempotent(tmp_path: Path) -> N
     provider = detect_provider(root)
     paths = provider.discover(root)
     with Archive(database) as archive:
+        assert archive.archive_revision() == 0
         first = archive.upload(root=root, provider=provider, transcripts=paths)
+        first_metrics = archive.browse_metrics()
+        cached_metrics = archive.browse_metrics()
         second = archive.upload(root=root, provider=provider, transcripts=paths)
+        unchanged_revision = archive.archive_revision()
 
     assert provider.name == "codex"
     assert first.imported == 1
     assert first.events == 4
     assert second.imported == 0
     assert second.unchanged == 1
+    assert first_metrics.revision == 1
+    assert cached_metrics is first_metrics
+    assert unchanged_revision == 1
 
     with closing(sqlite3.connect(database)) as connection:
         row = connection.execute(
@@ -93,6 +100,12 @@ def test_codex_upload_is_lossless_searchable_and_idempotent(tmp_path: Path) -> N
         assert match == ("Find the blue widget",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT event_count, message_count, preview FROM conversation_metrics"
+        ).fetchone() == (4, 2, "Find the blue widget")
+        assert connection.execute(
+            "SELECT account_username, revision FROM archive_revisions"
+        ).fetchone() == ("", 1)
 
 
 def test_normalized_text_replaces_database_incompatible_nul_bytes(tmp_path: Path) -> None:
@@ -143,6 +156,7 @@ def test_changed_transcript_replaces_normalized_events(tmp_path: Path) -> None:
     provider = get_provider("codex")
     with Archive(database) as archive:
         archive.upload(root=root, provider=provider, transcripts=[path])
+        previous_metrics = archive.browse_metrics()
         records = _codex_records()
         records[-1]["payload"] = {
             "type": "message",
@@ -151,14 +165,47 @@ def test_changed_transcript_replaces_normalized_events(tmp_path: Path) -> None:
         }
         _write_jsonl(path, records)
         result = archive.upload(root=root, provider=provider, transcripts=[path])
+        updated_metrics = archive.browse_metrics()
 
     assert result.updated == 1
+    assert updated_metrics.revision == previous_metrics.revision + 1
+    assert updated_metrics is not previous_metrics
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (1,)
         assert connection.execute("SELECT count(*) FROM events").fetchone() == (4,)
         assert connection.execute(
             "SELECT searchable_text FROM events_fts WHERE events_fts MATCH 'updated'"
         ).fetchone() == ("Updated answer",)
+
+
+def test_metrics_cache_observes_revisions_from_another_archive_instance(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    path = root / "sessions/rollout.jsonl"
+    _write_jsonl(path, _codex_records())
+    database = tmp_path / "archive.sqlite"
+    provider = get_provider("codex")
+    with Archive(database) as writer:
+        writer.upload(root=root, provider=provider, transcripts=[path])
+
+    with Archive(database) as reader, Archive(database) as writer:
+        initial = reader.browse_metrics()
+        records = _codex_records()
+        records.append(
+            {
+                "timestamp": "2026-07-14T10:00:04Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "One more update."},
+            }
+        )
+        _write_jsonl(path, records)
+        writer.upload(root=root, provider=provider, transcripts=[path])
+        refreshed = reader.browse_metrics()
+
+    assert refreshed.revision == initial.revision + 1
+    assert refreshed.totals.events == initial.totals.events + 1
+    assert refreshed.totals.messages == initial.totals.messages + 1
 
 
 def test_same_logical_revision_from_two_locations_is_deduplicated(tmp_path: Path) -> None:

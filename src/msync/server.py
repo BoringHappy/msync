@@ -251,6 +251,13 @@ class ArchiveMetricsResponse(BaseModel):
     session_depth: list[CountMetricResponse]
     recent_sessions: list[ConversationSummaryResponse]
     latest_activity_at: str | None
+    revision: int
+
+
+class ArchiveRevisionResponse(BaseModel):
+    """Lightweight archive change token used by dashboard polling."""
+
+    revision: int
 
 
 class MessagePartResponse(BaseModel):
@@ -607,6 +614,17 @@ def create_app(
         return archive.browse_metrics(
             account_username=account.username,
             include_legacy=account.username == legacy_owner,
+        )
+
+    @app.get("/api/metrics/revision", response_model=ArchiveRevisionResponse)
+    def metrics_revision(
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
+    ) -> ArchiveRevisionResponse:
+        return ArchiveRevisionResponse(
+            revision=archive.archive_revision(
+                account_username=account.username,
+                include_legacy=account.username == legacy_owner,
+            )
         )
 
     @app.get("/api/conversations", response_model=list[ConversationSummaryResponse])

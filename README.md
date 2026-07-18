@@ -126,8 +126,10 @@ triggers. Existing schemas are migrated by the explicit `msync upgrade` maintena
 During the development phase, version 5 is the oldest supported upgrade baseline; earlier
 development schemas should be recreated or exported with their compatible msync release. Known
 migrations are registered as sequential steps. Schema v7 adds account ownership and tenant-local
-revision uniqueness. Future migrations can extend the same chain without changing the CLI
-workflow. Partial or otherwise incompatible schemas fail before any transcript is uploaded.
+revision uniqueness. Schema v8 adds upload-time conversation metrics and owner revisions so the
+dashboard does not rescan native events on every request. Future migrations can extend the same
+chain without changing the CLI workflow. Partial or otherwise incompatible schemas fail before
+any transcript is uploaded.
 
 For a shared or large archive, stop uploads and run the schema upgrade explicitly before starting
 the web server:
@@ -239,10 +241,11 @@ Then open `http://127.0.0.1:8000` and sign in as `msync`. The web UI uses a term
 Claude/Codex layout. The overview dashboard summarizes session, message, tool, streak, provider,
 and recent-work activity. The dedicated **Insights** page adds a 30-day activity pulse, weekly and
 hourly rhythms, session depth, plus top project, tool, and model breakdowns. Metrics are scoped to
-the signed-in archive account. The session browser includes a location picker, search,
+the signed-in archive account, cached by its archive revision, and refreshed automatically within
+about 15 seconds of a completed upload. The session browser includes a location picker, search,
 chronological message rendering, and lossless event inspection. Tool calls and results share
-compact activity cards, while assistant
-messages render common Markdown, GitHub-style tables, and fenced code blocks without accepting
+compact activity cards, while assistant messages render common Markdown, GitHub-style tables, and
+fenced code blocks without accepting
 embedded HTML. Injected Claude skill/context records are kept out of the human conversation and
 remain available in **Raw events**. Order the session list by time, activity, or title. Long
 conversation titles stay on one line and expose their full value on hover or keyboard focus. Use the
@@ -304,6 +307,8 @@ The database is deliberately split into distinct storage and indexing layers:
 | `schema_info` | Portable application schema version used by SQLAlchemy-managed databases. |
 | `locations` | One account, hostname, and Claude/Codex data-directory tuple, allowing isolated users, machines, and installations. |
 | `conversations` | Account-owned session metadata, tenant-local logical revision identity, and a zlib-compressed byte-exact source JSONL. |
+| `conversation_metrics` | Upload-time message, event, tool, timing, and preview facts used by the dashboard. |
+| `archive_revisions` | Per-owner change tokens used for aggregate cache invalidation and browser refresh. |
 | `events` | Every JSONL record in source order, including its untouched JSON and normalized role/type fields. |
 | `message_parts` | Structured content blocks such as text, tool use, and tool results. |
 | `events_fts` | SQLite-only FTS5 index maintained automatically for future full-text search. |
