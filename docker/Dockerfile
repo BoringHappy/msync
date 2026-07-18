@@ -41,5 +41,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()"]
 
-ENTRYPOINT ["msync"]
+ENTRYPOINT ["python", "-m", "msync.docker_entrypoint"]
 CMD ["server", "--host", "0.0.0.0", "--database", "/data/msync.sqlite"]

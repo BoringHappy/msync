@@ -35,13 +35,13 @@ bundled PostgreSQL service, set passwords and start the default Compose configur
 
 ```console
 $ export MSYNC_SERVER_PASSWORD='choose-a-strong-web-password'
-$ export POSTGRES_PASSWORD='choose-a-url-safe-database-password'
+$ export POSTGRES_PASSWORD='choose-a-strong-database-password'
 $ make docker-up-postgres
 ```
 
-PostgreSQL data is retained in a named volume. The database password is included in a SQLAlchemy
-URL, so percent-encode URL-reserved characters or use a password containing only URL-safe
-characters.
+PostgreSQL data is retained in a named volume. The container safely encodes the database URL at
+startup, so the PostgreSQL password can contain URL-reserved characters without additional
+escaping.
 
 To connect only the msync container to an existing PostgreSQL database, use the external-database
 configuration and provide its SQLAlchemy URL:
