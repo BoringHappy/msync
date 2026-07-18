@@ -452,7 +452,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert paged.json()["summary"]["event_count"] == 4
     assert [event["sequence"] for event in paged.json()["events"]] == [1, 2]
     assert missing.status_code == 404
-    assert "<title>Conversation History · msync</title>" in page.text
+    assert "<title>AI Coding Sessions · msync</title>" in page.text
     assert "Raw events" in page.text
     assert "ctrlKey" in script.text
     assert "moveEventFocus" in script.text
