@@ -182,30 +182,37 @@ def _matches_project(item: dict[str, Any], aliases: set[str]) -> bool:
 
 
 def _search(args: argparse.Namespace, base_url: str, token: str) -> None:
-    request_limit = 500 if args.project else args.limit
-    request_offset = 0 if args.project else args.offset
-    payload = _request_json(
-        base_url,
-        token,
-        "/api/conversations",
-        {
-            "search": args.query.strip(),
-            "order": args.order,
-            "limit": request_limit,
-            "offset": request_offset,
-        },
-    )
-    if not isinstance(payload, list):
-        raise RecallError("msync returned an invalid conversation list.")
-    conversations = payload
     if args.project:
         aliases = _project_aliases()
-        conversations = [
-            item
-            for item in conversations
-            if isinstance(item, dict) and _matches_project(item, aliases)
-        ]
+        matches: list[dict[str, Any]] = []
+        server_offset = 0
+        desired_count = args.offset + args.limit
+        while len(matches) < desired_count:
+            page = _conversation_page(
+                base_url,
+                token,
+                query=args.query,
+                order=args.order,
+                limit=500,
+                offset=server_offset,
+            )
+            matches.extend(
+                item for item in page if isinstance(item, dict) and _matches_project(item, aliases)
+            )
+            if len(page) < 500:
+                break
+            server_offset += len(page)
+        conversations = matches
         conversations = conversations[args.offset : args.offset + args.limit]
+    else:
+        conversations = _conversation_page(
+            base_url,
+            token,
+            query=args.query,
+            order=args.order,
+            limit=args.limit,
+            offset=args.offset,
+        )
 
     if not conversations:
         print("No matching conversations found.")
@@ -227,12 +234,43 @@ def _search(args: argparse.Namespace, base_url: str, token: str) -> None:
             print(f"  preview: {_one_line(preview, 300)}")
 
 
-def _read(args: argparse.Namespace, base_url: str, token: str) -> None:
+def _conversation_page(
+    base_url: str,
+    token: str,
+    *,
+    query: str,
+    order: str,
+    limit: int,
+    offset: int,
+) -> list[Any]:
     payload = _request_json(
         base_url,
         token,
-        f"/api/conversations/{args.conversation_id}",
-        {"event_limit": args.limit, "event_offset": args.offset},
+        "/api/conversations",
+        {
+            "search": query.strip(),
+            "order": order,
+            "limit": limit,
+            "offset": offset,
+            "preview_chars": 300,
+        },
+    )
+    if not isinstance(payload, list):
+        raise RecallError("msync returned an invalid conversation list.")
+    return payload
+
+
+def _read(args: argparse.Namespace, base_url: str, token: str) -> None:
+    params = {
+        "event_limit": args.limit,
+        "event_offset": args.offset,
+        "max_chars": args.max_chars,
+    }
+    payload = _request_json(
+        base_url,
+        token,
+        f"/api/conversations/{args.conversation_id}/context",
+        params,
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("summary"), dict):
         raise RecallError("msync returned an invalid conversation.")
@@ -262,7 +300,7 @@ def _read(args: argparse.Namespace, base_url: str, token: str) -> None:
         occurred_at = event.get("occurred_at")
         suffix = f" | {occurred_at}" if occurred_at else ""
         print(f"\n[{event.get('sequence', '?')} | {label}{suffix}]")
-        print(_bounded_text(text.strip(), args.max_chars))
+        print(text.strip())
         printed += 1
     if not printed:
         print("\nNo visible messages in this event page.")
@@ -276,13 +314,6 @@ def _read(args: argparse.Namespace, base_url: str, token: str) -> None:
 def _one_line(value: Any, limit: int) -> str:
     text = " ".join(str(value).split())
     return text if len(text) <= limit else f"{text[: limit - 1]}…"
-
-
-def _bounded_text(text: str, limit: int) -> str:
-    if limit == 0 or len(text) <= limit:
-        return text
-    omitted = len(text) - limit
-    return f"{text[:limit]}\n[… {omitted} characters omitted; raise --max-chars to include them]"
 
 
 def main() -> int:

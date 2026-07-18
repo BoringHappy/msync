@@ -327,6 +327,28 @@ class ConversationResponse(BaseModel):
     events: list[EventResponse]
 
 
+class ContextEventResponse(BaseModel):
+    """Bounded normalized event content for agent context retrieval."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    sequence: int
+    event_type: str
+    event_subtype: str | None
+    role: str | None
+    occurred_at: str | None
+    text: str
+
+
+class ConversationContextResponse(BaseModel):
+    """Conversation summary and bounded events without raw transcript data."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    summary: ConversationSummaryResponse
+    events: list[ContextEventResponse]
+
+
 def create_app(
     database: str | Path,
     *,
@@ -675,6 +697,7 @@ def create_app(
         order: Literal["newest", "oldest", "messages", "events", "title"] = "newest",
         limit: Annotated[int, Query(ge=1, le=500)] = 200,
         offset: Annotated[int, Query(ge=0)] = 0,
+        preview_chars: Annotated[int | None, Query(ge=1, le=10_000)] = None,
         account: ServerAccount = Depends(require_auth),  # noqa: B008
     ) -> list[Any]:
         return archive.browse_conversations(
@@ -683,6 +706,7 @@ def create_app(
             order_by=order,
             limit=limit,
             offset=offset,
+            preview_max_chars=preview_chars,
             account_username=account.username,
             include_legacy=account.username == legacy_owner,
         )
@@ -732,6 +756,30 @@ def create_app(
         if result is None:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         return result
+
+    @app.get(
+        "/api/conversations/{conversation_id}/context",
+        response_model=ConversationContextResponse,
+    )
+    def conversation_context(
+        conversation_id: int,
+        event_limit: Annotated[int, Query(ge=1, le=500)] = 200,
+        event_offset: Annotated[int, Query(ge=0)] = 0,
+        max_chars: Annotated[int, Query(ge=0, le=1_000_000)] = 12_000,
+        account: ServerAccount = Depends(require_auth),  # noqa: B008
+    ) -> Any:
+        result = archive.browse_conversation(
+            conversation_id,
+            event_limit=event_limit,
+            event_offset=event_offset,
+            include_raw=False,
+            event_text_max_chars=max_chars or None,
+            account_username=account.username,
+            include_legacy=account.username == legacy_owner,
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return {"summary": result.summary, "events": result.events}
 
     return app
 

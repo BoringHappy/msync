@@ -99,7 +99,7 @@ Usernames and tokens must be unique. Commas and semicolons cannot appear inside 
 To use an existing PostgreSQL database instead:
 
 ```console
-$ export MSYNC_SERVER_ACCOUNTS='alice,web-password,upload-token'
+$ export MSYNC_SERVER_ACCOUNTS='alice,web-password,access-token'
 $ export MSYNC_DATABASE_URL='postgresql+psycopg://msync:secret@database.example.com/msync'
 $ make docker-up-external-db
 ```

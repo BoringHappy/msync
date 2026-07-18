@@ -104,6 +104,53 @@ def test_recall_history_filters_search_to_current_project(
     assert "42 | codex" in output
     assert "99 | claude" not in output
     assert requests[0]["limit"] == 500
+    assert requests[0]["offset"] == 0
+    assert requests[0]["preview_chars"] == 300
+
+
+def test_recall_history_pages_until_it_finds_project_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_skill_script()
+    offsets: list[int] = []
+
+    def fake_request(
+        base_url: str,
+        token: str,
+        path: str,
+        params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        del base_url, token, path
+        offsets.append(params["offset"])
+        if params["offset"] == 0:
+            return [
+                {"id": 1, "cwd": "/work/msync"},
+                *[
+                    {"id": identifier, "cwd": "/work/another-project"}
+                    for identifier in range(2, 501)
+                ],
+            ]
+        return [
+            {
+                "id": 501,
+                "provider": "codex",
+                "external_id": "matching",
+                "cwd": "/work/msync",
+            }
+        ]
+
+    monkeypatch.setattr(module, "_request_json", fake_request)
+    monkeypatch.setattr(module, "_project_aliases", lambda: {"msync"})
+    module._search(
+        Namespace(query="migration", project=True, limit=1, offset=1, order="newest"),
+        "https://history.example",
+        "secret-token",
+    )
+
+    output = capsys.readouterr().out
+    assert offsets == [0, 500]
+    assert "501 | codex" in output
 
 
 def test_recall_history_reads_visible_messages_and_reports_next_page(
@@ -111,10 +158,18 @@ def test_recall_history_reads_visible_messages_and_reports_next_page(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     module = _load_skill_script()
-    monkeypatch.setattr(
-        module,
-        "_request_json",
-        lambda *args, **kwargs: {
+    captured: dict[str, Any] = {}
+
+    def fake_request(
+        base_url: str,
+        token: str,
+        path: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        del base_url, token
+        captured["path"] = path
+        captured["params"] = params
+        return {
             "summary": {
                 "id": 42,
                 "external_id": "session-42",
@@ -132,8 +187,9 @@ def test_recall_history_reads_visible_messages_and_reports_next_page(
                     "text": "Answer",
                 },
             ],
-        },
-    )
+        }
+
+    monkeypatch.setattr(module, "_request_json", fake_request)
     module._read(
         Namespace(conversation_id=42, limit=3, offset=0, max_chars=12_000, all_events=False),
         "https://history.example",
@@ -145,9 +201,15 @@ def test_recall_history_reads_visible_messages_and_reports_next_page(
     assert "[2 | assistant]" in output
     assert "hidden" not in output
     assert "continue with --offset 3" in output
+    assert captured["path"] == "/api/conversations/42/context"
+    assert captured["params"] == {
+        "event_limit": 3,
+        "event_offset": 0,
+        "max_chars": 12_000,
+    }
 
 
-def test_recall_history_bounds_large_event_output(
+def test_recall_history_prints_server_bounded_event_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -167,7 +229,7 @@ def test_recall_history_bounds_large_event_output(
                     "sequence": 0,
                     "event_type": "message",
                     "role": "assistant",
-                    "text": "abcdefghij",
+                    "text": "abcd\n[… 6 characters omitted]",
                 }
             ],
         },

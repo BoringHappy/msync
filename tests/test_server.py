@@ -748,6 +748,7 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
         locations = client.get("/api/locations")
         all_conversations = client.get("/api/conversations")
         search_results = client.get("/api/conversations", params={"search": "blue widget"})
+        bounded_previews = client.get("/api/conversations", params={"preview_chars": 4})
         location_id = locations.json()[1]["id"]
         selected_location = client.get("/api/conversations", params={"location": location_id})
         first_page = client.get("/api/conversations", params={"limit": 1, "offset": 0})
@@ -763,6 +764,7 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
     assert len(all_conversations.json()) == 2
     assert all(conversation["hostname"] for conversation in all_conversations.json())
     assert [item["external_id"] for item in search_results.json()] == ["first-session"]
+    assert {item["preview"] for item in bounded_previews.json()} == {"Inve", "Ship"}
     assert len(selected_location.json()) == 1
     assert selected_location.json()[0]["location_id"] == location_id
     assert len(first_page.json()) == 1
@@ -801,7 +803,12 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
             f"/api/conversations/{summary['id']}",
             params={"event_limit": 2, "event_offset": 1},
         )
+        context = client.get(
+            f"/api/conversations/{summary['id']}/context",
+            params={"event_limit": 2, "event_offset": 1, "max_chars": 4},
+        )
         missing = client.get("/api/conversations/999999")
+        missing_context = client.get("/api/conversations/999999/context")
         page = client.get("/")
         insights_page = client.get("/insights")
         sessions_page = client.get("/sessions")
@@ -824,7 +831,21 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert paged.status_code == 200
     assert paged.json()["summary"]["event_count"] == 4
     assert [event["sequence"] for event in paged.json()["events"]] == [1, 2]
+    assert context.status_code == 200
+    context_detail = context.json()
+    assert set(context_detail) == {"summary", "events"}
+    assert [event["sequence"] for event in context_detail["events"]] == [1, 2]
+    assert context_detail["events"][0]["text"] == "Show\n[… 17 characters omitted]"
+    assert set(context_detail["events"][0]) == {
+        "sequence",
+        "event_type",
+        "event_subtype",
+        "role",
+        "occurred_at",
+        "text",
+    }
     assert missing.status_code == 404
+    assert missing_context.status_code == 404
     assert insights_page.status_code == 200
     assert sessions_page.status_code == 200
     assert metrics_response.status_code == 200
