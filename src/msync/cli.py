@@ -103,6 +103,14 @@ def upload(
             help="Wait for a selected transcript to stop changing before upload.",
         ),
     ] = False,
+    expected_assistant_sha256: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-assistant-sha256",
+            hidden=True,
+            help="Wait until this assistant-message digest appears in the transcript.",
+        ),
+    ] = None,
     provider: Annotated[
         str,
         typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
@@ -128,14 +136,21 @@ def upload(
     try:
         if not token:
             raise ValueError("--url requires --token or MSYNC_UPLOAD_TOKEN.")
-        if wait_for_transcript:
-            if transcript is None:
-                raise ValueError("--wait-for-transcript requires --transcript.")
-            wait_for_transcript_stable(transcript)
         selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
         transcripts = _upload_transcripts(root, selected_provider, transcript)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
+        if expected_assistant_sha256 is not None and not wait_for_transcript:
+            raise ValueError("--expected-assistant-sha256 requires --wait-for-transcript.")
+        if wait_for_transcript:
+            if transcript is None:
+                raise ValueError("--wait-for-transcript requires --transcript.")
+            wait_for_transcript_stable(
+                transcripts[0],
+                provider=selected_provider,
+                root=root,
+                expected_assistant_sha256=expected_assistant_sha256,
+            )
         verified_transcripts, verification_failures = _verify_transcripts(
             root=root,
             provider=selected_provider,

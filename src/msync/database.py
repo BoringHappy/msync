@@ -1688,6 +1688,14 @@ class Archive:
         )
         if existing is not None and existing.relative_path != relative_path:
             raise RuntimeError("A SHA-256 collision occurred while identifying a transcript.")
+        if (
+            existing is not None
+            and source_mtime_ns is not None
+            and source_mtime_ns > 0
+            and source_mtime_ns < existing.source_mtime_ns
+        ):
+            result.unchanged += 1
+            return
         if existing is not None and existing.content_sha256 == content_sha256:
             identity = (
                 (existing.logical_session_id, existing.chat_sha256)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -11,7 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TextIO
 
-from msync.providers import get_provider
+from msync.providers import HistoryProvider, get_provider
 
 _PROVIDER_ROOT_ENV = {
     "claude": "CLAUDE_CONFIG_DIR",
@@ -22,8 +23,9 @@ _PROVIDER_TRANSCRIPT_DIRECTORIES = {
     "codex": frozenset({"sessions", "archived_sessions"}),
 }
 _TRANSCRIPT_QUIET_SECONDS = 2.0
-_TRANSCRIPT_WAIT_TIMEOUT_SECONDS = 10.0
+_TRANSCRIPT_WAIT_TIMEOUT_SECONDS = 30.0
 _TRANSCRIPT_POLL_SECONDS = 0.1
+_CLOCK_EPSILON_SECONDS = 1e-9
 
 
 def queue_session_upload(
@@ -55,6 +57,7 @@ def queue_session_upload(
 
     provider_name, root = _history_location(provider_name, transcript, environment)
     provider = get_provider(provider_name)
+    expected_assistant_sha256 = _hook_assistant_sha256(hook_input, provider.name)
     command = [
         sys.executable,
         "-m",
@@ -65,9 +68,10 @@ def queue_session_upload(
         "--transcript",
         str(transcript),
         "--wait-for-transcript",
-        "--provider",
-        provider.name,
     ]
+    if expected_assistant_sha256 is not None:
+        command.extend(["--expected-assistant-sha256", expected_assistant_sha256])
+    command.extend(["--provider", provider.name])
     _spawn_detached(command, environment)
     return True
 
@@ -75,6 +79,9 @@ def queue_session_upload(
 def wait_for_transcript_stable(
     transcript: Path,
     *,
+    provider: HistoryProvider | None = None,
+    root: Path | None = None,
+    expected_assistant_sha256: str | None = None,
     quiet_seconds: float = _TRANSCRIPT_QUIET_SECONDS,
     timeout_seconds: float = _TRANSCRIPT_WAIT_TIMEOUT_SECONDS,
     poll_seconds: float = _TRANSCRIPT_POLL_SECONDS,
@@ -83,27 +90,100 @@ def wait_for_transcript_stable(
 
     if quiet_seconds <= 0 or timeout_seconds <= 0 or poll_seconds <= 0:
         raise ValueError("Transcript wait intervals must be greater than zero.")
+    if expected_assistant_sha256 is not None:
+        if provider is None or root is None:
+            raise ValueError("Expected assistant message requires a provider and history root.")
+        _validate_sha256(expected_assistant_sha256)
 
     signature = _transcript_signature(transcript)
     started_at = time.monotonic()
     unchanged_since = started_at
+    expected_seen = expected_assistant_sha256 is None or _transcript_has_assistant_message(
+        transcript,
+        provider=provider,
+        root=root,
+        expected_sha256=expected_assistant_sha256,
+    )
     while True:
         now = time.monotonic()
         quiet_remaining = quiet_seconds - (now - unchanged_since)
         timeout_remaining = timeout_seconds - (now - started_at)
-        if quiet_remaining <= 0 or timeout_remaining <= 0:
+        if expected_seen and quiet_remaining <= _CLOCK_EPSILON_SECONDS:
+            return
+        if timeout_remaining <= _CLOCK_EPSILON_SECONDS:
+            if not expected_seen:
+                raise TimeoutError("Final assistant message did not appear in the transcript.")
             return
 
-        time.sleep(min(poll_seconds, quiet_remaining, timeout_remaining))
+        wait_seconds = min(poll_seconds, timeout_remaining)
+        if expected_seen:
+            wait_seconds = min(wait_seconds, quiet_remaining)
+        time.sleep(wait_seconds)
         current_signature = _transcript_signature(transcript)
         if current_signature != signature:
             signature = current_signature
             unchanged_since = time.monotonic()
+            if expected_assistant_sha256 is not None:
+                expected_seen = _transcript_has_assistant_message(
+                    transcript,
+                    provider=provider,
+                    root=root,
+                    expected_sha256=expected_assistant_sha256,
+                )
 
 
 def _transcript_signature(transcript: Path) -> tuple[int, int]:
     stat = transcript.stat()
     return stat.st_size, stat.st_mtime_ns
+
+
+def _hook_assistant_sha256(hook_input: dict[str, Any], provider_name: str) -> str | None:
+    if provider_name != "claude":
+        return None
+    message = hook_input.get("last_assistant_message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    return _assistant_message_sha256(message)
+
+
+def _transcript_has_assistant_message(
+    transcript: Path,
+    *,
+    provider: HistoryProvider | None,
+    root: Path | None,
+    expected_sha256: str,
+) -> bool:
+    assert provider is not None
+    assert root is not None
+    try:
+        conversation = provider.read(transcript, root)
+    except OSError, ValueError:
+        return False
+
+    assistant_events = [event for event in conversation.events if event.role == "assistant"]
+    if not assistant_events:
+        return False
+    latest = assistant_events[-1]
+    candidates = [latest.searchable_text, *(part.text for part in latest.parts)]
+    return any(
+        _assistant_message_sha256(candidate) == expected_sha256
+        for candidate in candidates
+        if candidate
+    )
+
+
+def _assistant_message_sha256(message: str) -> str:
+    normalized = message.replace("\r\n", "\n").strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def _validate_sha256(value: str) -> None:
+    if len(value) != 64:
+        raise ValueError("Expected assistant message digest must be a SHA-256 value.")
+    try:
+        int(value, 16)
+    except ValueError as error:
+        raise ValueError("Expected assistant message digest must be a SHA-256 value.") from error
 
 
 def _history_location(

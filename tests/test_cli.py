@@ -350,8 +350,14 @@ def test_hook_upload_waits_for_selected_transcript_before_verification(
     transcript.touch()
     calls: list[str] = []
 
-    def fake_wait(path: Path) -> None:
+    def fake_wait(
+        path: Path,
+        **options: Any,
+    ) -> None:
         assert path == transcript.resolve()
+        assert options["provider"].name == "codex"
+        assert options["root"] == root.resolve()
+        assert options["expected_assistant_sha256"] is None
         calls.append("wait")
         _write_codex_transcript(root)
 

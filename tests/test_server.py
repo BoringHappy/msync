@@ -547,6 +547,12 @@ def test_remote_upload_upserts_changed_single_transcript(tmp_path: Path) -> None
             content=_remote_upload_body(metadata, content("Updated answer")),
             headers=_upload_headers("alice-token"),
         )
+        metadata["source_mtime_ns"] = 123
+        stale = client.post(
+            "/api/upload",
+            content=_remote_upload_body(metadata, content("First answer")),
+            headers=_upload_headers("alice-token"),
+        )
         summaries = client.get(
             "/api/conversations",
             auth=("alice", "alice-password"),
@@ -560,6 +566,9 @@ def test_remote_upload_upserts_changed_single_transcript(tmp_path: Path) -> None
     assert first.json()["imported"] == 1
     assert second.status_code == 200
     assert second.json()["updated"] == 1
+    assert stale.status_code == 200
+    assert stale.json()["updated"] == 0
+    assert stale.json()["unchanged"] == 1
     assert len(summaries) == 1
     assert [event["text"] for event in detail["events"] if event["role"] == "assistant"] == [
         "Updated answer"

@@ -123,10 +123,11 @@ network.
 
 The bundled `msync` plugin registers a `Stop` hook for both clients. Every completed agent turn
 starts a detached `msync upload` process for only the `transcript_path` supplied by that hook. The
-hook returns immediately; the background process gives the transcript a short quiet window for the
-client's final write, then verifies and uploads it. The server imports a new relative path, skips an
-unchanged content hash, or replaces the normalized events when that transcript has changed, so
-repeated Stop events are safe upserts.
+hook returns immediately. For Claude Code, the background process waits until the hook's final
+assistant message appears in the transcript and the file becomes quiet; Codex uses the quiet window
+directly. The worker then verifies and uploads the transcript. The server imports a new relative
+path, skips unchanged or stale content, or replaces the normalized events when a newer transcript
+has changed, so repeated and overlapping Stop events are safe upserts.
 
 Install the `msync` CLI as described above, export `MSYNC_UPLOAD_URL` and `MSYNC_UPLOAD_TOKEN` in the
 environment that launches the client, then install the plugin from this repository.
