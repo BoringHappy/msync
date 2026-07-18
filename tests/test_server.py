@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
@@ -13,7 +15,13 @@ from msync.cli import app
 from msync.database import Archive
 from msync.providers import get_provider
 from msync.remote import UPLOAD_CONTENT_TYPE, RemoteUploadMetadata, encode_upload_prefix
-from msync.server import ServerAccount, create_app, parse_server_accounts
+from msync.server import (
+    ServerAccount,
+    _FormBodyError,
+    _read_form_fields,
+    create_app,
+    parse_server_accounts,
+)
 
 
 def _remote_upload_body(metadata: dict[str, Any], content: bytes) -> bytes:
@@ -164,10 +172,20 @@ def test_server_uses_login_session_and_redirects_unauthenticated_pages(tmp_path:
     with TestClient(web_app) as client:
         page = client.get("/?conversation=42&order=oldest", follow_redirects=False)
         login_page = client.get(page.headers["location"])
+        login_csrf = client.cookies.get("msync_csrf")
         api = client.get("/api/locations")
+        browser_api = client.get(
+            "/api/locations",
+            headers={"X-Msync-Browser-Request": "1"},
+        )
         wrong = client.post(
             "/login",
-            data={"username": "reader", "password": "wrong", "next": "/"},
+            data={
+                "username": "reader",
+                "password": "wrong",
+                "next": "/",
+                "csrf_token": login_csrf,
+            },
         )
         signed_in = client.post(
             "/login",
@@ -175,12 +193,17 @@ def test_server_uses_login_session_and_redirects_unauthenticated_pages(tmp_path:
                 "username": "reader",
                 "password": "secret",
                 "next": "/?conversation=42&order=oldest",
+                "csrf_token": client.cookies.get("msync_csrf"),
             },
             follow_redirects=False,
         )
         authenticated_page = client.get("/")
         authenticated_api = client.get("/api/locations")
-        signed_out = client.post("/logout", follow_redirects=False)
+        signed_out = client.post(
+            "/logout",
+            data={"csrf_token": client.cookies.get("msync_csrf")},
+            follow_redirects=False,
+        )
         page_after_logout = client.get("/", follow_redirects=False)
         basic_api = client.get("/api/locations", auth=("reader", "secret"))
 
@@ -189,8 +212,14 @@ def test_server_uses_login_session_and_redirects_unauthenticated_pages(tmp_path:
     assert login_page.status_code == 200
     assert "Sign in to your archive" in login_page.text
     assert 'value="/?conversation=42&amp;order=oldest"' in login_page.text
+    assert login_csrf is not None
+    assert f'name="csrf_token" value="{login_csrf}"' in login_page.text
+    assert "HttpOnly" in login_page.headers["set-cookie"]
+    assert "SameSite=strict" in login_page.headers["set-cookie"]
     assert api.status_code == 401
-    assert "www-authenticate" not in api.headers
+    assert api.headers["www-authenticate"].startswith("Basic")
+    assert browser_api.status_code == 401
+    assert "www-authenticate" not in browser_api.headers
     assert wrong.status_code == 401
     assert "The username or password is incorrect." in wrong.text
     assert signed_in.status_code == 303
@@ -199,6 +228,8 @@ def test_server_uses_login_session_and_redirects_unauthenticated_pages(tmp_path:
     assert "HttpOnly" in signed_in.headers["set-cookie"]
     assert "SameSite=lax" in signed_in.headers["set-cookie"]
     assert authenticated_page.status_code == 200
+    assert 'name="csrf_token"' in authenticated_page.text
+    assert "__MSYNC_CSRF__" not in authenticated_page.text
     assert authenticated_api.status_code == 200
     assert signed_out.status_code == 303
     assert signed_out.headers["location"] == "/login"
@@ -217,6 +248,7 @@ def test_server_login_rejects_unsafe_redirects_and_tampered_sessions(tmp_path: P
                 "username": "reader",
                 "password": "secret",
                 "next": "//example.com/archive",
+                "csrf_token": client.cookies.get("msync_csrf"),
             },
             follow_redirects=False,
         )
@@ -235,6 +267,78 @@ def test_server_login_rejects_unsafe_redirects_and_tampered_sessions(tmp_path: P
     assert session_cookie is not None
     assert tampered.status_code == 303
     assert tampered.headers["location"] == "/login?next=%2F"
+
+
+def test_server_login_and_logout_require_csrf_token(tmp_path: Path) -> None:
+    web_app = create_app(tmp_path / "archive.sqlite", username="reader", password="secret")
+
+    with TestClient(web_app) as client:
+        rejected_login = client.post(
+            "/login",
+            data={
+                "username": "reader",
+                "password": "secret",
+                "next": "/",
+                "csrf_token": "attacker-token",
+            },
+            follow_redirects=False,
+        )
+        client.get("/login")
+        csrf_token = client.cookies.get("msync_csrf")
+        signed_in = client.post(
+            "/login",
+            data={
+                "username": "reader",
+                "password": "secret",
+                "next": "/",
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        rejected_logout = client.post(
+            "/logout",
+            data={"csrf_token": ""},
+            follow_redirects=False,
+        )
+        still_authenticated = client.get("/", follow_redirects=False)
+        signed_out = client.post(
+            "/logout",
+            data={"csrf_token": client.cookies.get("msync_csrf")},
+            follow_redirects=False,
+        )
+
+    assert rejected_login.status_code == 403
+    assert "sign-in form expired" in rejected_login.text
+    assert signed_in.status_code == 303
+    assert rejected_logout.status_code == 403
+    assert still_authenticated.status_code == 200
+    assert signed_out.status_code == 303
+
+
+def test_server_stops_reading_oversized_chunked_login_body() -> None:
+    chunks_read = 0
+    chunks = iter([b"x" * 8192] * 100)
+
+    async def receive() -> dict[str, Any]:
+        nonlocal chunks_read
+        chunks_read += 1
+        return {"type": "http.request", "body": next(chunks), "more_body": True}
+
+    request = Request(
+        {
+            "type": "http",
+            "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+        },
+        receive,
+    )
+    try:
+        asyncio.run(_read_form_fields(request))
+    except _FormBodyError as error:
+        assert error.status_code == 413
+    else:
+        raise AssertionError("Accepted an oversized chunked login body")
+
+    assert chunks_read == 9
 
 
 def test_server_account_configuration_accepts_optional_tokens() -> None:
@@ -322,6 +426,27 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
             headers=_upload_headers("alice-token"),
         )
 
+        client.get("/login")
+        alice_sign_in = client.post(
+            "/login",
+            data={
+                "username": "alice",
+                "password": "alice-password",
+                "next": "/",
+                "csrf_token": client.cookies.get("msync_csrf"),
+            },
+            follow_redirects=False,
+        )
+        alice_session_locations = client.get("/api/locations")
+        explicit_bob_locations = client.get(
+            "/api/locations",
+            auth=("bob", "bob-password"),
+        )
+        invalid_basic_with_cookie = client.get(
+            "/api/locations",
+            auth=("alice", "wrong-password"),
+        )
+
         alice_locations = client.get("/api/locations", auth=("alice", "alice-password"))
         bob_locations = client.get("/api/locations", auth=("bob", "bob-password"))
         carol_locations = client.get("/api/locations", auth=("carol", "carol-password"))
@@ -342,6 +467,10 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
     assert carol_upload.json()["imported"] == 1
     assert repeated_alice_upload.status_code == 200
     assert repeated_alice_upload.json()["unchanged"] == 1
+    assert alice_sign_in.status_code == 303
+    assert len(alice_session_locations.json()) == 1
+    assert explicit_bob_locations.json() == []
+    assert invalid_basic_with_cookie.status_code == 401
     assert len(alice_locations.json()) == 1
     assert bob_locations.json() == []
     assert len(carol_locations.json()) == 1
@@ -529,6 +658,7 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert "updateTitleOverflow" in script.text
     assert "setFitWidth" in script.text
     assert "moveHumanMessage" in script.text
+    assert "X-Msync-Browser-Request" in script.text
     assert "sessionLoaderObserver" in script.text
     assert "transcriptLoaderObserver" in script.text
     assert "cancelEventPagination" in script.text
