@@ -3,12 +3,20 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from msync.schemas.claude import ClaudeRecord, ClaudeUserMessage, ClaudeUserRecord
+from msync.schemas.claude import (
+    ClaudeGeneratedTranscript,
+    ClaudeRecord,
+    ClaudeUserMessage,
+    ClaudeUserRecord,
+)
 from msync.schemas.codex import (
     CodexContentBlock,
+    CodexEventMessagePayload,
+    CodexGeneratedTranscript,
     CodexResponseMessageLine,
     CodexResponseMessagePayload,
     CodexRolloutLine,
+    CodexSessionMetaPayload,
 )
 
 
@@ -72,6 +80,80 @@ def test_codex_writer_schema_serializes_only_declared_payload_fields() -> None:
             content=[CodexContentBlock(type="output_text", text="answer")],
             future_payload_field="rejected",
         )
+
+
+def test_codex_writer_schema_allows_distinct_session_and_thread_ids() -> None:
+    payload = CodexSessionMetaPayload(
+        session_id="019f61a0-0000-7000-8000-000000000001",
+        id="019f61a0-0000-7000-8000-000000000002",
+        timestamp="2026-07-14T12:00:00Z",
+        cwd="/work",
+    )
+
+    assert payload.session_id != payload.id
+
+
+def test_codex_writer_schema_requires_role_appropriate_content_blocks() -> None:
+    with pytest.raises(ValidationError, match="assistant messages require output_text blocks"):
+        CodexResponseMessagePayload(
+            role="assistant",
+            content=[CodexContentBlock(type="input_text", text="answer")],
+        )
+
+
+def test_codex_writer_schema_rejects_assistant_phase_on_user_events() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="user_message events cannot declare an assistant phase",
+    ):
+        CodexEventMessagePayload(
+            type="user_message",
+            message="question",
+            phase="final_answer",
+        )
+
+
+def test_codex_transcript_schema_requires_session_metadata_first() -> None:
+    with pytest.raises(ValidationError, match="session_meta must be the first generated record"):
+        CodexGeneratedTranscript.model_validate(
+            [
+                {
+                    "timestamp": "2026-07-14T12:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "question"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-07-14T12:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "session_id": "019f61a0-0000-7000-8000-000000000001",
+                        "id": "019f61a0-0000-7000-8000-000000000001",
+                        "timestamp": "2026-07-14T12:00:00Z",
+                        "cwd": "/work",
+                    },
+                },
+            ]
+        )
+
+
+def test_claude_transcript_schema_requires_unique_contiguous_message_ids() -> None:
+    record = {
+        "type": "user",
+        "sessionId": "019f61a0-0000-7000-8000-000000000001",
+        "uuid": "019f61a0-0000-7000-8000-000000000002",
+        "parentUuid": None,
+        "timestamp": "2026-07-14T12:00:00Z",
+        "cwd": "/work",
+        "message": {"role": "user", "content": "question"},
+    }
+    duplicate = {**record, "parentUuid": record["uuid"]}
+
+    with pytest.raises(ValidationError, match="generated record UUIDs must be unique"):
+        ClaudeGeneratedTranscript.model_validate([record, duplicate])
 
 
 def test_claude_writer_schema_rejects_unknown_record_fields() -> None:
