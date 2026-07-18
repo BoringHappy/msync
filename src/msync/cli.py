@@ -125,8 +125,8 @@ def upload(
     token: Annotated[
         str | None,
         typer.Option(
-            envvar="MSYNC_UPLOAD_TOKEN",
-            help="Upload token for --url (or set MSYNC_UPLOAD_TOKEN).",
+            envvar="MSYNC_TOKEN",
+            help="API access token for --url (or set MSYNC_TOKEN).",
         ),
     ] = None,
 ) -> None:
@@ -135,7 +135,7 @@ def upload(
     root = directory.expanduser().resolve()
     try:
         if not token:
-            raise ValueError("--url requires --token or MSYNC_UPLOAD_TOKEN.")
+            raise ValueError("--url requires --token or MSYNC_TOKEN.")
         selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
         transcripts = _upload_transcripts(root, selected_provider, transcript)
         if not transcripts:

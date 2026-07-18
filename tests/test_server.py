@@ -368,7 +368,7 @@ def test_server_account_configuration_rejects_ambiguous_or_duplicate_credentials
             raise AssertionError(f"Accepted invalid server accounts: {value}")
 
 
-def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_only(
+def test_access_tokens_upload_read_and_isolate_accounts(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "archive.sqlite"
@@ -452,16 +452,35 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
         carol_locations = client.get("/api/locations", auth=("carol", "carol-password"))
         alice_conversations = client.get("/api/conversations", auth=("alice", "alice-password"))
         carol_conversations = client.get("/api/conversations", auth=("carol", "carol-password"))
+        alice_token_locations = client.get(
+            "/api/locations",
+            headers=_upload_headers("alice-token"),
+        )
+        alice_token_conversations = client.get(
+            "/api/conversations",
+            headers=_upload_headers("alice-token"),
+        )
+        carol_token_conversations = client.get(
+            "/api/conversations",
+            headers=_upload_headers("carol-token"),
+        )
+        invalid_token = client.get(
+            "/api/conversations",
+            headers=_upload_headers("wrong-token"),
+        )
         alice_metrics = client.get("/api/metrics", auth=("alice", "alice-password"))
         bob_metrics = client.get("/api/metrics", auth=("bob", "bob-password"))
-        alice_revision = client.get(
-            "/api/metrics/revision", auth=("alice", "alice-password")
-        )
+        alice_revision = client.get("/api/metrics/revision", auth=("alice", "alice-password"))
         bob_revision = client.get("/api/metrics/revision", auth=("bob", "bob-password"))
         carol_conversation_id = carol_conversations.json()[0]["id"]
+        alice_conversation_id = alice_token_conversations.json()[0]["id"]
+        alice_token_detail = client.get(
+            f"/api/conversations/{alice_conversation_id}",
+            headers=_upload_headers("alice-token"),
+        )
         cross_account_detail = client.get(
             f"/api/conversations/{carol_conversation_id}",
-            auth=("alice", "alice-password"),
+            headers=_upload_headers("alice-token"),
         )
 
     assert no_token.status_code == 401
@@ -482,6 +501,12 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
     assert len(carol_locations.json()) == 1
     assert len(alice_conversations.json()) == 1
     assert len(carol_conversations.json()) == 1
+    assert len(alice_token_locations.json()) == 1
+    assert len(alice_token_conversations.json()) == 1
+    assert len(carol_token_conversations.json()) == 1
+    assert alice_token_detail.status_code == 200
+    assert invalid_token.status_code == 401
+    assert invalid_token.headers["www-authenticate"] == "Bearer"
     assert alice_metrics.json()["totals"]["sessions"] == 1
     assert bob_metrics.json()["totals"]["sessions"] == 0
     assert [entry["unchanged"] for entry in alice_metrics.json()["recent_uploads"]] == [1, 0]
@@ -723,6 +748,7 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
         locations = client.get("/api/locations")
         all_conversations = client.get("/api/conversations")
         search_results = client.get("/api/conversations", params={"search": "blue widget"})
+        bounded_previews = client.get("/api/conversations", params={"preview_chars": 4})
         location_id = locations.json()[1]["id"]
         selected_location = client.get("/api/conversations", params={"location": location_id})
         first_page = client.get("/api/conversations", params={"limit": 1, "offset": 0})
@@ -738,6 +764,7 @@ def test_server_browses_and_filters_locations(tmp_path: Path) -> None:
     assert len(all_conversations.json()) == 2
     assert all(conversation["hostname"] for conversation in all_conversations.json())
     assert [item["external_id"] for item in search_results.json()] == ["first-session"]
+    assert {item["preview"] for item in bounded_previews.json()} == {"Inve", "Ship"}
     assert len(selected_location.json()) == 1
     assert selected_location.json()[0]["location_id"] == location_id
     assert len(first_page.json()) == 1
@@ -776,7 +803,12 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
             f"/api/conversations/{summary['id']}",
             params={"event_limit": 2, "event_offset": 1},
         )
+        context = client.get(
+            f"/api/conversations/{summary['id']}/context",
+            params={"event_limit": 2, "event_offset": 1, "max_chars": 4},
+        )
         missing = client.get("/api/conversations/999999")
+        missing_context = client.get("/api/conversations/999999/context")
         page = client.get("/")
         insights_page = client.get("/insights")
         sessions_page = client.get("/sessions")
@@ -799,7 +831,21 @@ def test_server_returns_normalized_and_expandable_event_details(tmp_path: Path) 
     assert paged.status_code == 200
     assert paged.json()["summary"]["event_count"] == 4
     assert [event["sequence"] for event in paged.json()["events"]] == [1, 2]
+    assert context.status_code == 200
+    context_detail = context.json()
+    assert set(context_detail) == {"summary", "events"}
+    assert [event["sequence"] for event in context_detail["events"]] == [1, 2]
+    assert context_detail["events"][0]["text"] == "Show\n[… 17 characters omitted]"
+    assert set(context_detail["events"][0]) == {
+        "sequence",
+        "event_type",
+        "event_subtype",
+        "role",
+        "occurred_at",
+        "text",
+    }
     assert missing.status_code == 404
+    assert missing_context.status_code == 404
     assert insights_page.status_code == 200
     assert sessions_page.status_code == 200
     assert metrics_response.status_code == 200

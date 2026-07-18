@@ -3,17 +3,18 @@
   "owner": {
     "name": "BoringHappy"
   },
-  "description": "Automatic conversation history uploads for Claude Code and Codex.",
+  "description": "Conversation uploads and remote history recall for Claude Code and Codex.",
   "plugins": [
     {
       "name": "msync",
       "source": "./plugins/msync",
-      "description": "Queue a single-session msync upsert after every completed agent turn.",
+      "description": "Upload completed sessions and recall relevant remote conversations.",
       "category": "Productivity",
       "tags": [
         "conversation-history",
         "sync",
-        "upload"
+        "upload",
+        "search"
       ]
     }
   ]

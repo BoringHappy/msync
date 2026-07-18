@@ -1,7 +1,7 @@
 {
   "name": "msync",
-  "version": "0.1.0",
-  "description": "Upload the current Codex or Claude Code session to msync after every turn.",
+  "version": "0.2.0",
+  "description": "Upload sessions and recall project context from a remote msync archive.",
   "author": {
     "name": "BoringHappy",
     "url": "https://github.com/BoringHappy"
@@ -12,20 +12,22 @@
   "keywords": [
     "conversation-history",
     "sync",
-    "upload"
+    "upload",
+    "search"
   ],
   "interface": {
     "displayName": "msync",
-    "shortDescription": "Upload completed sessions to your msync archive.",
-    "longDescription": "Queues a non-blocking, single-transcript upsert after each completed Codex or Claude Code turn.",
+    "shortDescription": "Upload sessions and recall remote project context.",
+    "longDescription": "Queues a non-blocking session upload after each completed turn and provides a skill for searching and reading prior project conversations.",
     "developerName": "BoringHappy",
     "category": "Productivity",
     "capabilities": [
-      "Automatic session upload"
+      "Automatic session upload",
+      "Remote conversation recall"
     ],
     "websiteURL": "https://github.com/BoringHappy/msync",
     "defaultPrompt": [
-      "Explain how automatic msync session uploads work."
+      "Find prior msync conversations that can help with my current project."
     ]
   }
 }

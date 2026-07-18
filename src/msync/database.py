@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from msync.models import Conversation
 from msync.providers import HistoryProvider, get_provider
@@ -328,6 +328,15 @@ def _archive_datetime(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _bounded_context_text(value: str, max_chars: int | None) -> str:
+    """Bound normalized context text before it leaves the archive process."""
+
+    if max_chars is None or len(value) <= max_chars:
+        return value
+    omitted = len(value) - max_chars
+    return f"{value[:max_chars]}\n[… {omitted} characters omitted]"
+
+
 def _session_depth_label(messages: int) -> str:
     if messages < 5:
         return "0–4"
@@ -555,9 +564,7 @@ class Archive:
         self.initialized_new_database = False
         self.schema_version_before: int | None = None
         self.schema_version = SCHEMA_VERSION
-        self._metrics_cache: dict[
-            tuple[str | None, bool], tuple[int, ArchiveMetrics]
-        ] = {}
+        self._metrics_cache: dict[tuple[str | None, bool], tuple[int, ArchiveMetrics]] = {}
         self._metrics_cache_lock = Lock()
         if self.sqlite_path is not None:
             self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
@@ -879,6 +886,7 @@ class Archive:
         order_by: str = "newest",
         limit: int = 200,
         offset: int = 0,
+        preview_max_chars: int | None = None,
         account_username: str | None = None,
         include_legacy: bool = False,
     ) -> list[ConversationSummary]:
@@ -888,6 +896,8 @@ class Archive:
             raise ValueError("Conversation limit must be between 1 and 500.")
         if offset < 0:
             raise ValueError("Conversation offset must not be negative.")
+        if preview_max_chars is not None and not 1 <= preview_max_chars <= 10_000:
+            raise ValueError("Preview limit must be between 1 and 10000 characters.")
         if order_by not in {"newest", "oldest", "messages", "events", "title"}:
             raise ValueError(f"Unsupported conversation order: {order_by}.")
 
@@ -921,6 +931,8 @@ class Archive:
             .correlate(ConversationRow)
             .scalar_subquery()
         )
+        if preview_max_chars is not None:
+            preview = func.substr(preview, 1, preview_max_chars)
         statement = (
             select(
                 ConversationRow.id,
@@ -1229,8 +1241,7 @@ class Archive:
             models=_breakdown_metrics(model_counts, model_messages, limit=6),
             projects=_breakdown_metrics(project_counts, project_messages, limit=6),
             tools=tuple(
-                CountMetric(label=label, count=count)
-                for label, count in tool_counts.most_common(6)
+                CountMetric(label=label, count=count) for label, count in tool_counts.most_common(6)
             ),
             weekdays=tuple(
                 CountMetric(label=label, count=weekday_counts[index])
@@ -1258,6 +1269,8 @@ class Archive:
         *,
         event_limit: int | None = None,
         event_offset: int = 0,
+        include_raw: bool = True,
+        event_text_max_chars: int | None = None,
         account_username: str | None = None,
         include_legacy: bool = False,
     ) -> ConversationDetail | None:
@@ -1267,6 +1280,8 @@ class Archive:
             raise ValueError("Event limit must be between 1 and 500.")
         if event_offset < 0:
             raise ValueError("Event offset must not be negative.")
+        if event_text_max_chars is not None and not 1 <= event_text_max_chars <= 1_000_000:
+            raise ValueError("Event text limit must be between 1 and 1000000 characters.")
 
         statement = (
             select(
@@ -1331,6 +1346,22 @@ class Archive:
                 .order_by(EventRow.sequence)
                 .offset(event_offset)
             )
+            if not include_raw:
+                event_statement = event_statement.options(
+                    load_only(
+                        EventRow.id,
+                        EventRow.sequence,
+                        EventRow.external_id,
+                        EventRow.parent_external_id,
+                        EventRow.event_type,
+                        EventRow.event_subtype,
+                        EventRow.role,
+                        EventRow.visibility,
+                        EventRow.occurred_at,
+                        EventRow.searchable_text,
+                        EventRow.parse_error,
+                    )
+                )
             if event_limit is not None:
                 event_statement = event_statement.limit(event_limit)
             event_rows = list(session.execute(event_statement).scalars())
@@ -1342,7 +1373,7 @@ class Archive:
                         .order_by(MessagePartRow.event_id, MessagePartRow.sequence)
                     ).scalars()
                 )
-                if event_rows
+                if include_raw and event_rows
                 else []
             )
 
@@ -1366,8 +1397,8 @@ class Archive:
                 role=event.role,
                 visibility=event.visibility,
                 occurred_at=event.occurred_at,
-                text=event.searchable_text,
-                raw_json=event.raw_json,
+                text=_bounded_context_text(event.searchable_text, event_text_max_chars),
+                raw_json=event.raw_json if include_raw else "",
                 parse_error=event.parse_error,
                 parts=tuple(parts_by_event.get(event.id, [])),
             )
@@ -1388,7 +1419,11 @@ class Archive:
             ended_at=row.ended_at,
             event_count=event_count,
             message_count=message_count,
-            preview=preview,
+            preview=(
+                _bounded_context_text(preview, event_text_max_chars)
+                if preview is not None
+                else None
+            ),
         )
         return ConversationDetail(
             summary=summary,
@@ -1915,9 +1950,7 @@ def _migrate_v5_to_v6(
             progress_reporter(completed, total)
 
     connection.execute(
-        update(SchemaInfoRow)
-        .where(SchemaInfoRow.key == "schema_version")
-        .values(value="6")
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="6")
     )
 
 
@@ -2021,9 +2054,7 @@ def _migrate_v6_to_v7(
         revision_index.create(connection)
 
     connection.execute(
-        update(SchemaInfoRow)
-        .where(SchemaInfoRow.key == "schema_version")
-        .values(value="7")
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="7")
     )
 
 
@@ -2106,9 +2137,7 @@ def _migrate_v7_to_v8(
             ],
         )
     connection.execute(
-        update(SchemaInfoRow)
-        .where(SchemaInfoRow.key == "schema_version")
-        .values(value="8")
+        update(SchemaInfoRow).where(SchemaInfoRow.key == "schema_version").values(value="8")
     )
 
 
@@ -2301,9 +2330,7 @@ def _normalize_database(database: str | Path) -> tuple[URL, Path | None]:
         url = url.set(drivername="postgresql+psycopg")
     backend = url.get_backend_name()
     if backend not in {"postgresql", "sqlite"}:
-        raise ValueError(
-            f"Unsupported database backend {backend!r}; use SQLite or PostgreSQL."
-        )
+        raise ValueError(f"Unsupported database backend {backend!r}; use SQLite or PostgreSQL.")
 
     if backend != "sqlite" or url.database in {None, "", ":memory:"}:
         return url, None
