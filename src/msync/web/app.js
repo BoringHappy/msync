@@ -10,6 +10,7 @@ const state = {
   activeConversation: null,
   conversationEntries: [],
   conversationController: null,
+  conversationLoading: false,
   detailsExpanded: false,
   eventController: null,
   eventLoading: false,
@@ -19,6 +20,7 @@ const state = {
   humanCursorSequence: null,
   listController: null,
   listRequest: 0,
+  loadingAllEvents: false,
   conversationRequest: 0,
   searchTimer: null,
   fitWidth: false,
@@ -29,6 +31,7 @@ const state = {
 const elements = {
   content: document.querySelector("#content"),
   conversation: document.querySelector("#conversation"),
+  conversationBottom: document.querySelector("#conversation-bottom"),
   conversationTop: document.querySelector("#conversation-top"),
   copyLink: document.querySelector("#copy-link"),
   clearSearch: document.querySelector("#clear-search"),
@@ -87,6 +90,12 @@ const transcriptLoaderObserver = typeof IntersectionObserver === "undefined"
     loadMoreEvents();
   }, { root: elements.content, rootMargin: "0px 0px 480px" });
 
+function updateConversationBottom() {
+  elements.conversationBottom.disabled = state.conversationLoading
+    || state.eventLoading
+    || state.loadingAllEvents;
+}
+
 function cancelEventPagination() {
   transcriptLoaderObserver?.takeRecords();
   transcriptLoaderObserver?.disconnect();
@@ -94,6 +103,8 @@ function cancelEventPagination() {
   state.eventController?.abort();
   state.eventController = null;
   state.eventLoading = false;
+  state.loadingAllEvents = false;
+  updateConversationBottom();
 }
 
 function node(tag, className, text) {
@@ -244,6 +255,7 @@ async function loadConversations({ append = false, keepSelection = false } = {})
   const controller = new AbortController();
   state.listController = controller;
   if (!append) {
+    state.conversationLoading = true;
     state.conversationRequest += 1;
     state.conversationController?.abort();
     cancelEventPagination();
@@ -269,6 +281,10 @@ async function loadConversations({ append = false, keepSelection = false } = {})
     elements.sessionList.setAttribute("aria-busy", "false");
     elements.loadMore.disabled = false;
     elements.loadMore.textContent = "Load more sessions";
+    if (!append) {
+      state.conversationLoading = false;
+      updateConversationBottom();
+    }
     throw error;
   }
   if (requestId !== state.listRequest) return;
@@ -297,6 +313,8 @@ async function loadConversations({ append = false, keepSelection = false } = {})
     if (state.activeConversation?.summary.id === requestedId) return;
   }
   if (keepSelection && available && state.activeConversation?.summary.id === requestedId) {
+    state.conversationLoading = false;
+    updateConversationBottom();
     elements.footerStatus.textContent = `${state.conversations.length} sessions loaded`;
     updateUrl(requestedId);
     return;
@@ -305,6 +323,8 @@ async function loadConversations({ append = false, keepSelection = false } = {})
   if (nextId) {
     await openConversation(nextId);
   } else {
+    state.conversationLoading = false;
+    updateConversationBottom();
     state.activeConversation = null;
     elements.conversation.classList.add("hidden");
     elements.empty.classList.remove("hidden");
@@ -356,6 +376,7 @@ function renderConversationList() {
 
 async function openConversation(id) {
   if (!id) return;
+  state.conversationLoading = true;
   const requestId = ++state.conversationRequest;
   state.conversationController?.abort();
   cancelEventPagination();
@@ -385,10 +406,13 @@ async function openConversation(id) {
       card.toggleAttribute("aria-current", active);
     });
     setSidebar(false);
+    state.conversationLoading = false;
+    updateConversationBottom();
     elements.conversation.setAttribute("aria-busy", "false");
   } catch (error) {
     if (error.name === "AbortError") return;
     if (requestId !== state.conversationRequest) return;
+    state.conversationLoading = false;
     cancelEventPagination();
     showToast(`Could not load session: ${error.message}`);
     elements.footerStatus.textContent = "Load failed";
@@ -1318,6 +1342,7 @@ async function loadMoreEvents() {
   const controller = new AbortController();
   state.eventController = controller;
   state.eventLoading = true;
+  updateConversationBottom();
   const loadButton = elements.transcript.querySelector(".transcript-load-more");
   if (loadButton) {
     transcriptLoaderObserver?.unobserve(loadButton);
@@ -1353,6 +1378,7 @@ async function loadMoreEvents() {
       && state.activeConversation?.summary.id === conversationId
     ) {
       state.eventLoading = false;
+      updateConversationBottom();
       if (pageLoaded) {
         renderEvents();
       } else if (loadButton?.isConnected) {
@@ -1368,6 +1394,36 @@ async function loadMoreEvents() {
 function scrollConversationTop() {
   state.humanCursorSequence = null;
   elements.content.scrollTo({ top: 0 });
+}
+
+async function scrollConversationBottom() {
+  const detail = state.activeConversation;
+  if (!detail || state.conversationLoading || state.eventLoading) return;
+
+  const conversationId = detail.summary.id;
+  state.humanCursorSequence = null;
+  state.loadingAllEvents = true;
+  updateConversationBottom();
+  try {
+    while (
+      state.loadingAllEvents
+      && state.activeConversation?.summary.id === conversationId
+      && detail.events.length < detail.summary.event_count
+    ) {
+      const loaded = detail.events.length;
+      await loadMoreEvents();
+      if (detail.events.length === loaded) break;
+    }
+    if (
+      state.activeConversation?.summary.id === conversationId
+      && detail.events.length >= detail.summary.event_count
+    ) {
+      elements.content.scrollTo({ top: elements.content.scrollHeight });
+    }
+  } finally {
+    state.loadingAllEvents = false;
+    updateConversationBottom();
+  }
 }
 
 async function copyConversationLink() {
@@ -1414,6 +1470,7 @@ elements.clearSearch.addEventListener("click", () => {
   elements.search.focus();
 });
 elements.loadMore.addEventListener("click", () => loadConversations({ append: true }).catch(handleError));
+elements.conversationBottom.addEventListener("click", scrollConversationBottom);
 elements.conversationTop.addEventListener("click", scrollConversationTop);
 elements.previousHuman.addEventListener("click", () => moveHumanMessage(-1));
 elements.nextHuman.addEventListener("click", () => moveHumanMessage(1));
