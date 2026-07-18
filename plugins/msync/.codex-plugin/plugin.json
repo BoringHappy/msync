@@ -1,0 +1,31 @@
+{
+  "name": "msync",
+  "version": "0.1.0",
+  "description": "Upload the current Codex or Claude Code session to msync after every turn.",
+  "author": {
+    "name": "BoringHappy",
+    "url": "https://github.com/BoringHappy"
+  },
+  "homepage": "https://github.com/BoringHappy/msync",
+  "repository": "https://github.com/BoringHappy/msync",
+  "license": "Apache-2.0",
+  "keywords": [
+    "conversation-history",
+    "sync",
+    "upload"
+  ],
+  "interface": {
+    "displayName": "msync",
+    "shortDescription": "Upload completed sessions to your msync archive.",
+    "longDescription": "Queues a non-blocking, single-transcript upsert after each completed Codex or Claude Code turn.",
+    "developerName": "BoringHappy",
+    "category": "Productivity",
+    "capabilities": [
+      "Automatic session upload"
+    ],
+    "websiteURL": "https://github.com/BoringHappy/msync",
+    "defaultPrompt": [
+      "Explain how automatic msync session uploads work."
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "msync",
+  "owner": {
+    "name": "BoringHappy"
+  },
+  "description": "Automatic conversation history uploads for Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "msync",
+      "source": "./plugins/msync",
+      "description": "Queue a single-session msync upsert after every completed agent turn.",
+      "category": "Productivity",
+      "tags": [
+        "conversation-history",
+        "sync",
+        "upload"
+      ]
+    }
+  ]
+}

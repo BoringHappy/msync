@@ -63,18 +63,21 @@ pinned image tag is needed.
 
 ## Upload history
 
-Upload Codex history to a running msync server:
+Upload Codex history to a running msync server. The URL and token can both come from the
+environment, which is the recommended configuration for automatic hooks:
 
 ```console
-$ msync upload --dir ~/.codex --url https://history.example.com --token "$MSYNC_UPLOAD_TOKEN"
+$ export MSYNC_UPLOAD_URL='https://history.example.com'
+$ export MSYNC_UPLOAD_TOKEN='alice-token'
+$ msync upload --dir ~/.codex
 ```
 
-Claude Code and additional installations work the same way. `MSYNC_UPLOAD_TOKEN` can supply the
-token without putting it in shell history:
+Claude Code and additional installations work the same way. `--url` and `--token` remain available
+for one-off commands, while the environment keeps the token out of shell history:
 
 ```console
-$ MSYNC_UPLOAD_TOKEN=alice-token msync upload --dir ~/.claude --url https://history.example.com
-$ MSYNC_UPLOAD_TOKEN=alice-token msync upload --dir ~/.codex_another --url https://history.example.com
+$ msync upload --dir ~/.claude
+$ msync upload --dir ~/.codex_another
 ```
 
 Locations are identified by account, hostname, and directory path, so users or machines that use
@@ -92,14 +95,55 @@ custom layout is ambiguous:
 $ msync upload --dir /mnt/history --provider codex --url https://history.example.com
 ```
 
-`upload` requires `--url`; direct `--database` uploads are no longer supported. The client detects
-and reads native transcripts locally, streams their byte-exact contents one file at a time over the
-authenticated API, and records the authenticated account, client hostname, source path, result
-counts, and upload time. A history directory has no aggregate upload limit; each individual
-transcript is capped at 256 MiB. The server rejects oversized request bodies before parsing them and
-spools accepted network bodies to disk before archive processing. Uploads retain the same hash-based
-update, duplicate, and schema checks. Treat an upload token like a password and use HTTPS whenever
-the server is reached over a network.
+Upload one native session transcript without scanning the other history files:
+
+```console
+$ msync upload --dir ~/.codex \
+    --transcript ~/.codex/sessions/2026/07/18/rollout-session.jsonl \
+    --provider codex
+```
+
+The transcript must be contained by `--dir`. Its native session identifier is read from the file,
+so it cannot disagree with a separate command-line session ID.
+
+`upload` requires `--url` or `MSYNC_UPLOAD_URL`; direct `--database` uploads are no longer supported.
+The client detects and reads native transcripts locally, streams their byte-exact contents one file
+at a time over the authenticated API, and records the authenticated account, client hostname,
+source path, result counts, and upload time. A history directory has no aggregate upload limit; each
+individual transcript is capped at 256 MiB. The server rejects oversized request bodies before
+parsing them and spools accepted network bodies to disk before archive processing. Uploads retain
+the same hash-based update, duplicate, and schema checks. Treat an upload token like a password and
+use HTTPS whenever the server is reached over a network.
+
+### Automatic uploads from Claude Code and Codex
+
+The bundled `msync` plugin registers a `Stop` hook for both clients. Every completed agent turn
+starts a detached `msync upload` process for only the `transcript_path` supplied by that hook. The
+hook returns immediately instead of waiting for the network. The server imports a new relative
+path, skips an unchanged content hash, or replaces the normalized events when that transcript has
+changed, so repeated Stop events are safe upserts.
+
+Install the `msync` CLI as described above, export `MSYNC_UPLOAD_URL` and `MSYNC_UPLOAD_TOKEN` in the
+environment that launches the client, then install the plugin from this repository.
+
+For Claude Code:
+
+```console
+$ claude plugin marketplace add BoringHappy/msync
+$ claude plugin install msync@msync
+```
+
+For Codex:
+
+```console
+$ codex plugin marketplace add BoringHappy/msync
+$ codex plugin add msync@msync
+```
+
+Codex requires newly installed command hooks to be reviewed before they run; open `/hooks`, inspect
+the `msync upload-hook` command, and trust it. The plugin quietly does nothing when either required
+environment variable is absent. It reads the provider from the native transcript path and the
+session ID from the transcript content; neither value needs manual hook configuration.
 
 On every connection, `msync` detects whether its schema is absent, initializes a new database from
 the SQLAlchemy declarative models, and then validates required tables, columns, primary keys,

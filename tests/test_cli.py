@@ -276,6 +276,105 @@ def test_upload_sends_native_transcripts_to_remote_server(
         assert request["body"][4 + metadata_length :] == transcript_content
 
 
+def test_upload_sends_only_selected_transcript_with_environment_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    _write_codex_transcript(root, session_id="first", filename="first.jsonl")
+    selected = _write_codex_transcript(root, session_id="selected", filename="selected.jsonl")
+    captured_bodies: list[bytes] = []
+
+    def fake_post(
+        url: str,
+        *,
+        headers: dict[str, str],
+        content: Iterator[bytes],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        del timeout
+        captured_bodies.append(b"".join(content))
+        assert url == "https://history.example/api/upload"
+        assert headers["Authorization"] == "Bearer env-token"
+        return httpx.Response(
+            200,
+            json={
+                "location_id": 12,
+                "scanned": 1,
+                "imported": 0,
+                "updated": 1,
+                "unchanged": 0,
+                "duplicates": 0,
+                "events": 1,
+                "message_parts": 0,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr("msync.cli.httpx.post", fake_post)
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--transcript",
+            str(selected),
+            "--provider",
+            "codex",
+        ],
+        env={
+            "MSYNC_UPLOAD_URL": "https://history.example",
+            "MSYNC_UPLOAD_TOKEN": "env-token",
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"Transcripts\s+1", result.output)
+    assert re.search(r"Updated\s+1", result.output)
+    assert len(captured_bodies) == 1
+    metadata_length = int.from_bytes(captured_bodies[0][:4], byteorder="big")
+    metadata = RemoteUploadMetadata.model_validate_json(
+        captured_bodies[0][4 : 4 + metadata_length]
+    )
+    assert metadata.relative_path == "sessions/selected.jsonl"
+    assert captured_bodies[0][4 + metadata_length :] == selected.read_bytes()
+
+
+def test_upload_rejects_selected_transcript_outside_history_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".codex"
+    _write_codex_transcript(root)
+    outside = _write_codex_transcript(tmp_path / "other", filename="outside.jsonl")
+
+    def unexpected_post(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("outside transcript reached the network")
+
+    monkeypatch.setattr("msync.cli.httpx.post", unexpected_post)
+    result = CliRunner().invoke(
+        app,
+        [
+            "upload",
+            "--dir",
+            str(root),
+            "--transcript",
+            str(outside),
+            "--provider",
+            "codex",
+            "--url",
+            "https://history.example",
+            "--token",
+            "secret",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Transcript must be contained in --dir" in result.output
+
+
 def test_upload_requires_token(tmp_path: Path) -> None:
     root = tmp_path / ".codex"
     _write_codex_transcript(root)

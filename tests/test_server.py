@@ -505,6 +505,67 @@ def test_remote_upload_tokens_isolate_accounts_and_optional_token_is_browser_onl
         ).fetchall() == [("alice", 2), ("carol", 1)]
 
 
+def test_remote_upload_upserts_changed_single_transcript(tmp_path: Path) -> None:
+    web_app = create_app(
+        tmp_path / "archive.sqlite",
+        accounts=(ServerAccount("alice", "alice-password", "alice-token"),),
+    )
+    metadata = {
+        "version": 1,
+        "provider": "codex",
+        "hostname": "workstation",
+        "root_path": "/home/alice/.codex",
+        "display_name": ".codex",
+        "relative_path": "sessions/upsert.jsonl",
+        "source_mtime_ns": 123,
+    }
+
+    def content(answer: str) -> bytes:
+        records = [
+            {
+                "timestamp": "2026-07-14T12:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "upsert-session", "cwd": "/tmp"},
+            },
+            {
+                "timestamp": "2026-07-14T12:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": answer},
+            },
+        ]
+        return "".join(json.dumps(record) + "\n" for record in records).encode()
+
+    with TestClient(web_app) as client:
+        first = client.post(
+            "/api/upload",
+            content=_remote_upload_body(metadata, content("First answer")),
+            headers=_upload_headers("alice-token"),
+        )
+        metadata["source_mtime_ns"] = 456
+        second = client.post(
+            "/api/upload",
+            content=_remote_upload_body(metadata, content("Updated answer")),
+            headers=_upload_headers("alice-token"),
+        )
+        summaries = client.get(
+            "/api/conversations",
+            auth=("alice", "alice-password"),
+        ).json()
+        detail = client.get(
+            f"/api/conversations/{summaries[0]['id']}",
+            auth=("alice", "alice-password"),
+        ).json()
+
+    assert first.status_code == 200
+    assert first.json()["imported"] == 1
+    assert second.status_code == 200
+    assert second.json()["updated"] == 1
+    assert len(summaries) == 1
+    assert [event["text"] for event in detail["events"] if event["role"] == "assistant"] == [
+        "Updated answer"
+    ]
+
+
 def test_overview_returns_latest_five_uploads_for_current_account(tmp_path: Path) -> None:
     web_app = create_app(
         tmp_path / "archive.sqlite",

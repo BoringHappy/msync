@@ -16,6 +16,7 @@ from rich.text import Text
 from sqlalchemy.exc import SQLAlchemyError
 
 from msync.database import Archive, SchemaUpgradeRequiredError, SearchResult, UploadResult
+from msync.hooks import queue_session_upload
 from msync.providers import (
     HistoryFormatError,
     HistoryProvider,
@@ -68,9 +69,24 @@ def upload(
     url: Annotated[
         str,
         typer.Option(
-            help="Base URL of an msync server that accepts remote uploads.",
+            envvar="MSYNC_UPLOAD_URL",
+            help=(
+                "Base URL of an msync server that accepts remote uploads "
+                "(or set MSYNC_UPLOAD_URL)."
+            ),
         ),
     ],
+    transcript: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Upload only this transcript instead of scanning --dir.",
+        ),
+    ] = None,
     provider: Annotated[
         str,
         typer.Option(help=f"Provider name or auto detection ({', '.join(provider_names())})."),
@@ -97,7 +113,7 @@ def upload(
         if not token:
             raise ValueError("--url requires --token or MSYNC_UPLOAD_TOKEN.")
         selected_provider = detect_provider(root) if provider == "auto" else get_provider(provider)
-        transcripts = selected_provider.discover(root)
+        transcripts = _upload_transcripts(root, selected_provider, transcript)
         if not transcripts:
             raise HistoryFormatError(f"No conversation transcripts found in {root}.")
         location_hostname = _upload_hostname(hostname)
@@ -134,6 +150,22 @@ def upload(
     table.add_row("Duplicates skipped", str(result.duplicates))
     table.add_row("Events indexed", str(result.events))
     console.print(table)
+
+
+@app.command("upload-hook", hidden=True)
+def upload_hook(
+    provider: Annotated[
+        str | None,
+        typer.Option(help=f"Provider override ({', '.join(provider_names())})."),
+    ] = None,
+) -> None:
+    """Queue one transcript upload from a Claude Code or Codex Stop hook."""
+
+    try:
+        queue_session_upload(provider)
+    except (OSError, RuntimeError, ValueError) as error:
+        error_console.print(f"[bold red]Upload hook failed:[/bold red] {error}")
+        raise typer.Exit(code=1) from error
 
 
 @app.command()
@@ -515,6 +547,21 @@ def _upload_hostname(hostname: str | None) -> str:
     if len(normalized) > 255:
         raise ValueError("Location hostname must not exceed 255 characters.")
     return normalized
+
+
+def _upload_transcripts(
+    root: Path,
+    provider: HistoryProvider,
+    transcript: Path | None,
+) -> list[Path]:
+    if transcript is None:
+        return provider.discover(root)
+    path = transcript.expanduser().resolve()
+    if not path.is_relative_to(root):
+        raise HistoryFormatError(f"Transcript must be contained in --dir: {path}")
+    if path.suffix.casefold() != ".jsonl" or path.name in provider.ignored_filenames:
+        raise HistoryFormatError(f"Not a {provider.name} conversation transcript: {path}")
+    return [path]
 
 
 def _remote_upload(
