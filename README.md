@@ -31,10 +31,11 @@ Python 3.14 or newer is required.
 ## Docker
 
 The published container image is available at `ghcr.io/boringhappy/msync`. To run msync with the
-bundled PostgreSQL service, set passwords and start the default Compose configuration:
+bundled PostgreSQL service, configure the accounts and database password, then start the default
+Compose configuration:
 
 ```console
-$ export MSYNC_SERVER_PASSWORD='choose-a-strong-web-password'
+$ export MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web-password,bob-upload-token'
 $ export POSTGRES_PASSWORD='choose-a-strong-database-password'
 $ make docker-up-postgres
 ```
@@ -47,15 +48,18 @@ To connect only the msync container to an existing PostgreSQL database, use the 
 configuration and provide its SQLAlchemy URL:
 
 ```console
-$ export MSYNC_SERVER_PASSWORD='choose-a-strong-web-password'
+$ export MSYNC_SERVER_ACCOUNTS='alice,alice-web-password,alice-upload-token;bob,bob-web-password,bob-upload-token'
 $ export MSYNC_DATABASE_URL='postgresql+psycopg://msync:secret@database.example.com/msync'
 $ make docker-up-external-db
 ```
 
 Use `host.docker.internal` as the database host when the database runs on the Docker host. Both
-configurations expose the browser on `http://localhost:8000`, use the `msync` login by default, and
-use `ghcr.io/boringhappy/msync:latest`. Override `MSYNC_PORT`, `MSYNC_SERVER_USERNAME`, or
-`MSYNC_IMAGE` when a different port, login, or pinned image tag is needed.
+configurations expose the browser on `http://localhost:8000` and use
+`ghcr.io/boringhappy/msync:latest`. `MSYNC_SERVER_ACCOUNTS` contains semicolon-separated
+`username,password[,token]` entries. Each password authenticates that user's browser login; the
+optional, unique token authenticates that user's remote uploads. Commas and semicolons cannot be
+used inside these credentials. Override `MSYNC_PORT` or `MSYNC_IMAGE` when a different port or
+pinned image tag is needed.
 
 ## Upload history
 

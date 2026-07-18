@@ -8,8 +8,7 @@ services:
     ports:
       - "${MSYNC_PORT:-8000}:8000"
     environment:
-      MSYNC_SERVER_PASSWORD: "${MSYNC_SERVER_PASSWORD:?Set MSYNC_SERVER_PASSWORD}"
-      MSYNC_SERVER_USERNAME: "${MSYNC_SERVER_USERNAME:-msync}"
+      MSYNC_SERVER_ACCOUNTS: "${MSYNC_SERVER_ACCOUNTS:?Set MSYNC_SERVER_ACCOUNTS}"
     command:
       - server
       - --host
